@@ -86,9 +86,11 @@ Camera2 constrained high-speed session
 Phase 5 implements the path through decode/frame-timestamp reconciliation. Phase
 6 implements investigation-only value-anchor diagnostics after selected fail-loud
 decode paths. A diagnostic `Proven` anchor is not a measurement-ready pairing,
-and the S10+ device proof for anchor behavior is still blocked pending a manual
-unlock and rerun. Detection, calibration UI, result UI, import mode, and 240 fps
-GPU proof remain planned.
+and the S10+ device proof for anchor behavior now rejects fail-loud with
+`SENSOR_NEAR_DUPLICATE` after a real burst/decode run (`N=268`, exact distinct
+sensor timestamps `325`, hypothetical post-collapse sensor count `260`).
+Detection, calibration UI, result UI, import mode, and 240 fps GPU proof remain
+planned.
 
 ## Live 240 fps Path
 

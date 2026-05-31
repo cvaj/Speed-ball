@@ -147,11 +147,11 @@ pairing proven**. Later work must either find a better timestamp source for the
 recorder stream, prove a value-anchored reconciliation strategy, or move to the
 preview/GPU path before reporting any measured result.
 
-## Phase 6 value-anchor device proof attempt (S10+)
+## Phase 6 value-anchor device proof (S10+)
 
-After the Phase 6 value-anchor diagnostics and privacy logging landed, we tried
-to rerun the real app on the connected S10+ (`SM-G975U`) for the required
-anchor verdict evidence.
+After the Phase 6 value-anchor diagnostics and privacy logging landed, we reran
+the real app on the connected S10+ (`SM-G975U`) for the required anchor verdict
+evidence.
 
 Command shape:
 
@@ -169,21 +169,30 @@ Observed result:
 
 ```text
 MODES 1280x720 @ 120 fps:recordSupported=true, 1920x1080 @ 120 fps:recordSupported=true, 1280x720 @ 240 fps:recordSupported=true, 1920x1080 @ 240 fps:recordSupported=true
+BURST_SUCCESS callbacks=520 uniqueTs=325 expected=300 min=240 medianGapMs=8.33 band=7.08..9.58 medianPass=true proof=true file=speed_ball_1280x720_120_1780249488438.mp4 bytes=6790131
+TIMESTAMP_ANCHOR_DIAGNOSTIC file=speed_ball_1280x720_120_1780249488438.mp4 verdict=REJECTED reason=SENSOR_NEAR_DUPLICATE decoded=268 rawPositiveSensorTs=520 exactDistinctSensorTs=325 hypotheticalPostCollapseSensorTs=260 postCollapse=postCollapseStillMismatched nearDuplicateGroups=65 evaluatedCandidates=0 survivingMappings=0 maxResidualUs=n/a medianResidualUs=n/a presentationHoles=0 sensorHoles=0 holeAgreement=NO_HOLES failures=none
+TIMESTAMP_ANCHOR_POST_COLLAPSE file=speed_ball_1280x720_120_1780249488438.mp4 interpretation=Post-collapse_sensor_count_still_differs_from_decoded_sample_count;_record-then-decode_may_have_encoder/frame-loss_issues_beyond_near-duplicate_callbacks._Evidence_only.
+TIMESTAMP_ANCHOR_NEAR_DUPLICATE_GAPS_NS file=speed_ball_1280x720_120_1780249488438.mp4 chunk=1 count=16 values=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+DECODE_FAILURE reason=SENSOR_TIMESTAMP_NEAR_DUPLICATE message=Adjacent SENSOR_TIMESTAMP values were closer than the provisional near-duplicate threshold: 1.0E-6 ms. file=speed_ball_1280x720_120_1780249488438.mp4
+DECODE_DIAGNOSTICS decoded=268 uniqueTs=325 sensorMedianMs=8.33 sensorMaxMs=8.38 ptsMedianMs=8.33 ptsMaxMs=8.39 dropThresholdMs=12.50 exactCount=false nearDuplicateMs=0.000001 clock=CAPTURE_BASED_CANDIDATE samples=
+DECODE_PTS_SENSOR_OFFSETS_US count=0 values=[]
 ```
 
-The debug APK built and installed successfully, and wireless ADB reported the
-S10+ attached. The run did not produce `BURST_SUCCESS`, `DECODE_*`, or
-`TIMESTAMP_ANCHOR_*` evidence. Device state inspection showed the phone was
-awake but still behind the secure lockscreen bouncer, so the app never reached a
-usable preview/capture run.
+The debug APK built and installed successfully, wireless ADB reported the S10+
+attached, and the manually unlocked run reached capture/decode. The burst proof
+passed at 120 fps, but anchor diagnostics rejected the evidence before candidate
+evaluation because near-duplicate `SENSOR_TIMESTAMP` callbacks were present.
+Post-collapse sensor count was still mismatched (`260` hypothetical sensor
+samples vs `268` decoded frames), so collapsing near-duplicates would still not
+produce a measurement-ready pairing.
 
 Interpretation:
 
-- Phase 6 S10+ anchor evidence is **blocked**, not measured.
-- No Phase 6 anchor rejection or diagnostic proof is claimed from this attempt.
-- Phase 5 fail-loud evidence remains the latest measured S10+ record-then-decode
-  result until the phone is manually unlocked and the full `autoStart120` run
-  emits burst, decode, and `TIMESTAMP_ANCHOR_*` logs.
+- Phase 6 S10+ anchor evidence is now **measured** and rejects fail-loud with
+  `SENSOR_NEAR_DUPLICATE`.
+- No Phase 6 diagnostic `Proven` or measurement-consumable proof is claimed.
+- Record-then-decode remains no-read on the S10+ for measurement because decoded
+  frames still cannot be paired to sensor timestamps safely.
 
 ## What this proves / disproves
 
@@ -195,9 +204,9 @@ Interpretation:
 - ❌ The current Phase 5 exact-count record-then-decode path does **not** yet
   produce a verified decoded-frame-to-sensor-timestamp pairing on S10+; it fails
   loud on near-duplicate sensor gaps and decoded/sensor count mismatch.
-- ❌ Phase 6 value-anchor S10+ device evidence is not yet captured; the first
-  post-diagnostics attempt was blocked by the secure lockscreen before burst
-  capture.
+- ❌ Phase 6 value-anchor S10+ device evidence is captured and rejects fail-loud:
+  near-duplicate callbacks remain, post-collapse sensor count still mismatches
+  decoded frames, and no measurement-ready pairing is produced.
 
 ## Open items carried into the plan
 

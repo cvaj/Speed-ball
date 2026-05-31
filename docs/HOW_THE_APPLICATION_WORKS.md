@@ -186,6 +186,8 @@ Phase 5 decode failure reasons are:
   decoded PTS values to real `SENSOR_TIMESTAMP` values, logs candidate offsets,
   residuals, dropped-hole agreement, near-duplicate/post-collapse evidence, and
   a diagnostic verdict, but it never feeds measurement or the user-facing result
-  path. S10+ Phase 6 device evidence is currently blocked pending a manually
-  unlocked run that emits `BURST_SUCCESS`, `DECODE_*`, and `TIMESTAMP_ANCHOR_*`
-  logs.
+  path. S10+ Phase 6 device evidence now shows a real 120 fps burst followed by
+  a fail-loud anchor rejection: `SENSOR_NEAR_DUPLICATE`, decoded `N=268`, exact
+  distinct sensor timestamps `325`, and hypothetical post-collapse sensor count
+  `260`. That is evidence against using the record-then-decode path as a
+  measurement-ready pairing source.
