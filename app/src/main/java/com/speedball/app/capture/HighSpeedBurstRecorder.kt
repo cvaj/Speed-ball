@@ -279,7 +279,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
         val safeOptions = options ?: return BurstOutcome.Failure(BurstFailure.RECORDING_FAILED, "Capture options were lost before completion.")
         val output = outputFile
         val timestampCopy = synchronized(lock) { timestamps.toList() }
-        return buildBurstOutcome(
+        val outcome = buildBurstOutcome(
             timestampsNanos = timestampCopy,
             callbackCount = callbackCount.get(),
             requestedDurationMillis = safeOptions.durationMillis,
@@ -287,6 +287,18 @@ class HighSpeedBurstRecorder(private val context: Context) {
             outputPath = output?.absolutePath.orEmpty(),
             fileBytes = output?.length() ?: 0L,
         )
+        return if (outcome is BurstOutcome.Success) {
+            outcome.copy(
+                outputFile = output,
+                sensorTimestampsNanos = timestampCopy,
+                requestedFps = safeOptions.mode.fps,
+                requestedDurationMillis = safeOptions.durationMillis,
+                width = safeOptions.mode.width,
+                height = safeOptions.mode.height,
+            )
+        } else {
+            outcome
+        }
     }
 
     private fun releaseResources(stopRecorder: Boolean): BurstFailure? {

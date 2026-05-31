@@ -15,13 +15,14 @@ The root project now has two modules:
 - `:core` is pure Kotlin/JVM and contains measurement model, calibration,
   unit-conversion, velocity-fit, outlier-rejection, fail-loud measurement outcome
   logic, and trajectory physics.
-- `:app` depends on `:core`, renders the Android shell, and owns the Phase 4
-  Camera2 capture foundation.
+- `:app` depends on `:core`, renders the Android shell, and owns the Camera2
+  capture foundation plus Phase 5 decode/frame-timestamp proof.
 
 No imported media, calibration data, detections, velocity fits, mph results, or
-trajectory values flow through the app shell yet. Camera HAL modes and
-SENSOR_TIMESTAMP diagnostics may flow through the developer diagnostics surface
-only after real enumeration/capture.
+trajectory values flow through the app shell yet. Camera HAL modes,
+SENSOR_TIMESTAMP diagnostics, decoded frame counts, PTS gap diagnostics, and
+sampled frame dimensions may flow through the developer diagnostics surface only
+after real enumeration/capture/decode proof or a typed failure.
 
 ## Core Measurement Path
 
@@ -66,8 +67,10 @@ Camera2 constrained high-speed session
   -> capture callback SENSOR_TIMESTAMP list
   -> BurstDiagnostics unique-count floor + median-gap band
   -> saved burst in app-specific external files
-  -> later phase decodes frames in order
-  -> reconcile decoded frames with timestamps
+  -> MediaExtractor reads exact output File video samples and PTS list
+  -> bounded frame proof samples two non-adjacent decoded frames
+  -> exact-count reconciliation pairs decoded frame index i to SENSOR_TIMESTAMP i
+  -> fail loud on count mismatch, cadence mismatch, dropped gaps, or near-duplicates
   -> HSV/OpenCV centroid detection
   -> flight window selection
   -> core velocity fit
@@ -75,8 +78,9 @@ Camera2 constrained high-speed session
   -> Compose results UI
 ```
 
-Phase 4 implements the path through `BurstDiagnostics` and saved burst output.
-Decode/frame pairing and detection remain planned.
+Phase 5 implements the path through decode/frame-timestamp reconciliation.
+Detection, calibration UI, result UI, import mode, and 240 fps GPU proof remain
+planned.
 
 ## Live 240 fps Path
 

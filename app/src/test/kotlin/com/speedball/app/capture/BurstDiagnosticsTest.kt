@@ -1,5 +1,6 @@
 package com.speedball.app.capture
 
+import com.speedball.app.decode.buildTimestampDiagnostics
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
@@ -25,6 +26,7 @@ class BurstDiagnosticsTest {
         assertEquals(4, diagnostics.callbackCount)
         assertEquals("burst.mp4", diagnostics.displayOutputName)
         assertEquals(8.33, diagnostics.medianGapMillis!!, 0.01)
+        assertEquals(8.33, diagnostics.maximumGapMillis!!, 0.01)
     }
 
     @Test
@@ -81,6 +83,62 @@ class BurstDiagnosticsTest {
         assertFalse(gapPassesCountFails.uniqueCountPassesRequestedMinimum)
         assertTrue(gapPassesCountFails.medianGapPassesRateBand)
         assertFalse(gapPassesCountFails.captureProofPasses)
+    }
+
+    @Test
+    fun phase4S10ProofGoldensRemainPinned() {
+        val passing = diagnosticsWithUniqueCount(count = 325, gapMillis = 8.33)
+        val lifecycleStop = diagnosticsWithUniqueCount(count = 45, gapMillis = 8.33)
+
+        assertEquals(300, passing.expectedUniqueTimestampCount)
+        assertEquals(240, passing.minimumUniqueTimestampCount)
+        assertTrue(passing.medianGapPassesRateBand)
+        assertTrue(passing.uniqueCountPassesRequestedMinimum)
+        assertTrue(passing.captureProofPasses)
+        assertEquals(300, lifecycleStop.expectedUniqueTimestampCount)
+        assertEquals(240, lifecycleStop.minimumUniqueTimestampCount)
+        assertTrue(lifecycleStop.medianGapPassesRateBand)
+        assertFalse(lifecycleStop.uniqueCountPassesRequestedMinimum)
+        assertFalse(lifecycleStop.captureProofPasses)
+    }
+
+    @Test
+    fun sharedTimestampHelperAndBurstDiagnosticsUseSameUniqueCount() {
+        val timestamps = listOf(timestampNanos(0.0), timestampNanos(8.33), timestampNanos(8.33), timestampNanos(24.99))
+        val helper = buildTimestampDiagnostics(timestamps, fps = 120)
+        val diagnostics = buildBurstDiagnostics(
+            timestampsNanos = timestamps,
+            callbackCount = timestamps.size,
+            requestedDurationMillis = 2_500L,
+            fps = 120,
+            outputPath = "burst.mp4",
+            fileBytes = 1L,
+        )
+
+        assertEquals(helper.uniqueCount, diagnostics.uniqueTimestampCount)
+        assertEquals(helper.maximumGapMillis!!, diagnostics.maximumGapMillis!!, 0.01)
+        assertEquals(helper.droppedFrameGapThresholdMillis, diagnostics.droppedFrameGapThresholdMillis, 0.01)
+    }
+
+    @Test
+    fun maximumGapDoesNotFeedCaptureProof() {
+        val timestamps = List(250) { index ->
+            val adjustedIndex = if (index >= 120) index + 1 else index
+            timestampNanos(adjustedIndex * 8.33)
+        }
+        val diagnostics = buildBurstDiagnostics(
+            timestampsNanos = timestamps,
+            callbackCount = timestamps.size,
+            requestedDurationMillis = 2_500L,
+            fps = 120,
+            outputPath = "burst.mp4",
+            fileBytes = 1L,
+        )
+
+        assertTrue(diagnostics.uniqueCountPassesRequestedMinimum)
+        assertTrue(diagnostics.medianGapPassesRateBand)
+        assertTrue(diagnostics.maximumGapMillis!! > diagnostics.droppedFrameGapThresholdMillis)
+        assertTrue(diagnostics.captureProofPasses)
     }
 
     @Test

@@ -20,20 +20,35 @@ import com.speedball.app.capture.HighSpeedCamera
 import com.speedball.app.capture.HighSpeedMode
 import com.speedball.app.capture.HighSpeedModesResult
 import com.speedball.app.capture.selectDefaultMode
+import com.speedball.app.decode.BurstVideoDecoder
+import com.speedball.app.decode.DecodeCompletionGate
+import com.speedball.app.decode.DecodeFailure
+import com.speedball.app.decode.DecodeOutcome
+import com.speedball.app.decode.buildDecodeWorkBounds
+import com.speedball.app.decode.runDecodeWithTimeout
 import com.speedball.app.ui.SpeedBallApp
 import com.speedball.app.ui.SpeedBallShellState
+import com.speedball.app.ui.decodeOutcomeUiLines
 import com.speedball.app.ui.speedBallCaptureState
 import com.speedball.app.ui.speedBallPlaceholderState
+import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
-/** Launches the Compose shell and owns Phase 4 Camera2 capture diagnostics. */
+/** Launches the Compose shell and owns Camera2 capture plus Phase 5 decode diagnostics. */
 class MainActivity : ComponentActivity() {
     private val logTag = "SPEEDBALL_CAPTURE"
     private lateinit var highSpeedCamera: HighSpeedCamera
     private lateinit var burstRecorder: HighSpeedBurstRecorder
+    private val burstVideoDecoder = BurstVideoDecoder()
+    private val decodeCompletionGate = DecodeCompletionGate()
+    private val decodeSupervisorExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val decodeWorkerExecutor: ExecutorService = Executors.newCachedThreadPool()
     private var previewSurface: Surface? = null
     private var modes: List<HighSpeedMode> = emptyList()
     private var selectedMode: HighSpeedMode? = null
     private var lastDiagnostics: BurstDiagnostics? = null
+    private var lastDecodeOutcome: DecodeOutcome? = null
     private var lastFailure: BurstOutcome.Failure? = null
     private var captureStatus: String = "Idle"
     private var shellState by mutableStateOf(speedBallPlaceholderState())
@@ -75,6 +90,12 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         stopBurst()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        decodeSupervisorExecutor.shutdownNow()
+        decodeWorkerExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun ensureCameraPermission() {
@@ -126,6 +147,7 @@ class MainActivity : ComponentActivity() {
         }
         captureStatus = "Recording"
         lastFailure = null
+        lastDecodeOutcome = null
         updateShellState(status = captureStatus)
         val immediateFailure = burstRecorder.start(BurstOptions(mode), surface, modes) { outcome ->
             runOnUiThread {
@@ -142,6 +164,9 @@ class MainActivity : ComponentActivity() {
                                 "medianPass=${outcome.diagnostics.medianGapPassesRateBand} proof=${outcome.diagnostics.captureProofPasses} " +
                                 "file=${outcome.diagnostics.displayOutputName} bytes=${outcome.diagnostics.fileBytes}",
                         )
+                        if (outcome.diagnostics.captureProofPasses) {
+                            startDecodeProof(outcome)
+                        }
                     }
                     is BurstOutcome.Failure -> {
                         lastFailure = outcome
@@ -162,6 +187,58 @@ class MainActivity : ComponentActivity() {
 
     private fun stopBurst() {
         burstRecorder.stopActive()
+        cancelDecodeProof()
+    }
+
+    private fun startDecodeProof(outcome: BurstOutcome.Success) {
+        val file = outcome.outputFile
+        val fps = outcome.requestedFps
+        val durationMillis = outcome.requestedDurationMillis
+        if (file == null || fps == null || durationMillis == null) {
+            lastDecodeOutcome = DecodeOutcome.Failure(DecodeFailure.OUTPUT_FILE_MISSING, "Capture did not provide an exact recorder output file for decode proof.")
+            captureStatus = "Decode proof failed"
+            updateShellState(status = captureStatus)
+            return
+        }
+        captureStatus = "Decode proof running"
+        updateShellState(status = captureStatus)
+        val generation = decodeCompletionGate.startRun()
+        val bounds = buildDecodeWorkBounds(durationMillis, fps)
+        decodeSupervisorExecutor.execute {
+            val decodeOutcome = runDecodeWithTimeout(decodeWorkerExecutor, bounds.timeoutMillis) {
+                burstVideoDecoder.decode(
+                    outputFile = file,
+                    rawSensorTimestampsNanos = outcome.sensorTimestampsNanos,
+                    requestedFps = fps,
+                    requestedDurationMillis = durationMillis,
+                )
+            }
+            runOnUiThread {
+                val acceptedOutcome = decodeCompletionGate.accept(generation, decodeOutcome)
+                if (acceptedOutcome == null) {
+                    Log.i(logTag, "DECODE_CANCELLED late_result_discarded file=${file.displayNameOnly()}")
+                    return@runOnUiThread
+                }
+                lastDecodeOutcome = acceptedOutcome
+                captureStatus = when (acceptedOutcome) {
+                    is DecodeOutcome.Success -> "Decode proof complete"
+                    is DecodeOutcome.Failure -> "Decode proof failed"
+                    DecodeOutcome.Cancelled -> "Decode cancelled"
+                }
+                logDecodeOutcome(file, acceptedOutcome)
+                updateShellState(status = captureStatus)
+            }
+        }
+    }
+
+    private fun cancelDecodeProof() {
+        if (captureStatus == "Decode proof running") {
+            lastDecodeOutcome = decodeCompletionGate.cancel()
+            captureStatus = "Decode cancelled"
+            updateShellState(status = captureStatus)
+        } else {
+            decodeCompletionGate.cancel()
+        }
     }
 
     private fun startAutoBurstIfReady() {
@@ -180,7 +257,7 @@ class MainActivity : ComponentActivity() {
                 "${mode.label} ($support)"
             },
             selectedModeLine = selectedMode?.label,
-            diagnosticLines = lastDiagnostics?.toUiLines().orEmpty(),
+            diagnosticLines = lastDiagnostics?.toUiLines().orEmpty() + decodeOutcomeUiLines(lastDecodeOutcome),
             failureLine = lastFailure?.let { "Failure: ${it.reason} - ${it.message}" },
         )
     }
@@ -194,6 +271,28 @@ class MainActivity : ComponentActivity() {
             "medianGapMs=${medianGapMillis?.format(2) ?: "n/a"} band=${medianGapLowerBoundMillis.format(2)}..${medianGapUpperBoundMillis.format(2)} pass=$medianGapPassesRateBand",
             "proof=$captureProofPasses file=$displayOutputName bytes=$fileBytes",
         )
+
+    private fun logDecodeOutcome(file: File, outcome: DecodeOutcome) {
+        when (outcome) {
+            DecodeOutcome.Cancelled -> Log.i(logTag, "DECODE_CANCELLED file=${file.displayNameOnly()}")
+            is DecodeOutcome.Failure -> Log.e(logTag, "DECODE_FAILURE reason=${outcome.reason} message=${outcome.message} file=${file.displayNameOnly()}")
+            is DecodeOutcome.Success -> {
+                val diagnostics = outcome.diagnostics
+                Log.i(
+                    logTag,
+                    "DECODE_SUCCESS decoded=${diagnostics.decodedFrameCount} uniqueTs=${diagnostics.uniqueSensorTimestampCount} " +
+                        "sensorMedianMs=${diagnostics.medianSensorGapMillis?.format(2)} sensorMaxMs=${diagnostics.maximumSensorGapMillis?.format(2)} " +
+                        "ptsMedianMs=${diagnostics.medianPresentationGapMillis?.format(2)} ptsMaxMs=${diagnostics.maximumPresentationGapMillis?.format(2)} " +
+                        "dropThresholdMs=${diagnostics.droppedFrameGapThresholdMillis.format(2)} exactCount=${diagnostics.exactCountPasses} " +
+                        "clock=${diagnostics.presentationClockAssessment} samples=${diagnostics.sampledFrames.joinToString { it.frameIndex.toString() }} " +
+                        "file=${file.displayNameOnly()}",
+                )
+            }
+        }
+    }
+
+    private fun File.displayNameOnly(): String =
+        name.ifBlank { absolutePath.substringAfterLast('/') }
 
     private fun Double.format(decimals: Int): String =
         "%.${decimals}f".format(this)

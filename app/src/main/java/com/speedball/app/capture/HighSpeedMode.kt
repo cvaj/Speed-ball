@@ -1,5 +1,6 @@
 package com.speedball.app.capture
 
+import java.io.File
 import kotlin.math.abs
 
 /** A device-reported high-speed mode reduced to app-owned primitive values. */
@@ -47,7 +48,16 @@ enum class BurstFailure {
 
 /** Terminal result from a burst attempt. Failure never carries partial measurement values. */
 sealed interface BurstOutcome {
-    data class Success(val diagnostics: BurstDiagnostics) : BurstOutcome
+    data class Success(
+        val diagnostics: BurstDiagnostics,
+        val outputFile: File? = null,
+        val sensorTimestampsNanos: List<Long> = emptyList(),
+        val requestedFps: Int? = null,
+        val requestedDurationMillis: Long? = null,
+        val width: Int? = null,
+        val height: Int? = null,
+    ) : BurstOutcome
+
     data class Failure(val reason: BurstFailure, val message: String) : BurstOutcome
 }
 

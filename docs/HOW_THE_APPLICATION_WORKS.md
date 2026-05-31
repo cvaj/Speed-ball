@@ -5,17 +5,19 @@ Speed-ball measures a hit softball by tracking a neon-colored ball in high-speed
 ## Current App State
 
 The visible app opens to a Compose workflow list plus a developer diagnostics
-surface for Phase 4 high-speed capture proof. The app can request camera
-permission, enumerate Camera2 high-speed modes from the device HAL, and start a
-bounded 120 fps MediaRecorder burst when a fixed 120 fps range is exposed. The
-results section stays in a no-read state until later phases wire decode,
-detection, calibration UI, and results UI.
+surface for high-speed capture and decode proof. The app can request camera
+permission, enumerate Camera2 high-speed modes from the device HAL, start a
+bounded 120 fps MediaRecorder burst when a fixed 120 fps range is exposed, and
+run Phase 5 decode/frame-timestamp reconciliation on the exact app-created MP4.
+The results section stays in a no-read state until later phases wire detection,
+calibration UI, and results UI.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
-measurement, and trajectory physics. The `:app` module now owns the Camera2
-capture foundation and timestamp diagnostics. It must still not display a sample
-speed, trajectory, or placeholder result value. Camera mode and timestamp
-diagnostics may be shown only after real HAL enumeration or a real burst.
+measurement, and trajectory physics. The `:app` module owns the Camera2 capture
+foundation, timestamp diagnostics, and Phase 5 decode proof. It must still not
+display a sample speed, trajectory, or placeholder result value. Camera mode,
+timestamp, frame-count, and raw decode diagnostics may be shown only after real
+HAL enumeration, a real burst, or a typed decode failure.
 
 ## User Flow
 
@@ -88,6 +90,19 @@ The app must show "No read" rather than a wrong speed when:
 - no positive `SENSOR_TIMESTAMP` values are collected;
 - the 120 fps capture proof fails either the unique-count floor or median-gap
   band;
+- the recorder output file is missing, empty, lacks a video track, has invalid
+  metadata, or cannot expose decoded sample timestamps;
+- fewer than three decoded frames are available;
+- decoded presentation timestamps are non-monotonic, have a median cadence
+  outside the requested fps band, or contain a gap larger than `1.5 *
+  expectedGap`;
+- normalized `SENSOR_TIMESTAMP` values are missing, contain a nonzero
+  near-duplicate gap below the provisional Phase 5 threshold, have a median
+  cadence outside the requested fps band, or contain a gap larger than `1.5 *
+  expectedGap`;
+- decoded frame count does not exactly equal unique `SENSOR_TIMESTAMP` count;
+- bounded frame extraction cannot prove two non-adjacent decoded frames at the
+  expected dimensions;
 - fewer than three valid detections exist;
 - timestamps are missing, duplicate, non-monotonic, or unpaired;
 - timestamps are too close together to produce a meaningful fit;
@@ -124,6 +139,27 @@ Phase 4 capture failure reasons are:
 - `NO_SENSOR_TIMESTAMPS`
 - `RESOURCE_RELEASE_FAILED`
 
+Phase 5 decode failure reasons are:
+
+- `OUTPUT_FILE_MISSING`
+- `OUTPUT_FILE_EMPTY`
+- `UNSUPPORTED_DECODER_API`
+- `NO_VIDEO_TRACK`
+- `INVALID_VIDEO_METADATA`
+- `FRAME_COUNT_UNAVAILABLE`
+- `FRAME_COUNT_TOO_LOW`
+- `FRAME_EXTRACTION_FAILED`
+- `MISSING_SENSOR_TIMESTAMPS`
+- `SENSOR_TIMESTAMP_NEAR_DUPLICATE`
+- `FRAME_SENSOR_COUNT_MISMATCH`
+- `PRESENTATION_TIMESTAMPS_NON_MONOTONIC`
+- `PRESENTATION_CADENCE_MISMATCH`
+- `PRESENTATION_DROPPED_FRAME_GAP`
+- `SENSOR_CADENCE_MISMATCH`
+- `SENSOR_DROPPED_FRAME_GAP`
+- `DECODE_WORK_LIMIT_EXCEEDED`
+- `RESOURCE_RELEASE_FAILED`
+
 ## Capture Modes
 
 - 120 fps on S10+ uses record-then-decode because it records cleanly.
@@ -134,3 +170,7 @@ Phase 4 capture failure reasons are:
 - A burst is considered 120 fps proof only when unique sensor timestamps meet
   the requested-duration floor and the median inter-frame gap is inside the
   `1000/fps` ms +/-15% band. For 120 fps that is about `8.33 ms`.
+- Phase 5 decode proof uses `MediaExtractor` sample count and presentation
+  timestamps for decoded-order diagnostics, then pairs frames by index only when
+  decoded frame count exactly equals unique `SENSOR_TIMESTAMP` count. Container
+  PTS is diagnostic; `SENSOR_TIMESTAMP` remains the measurement timing authority.
