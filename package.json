@@ -1,0 +1,30 @@
+{
+  "name": "speed-ball",
+  "version": "0.1.0",
+  "description": "Native Android softball exit-velocity camera app with Camera2 high-speed capture.",
+  "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "prepare": "husky",
+    "check": "bash scripts/check.sh",
+    "docs:check": "bash scripts/docs-check.sh",
+    "lint": "bash scripts/lint.sh",
+    "test": "bash scripts/test.sh",
+    "security:check": "bash scripts/security-check.sh"
+  },
+  "keywords": [
+    "softball",
+    "exit-velocity",
+    "android",
+    "camera2",
+    "opencv"
+  ],
+  "author": "cvaj <vangmountain@gmail.com>",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.21.0",
+  "devDependencies": {
+    "husky": "^9.1.7"
+  }
+}

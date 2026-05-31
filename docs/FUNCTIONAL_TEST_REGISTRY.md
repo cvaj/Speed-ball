@@ -1,0 +1,18 @@
+# Functional Test Registry
+
+Every Speed-ball capability must have functional proof. New capabilities must add or update a row before implementation is considered complete.
+
+| Capability | Required Proof | Current Status |
+|---|---|---|
+| Camera2 high-speed HAL enumeration | Device/prototype log proving supported fps/res combos | S10+ proven in `docs/HIGH_SPEED_FINDINGS.md`; S22+ pending |
+| 120 fps burst capture | On-device burst with timestamp count and decoded frame reconciliation | Planned |
+| 240 fps GPU capture | On-device true 240 detections from preview/GPU path | Planned |
+| HSV color calibration | Tap/sample -> HSV band -> mask preview/detection | Planned |
+| Ball centroid detection | Real frame fixtures produce centroids within tolerance | Planned |
+| Flight window selection | No read on insufficient/ambiguous detections; valid window on known clip | Planned |
+| Velocity fit | Golden values for slope, speed, angle, residuals, outlier rejection | Planned |
+| Distance calibration | Known pixel gap and real distance produce expected pixels/foot | Planned |
+| Unit conversion | px/s -> ft/s -> mph golden values | Planned |
+| Drag trajectory | No-drag closed form, drag monotonicity, hand-calculated case | Planned |
+| Results UI | Valid read and no-read states display correct user-facing messages | Planned |
+| Import mode | Imported clip runs same detector/math pipeline | Planned |

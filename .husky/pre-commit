@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+. "$(dirname "$0")/_/husky.sh" 2>/dev/null || true
+
+bash scripts/docs-check.sh
+bash scripts/security-check.sh

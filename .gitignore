@@ -1,0 +1,54 @@
+# Android / Gradle
+*.iml
+.gradle/
+**/build/
+local.properties
+.idea/
+.kotlin/
+captures/
+*.apk
+*.aab
+*.keystore
+!debug.keystore
+
+# Captured media / large binaries (kept out of git)
+*.mp4
+*.mov
+samples/*.mp4
+
+# OS
+.DS_Store
+
+# Node (RN demo reference only)
+node_modules/
+
+# Local agent runtime state
+.interagent/claude_request.md
+.interagent/claude_response.md
+.interagent/claude_response.normalized.md
+.interagent/codex_request.md
+.interagent/codex_response.md
+.interagent/codex_handoff.md
+.interagent/session.json
+.interagent/implementation_queue.json
+.interagent/tmp/
+.interagent/requests/*
+!.interagent/requests/.gitkeep
+.interagent/responses/*
+!.interagent/responses/.gitkeep
+.interagent/progress/*
+!.interagent/progress/.gitkeep
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Planning/progress scratch
+docs/PROGRESS_*.md
+docs/IMPL_PLAN_*.md
+docs/SUBTASK_QUEUE_*.md
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+credentials.*
