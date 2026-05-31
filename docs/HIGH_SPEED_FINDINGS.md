@@ -267,3 +267,53 @@ Interpretation:
 - Investigate whether the S10+ requires a companion encoder surface, vendor
   camera constraints, or a different session shape before a preview/GPU path can
   consume true high-speed frames.
+
+## Phase 9 direct companion proof (S10+)
+
+Phase 9 now has an app-owned debug entry point:
+
+```bash
+adb shell am start -n com.speedball.app/.MainActivity --ez autoStartDirectProof120 true
+```
+
+The implemented run shape is companion encoder plus direct
+`SurfaceTexture`/GL readback in one constrained high-speed session, followed by
+the preview-only control only after companion teardown and scratch deletion.
+The companion MP4 is app-private cache data only; it is not decoded, imported,
+path-logged, or used for proof.
+
+Observed S10+ result:
+
+```text
+DIRECT_PROOF_START mode=1280x720_@_120_fps shape=COMPANION_ENCODER
+DIRECT_CAPTURE_SCRATCH_PREPARED mode=1280x720_@_120_fps
+DIRECT_CAPTURE_GL_SETUP_READY mode=1280x720_@_120_fps
+DIRECT_CAPTURE_HIGH_SPEED_REQUEST_LIST mode=1280x720_@_120_fps requests=4
+DIRECT_CAPTURE_FRAME_READBACK count=1 timestamp=1079441694556966
+DIRECT_CAPTURE_RELEASE_DONE failure=null scratch=DELETED
+DIRECT_PROOF_COMPANION mode=1280x720_@_120_fps shape=COMPANION_ENCODER requestListSize=4 directCount=1 sensorCount=8 pixelCount=1 verdict=CAPTURED
+DIRECT_PROOF_PREVIEW mode=1280x720_@_120_fps shape=PREVIEW_ONLY_CONTROL verdict=PREVIEW_CADENCE_MISMATCH
+DIRECT_PROOF_RESULT mode=1280x720_@_120_fps verdict=INSUFFICIENT_DIRECT_FRAMES
+```
+
+App-private cache check after the run showed only the empty
+`cache/speed-ball-companion` directory and no scratch MP4 file.
+
+Interpretation:
+
+- The S10+ accepts the companion encoder plus direct `SurfaceTexture` session
+  and Camera2 returns a high-speed request list of size `4`.
+- The app proved one same-update direct GL pixel readback and captured matching
+  aggregate pixel proof metadata without reading the companion MP4.
+- The companion scratch file was deleted.
+- This is still not a measurement-ready source: the current direct proof window
+  captured only one direct timestamp/pixel proof, while eight sensor timestamps
+  arrived. The proof runner therefore rejects before token eligibility with
+  `INSUFFICIENT_DIRECT_FRAMES`.
+- The preview-only control still reproduces the known
+  `PREVIEW_CADENCE_MISMATCH` result.
+
+The proof token path remains bound to the vetted direct measurement input, and
+no token is minted from this evidence. The app remains fail-loud no-read on the
+S10+ until the direct path can capture at least 12 consumed same-update frames
+and prove cadence and membership against `SENSOR_TIMESTAMP`.

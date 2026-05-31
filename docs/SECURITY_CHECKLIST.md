@@ -50,3 +50,29 @@ Run this on every code change before review and before commit.
   APK, keystore, or credential is added by the Phase 8 pure pipeline foundation.
 - Main source contains no concrete `MeasurementTimingProof`; every real source
   remains no-read until Phase 9 source proof exists.
+
+## Phase 9 Notes
+
+- Direct proof pixel signatures are aggregate hash/checksum/variation data only;
+  raw tile pixels must not be logged or retained in diagnostics.
+- Companion encoder scratch files are app-private cache data only, bounded by
+  burst duration/size, deleted on terminal paths, and never decoded, imported,
+  path-logged, or measurement-consumed.
+- Direct GL readback is bounded by readback dimensions, frame count, and sample
+  caps; callbacks after teardown are rejected and release failures remain
+  fail-loud proof failures.
+- The companion-first runner passes no file path to proof validation, runs no
+  decoder or metadata reader, and prevents preview-control fallback after
+  camera-busy, camera-open, or scratch-cleanup failures.
+- Direct production timing tokens are accepted only through the bound
+  `DirectSourceMeasurementInput`; the generic measurement path rejects naked
+  direct tokens and `TimedFrameSequence` exposes no caller-settable proof
+  identity fields.
+- The bound direct measurement input rejects any measured sequence whose frame
+  count, relative timestamps, dimensions, or aggregate pixel signatures do not
+  match the proven direct frames.
+- Token eligibility requires at least 12 consumed same-update direct frames plus
+  passing timestamp and aggregate pixel-signature proof gates.
+- The `autoStartDirectProof120` developer entry point exposes only bounded
+  proof diagnostics and no-read UI on failure; it does not display scratch
+  paths, raw pixels, mph, angle, or trajectory values.

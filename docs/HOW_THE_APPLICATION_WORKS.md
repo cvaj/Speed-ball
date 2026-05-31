@@ -19,8 +19,14 @@ preview-only stream delivered about 30 fps while 120 fps was requested, so the
 path fails loud with `PREVIEW_CADENCE_MISMATCH`. Phase 8 adds the pure Kotlin
 detection, calibration, measurement orchestration, and result-state foundation,
 but it deliberately has no production implementation of `MeasurementTimingProof`.
-The results section therefore stays in a no-read state for every real source
-until Phase 9 provides an evidence-derived timing source.
+Phase 9 adds a developer-only direct proof path with a companion encoder
+session driver plus same-update `SurfaceTexture`/GL readback. The encoded
+scratch file is never read. The path still stays no-read on the measured S10+
+run because it consumed only one direct frame; token eligibility now requires
+at least 12 consumed same-update direct frames plus timestamp and pixel gates.
+Direct timing tokens cannot authorize arbitrary frame sequences through the
+generic pipeline; they must come through the factory-emitted bound direct input
+whose RGB frames recreate the proven direct frame signatures.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
@@ -135,6 +141,8 @@ The app must show "No read" rather than a wrong speed when:
 - the detector cannot distinguish the ball from background blobs;
 - Phase 8 frame-processing bounds are exceeded for dimensions, frame count,
   threshold-passing pixels, connected-component count, or per-frame operations;
+- Phase 9 direct source proof rejects the session, timestamps, pixel signature,
+  sequence identity, resource bounds, or proof-token eligibility;
 - a production source attempts to measure without a Phase 9 timing proof.
 
 Core failure reasons are:
@@ -222,6 +230,31 @@ Phase 8 measurement-run failure reasons are:
 - `MEASUREMENT_REJECTED`
 - `RESOURCE_LIMIT_EXCEEDED`
 
+Phase 9 direct proof failure reasons are diagnostic-only and include:
+
+- `UNSUPPORTED_MODE`
+- `CAPTURE_BUSY`
+- `CAMERA_OPEN_FAILED`
+- `SESSION_CONFIGURATION_FAILED`
+- `COMPANION_RECORDER_SETUP_FAILED`
+- `SCRATCH_FILE_CLEANUP_FAILED`
+- `MISSING_DIRECT_TIMESTAMPS`
+- `INSUFFICIENT_DIRECT_FRAMES`
+- `DUPLICATE_DIRECT_TIMESTAMPS`
+- `DIRECT_TIMESTAMPS_NON_MONOTONIC`
+- `DIRECT_CADENCE_MISMATCH`
+- `DIRECT_DROPPED_FRAME_GAP`
+- `DIRECT_TIMESTAMP_NEAR_DUPLICATE`
+- `MISSING_SENSOR_TIMESTAMPS`
+- `SENSOR_MEMBERSHIP_UNAVAILABLE`
+- `NONZERO_OFFSET_OUT_OF_BOUND`
+- `AMBIGUOUS_WRONG_BY_K_OFFSET`
+- `PIXEL_READBACK_FAILED`
+- `BLANK_OR_STALE_PIXEL_PROOF`
+- `RESOURCE_LIMIT_EXCEEDED`
+- `LATE_CALLBACK_AFTER_TEARDOWN`
+- `PROOF_TOKEN_REJECTED`
+
 ## Capture Modes
 
 - 120 fps on S10+ uses record-then-decode because it records cleanly.
@@ -261,3 +294,18 @@ Phase 8 measurement-run failure reasons are:
   only with a synthetic timing-proof token defined in test source. Main
   production source has no timing-proof implementation, so Phase 5/6/7 real
   sources still return no-read with `UNPROVEN_TIMING`.
+- Phase 9 adds direct-source proof contracts. The companion-encoder shape is
+  tried first, but the encoded scratch MP4 is only a session driver and is not
+  decoded or read for proof. The runner validates consumed `SurfaceTexture`
+  timestamps and same-update aggregate pixel signatures from the companion
+  shape before any token eligibility exists, and rejects fewer than 12 consumed
+  direct frames as `INSUFFICIENT_DIRECT_FRAMES`. The preview-only control runs
+  only after companion teardown and scratch deletion, remains diagnostic-only,
+  and cannot mint a proof token. The production direct-source token factory emits
+  a bound direct measurement input; a naked direct token passed to the generic
+  pipeline remains `UNPROVEN_TIMING`, and the bound input rejects any measured
+  sequence whose count, relative timestamps, dimensions, or aggregate pixel
+  signatures do not match the proven direct frames. Caller-settable sequence
+  identity therefore cannot produce a speed. Testers can trigger the path with the debug-only
+  `autoStartDirectProof120` adb extra; failures still render as no-read
+  diagnostics with no path, pixel, speed, angle, or trajectory values.

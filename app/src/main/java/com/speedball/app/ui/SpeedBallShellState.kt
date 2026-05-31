@@ -1,6 +1,9 @@
 package com.speedball.app.ui
 
 import com.speedball.app.decode.DecodeOutcome
+import com.speedball.app.capture.DirectSessionProbeOutcome
+import com.speedball.app.capture.DirectTimingSourceProofOutcome
+import com.speedball.app.capture.DirectTimingSourceProofRunResult
 import com.speedball.app.capture.PreviewFrameOutcome
 import com.speedball.app.measurement.MeasurementPipeline
 import com.speedball.app.measurement.MeasurementRunFailure
@@ -167,6 +170,32 @@ fun previewOutcomeUiLines(outcome: PreviewFrameOutcome?): List<String> =
                 "previewGapMs median=${diagnostics.medianPreviewGapMillis.formatOrNa()} max=${diagnostics.maximumPreviewGapMillis.formatOrNa()} " +
                     "sensorMedian=${diagnostics.medianSensorGapMillis.formatOrNa()}",
             )
+        }
+    }
+
+fun directProofRunUiLines(result: DirectTimingSourceProofRunResult?): List<String> =
+    when (result) {
+        null -> emptyList()
+        else -> buildList {
+            add(
+                when (val proof = result.proofOutcome) {
+                    is DirectTimingSourceProofOutcome.Success ->
+                        "directProof=success frames=${proof.frames.size} tokenEligible=true"
+                    is DirectTimingSourceProofOutcome.Failure ->
+                        "directProofFailure=${proof.reason} message=${proof.message}"
+                    DirectTimingSourceProofOutcome.Cancelled ->
+                        "directProof=cancelled"
+                },
+            )
+            when (val companion = result.companionOutcome) {
+                is DirectSessionProbeOutcome.Success -> add(
+                    "directCompanion shape=${companion.shape} requestList=${companion.requestListSize} directFrames=${companion.frames.size} sensorTs=${companion.sensorTimestampsNanos.size}",
+                )
+                is DirectSessionProbeOutcome.Failure -> add(
+                    "directCompanionFailure=${companion.reason} shape=${companion.shape} directFrames=${companion.directTimestampCount} sensorTs=${companion.sensorTimestampCount}",
+                )
+            }
+            add("directPreviewControl attempted=${result.previewControl.attempted}")
         }
     }
 

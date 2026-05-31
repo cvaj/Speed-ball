@@ -18,6 +18,16 @@ import com.speedball.app.capture.BurstDiagnostics
 import com.speedball.app.capture.BurstFailure
 import com.speedball.app.capture.BurstOptions
 import com.speedball.app.capture.BurstOutcome
+import com.speedball.app.capture.DirectCompanionTimingProofCapture
+import com.speedball.app.capture.DirectPixelProofConfig
+import com.speedball.app.capture.DirectPreviewControlReport
+import com.speedball.app.capture.DirectProofRunId
+import com.speedball.app.capture.DirectProofSessionShape
+import com.speedball.app.capture.DirectSessionProbeOutcome
+import com.speedball.app.capture.DirectTimingSourceFailure
+import com.speedball.app.capture.DirectTimingSourceProofOutcome
+import com.speedball.app.capture.DirectTimingSourceProofRunResult
+import com.speedball.app.capture.DirectTimingSourceProofRunner
 import com.speedball.app.capture.HighSpeedBurstRecorder
 import com.speedball.app.capture.HighSpeedCamera
 import com.speedball.app.capture.HighSpeedMode
@@ -38,12 +48,16 @@ import com.speedball.app.decode.timestampAnchorDiagnosticLogLines
 import com.speedball.app.ui.SpeedBallApp
 import com.speedball.app.ui.SpeedBallShellState
 import com.speedball.app.ui.decodeOutcomeUiLines
+import com.speedball.app.ui.directProofRunUiLines
 import com.speedball.app.ui.previewOutcomeUiLines
 import com.speedball.app.ui.speedBallCaptureState
 import com.speedball.app.ui.speedBallPlaceholderState
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /** Launches the Compose shell and owns Camera2 capture plus Phase 5 decode diagnostics. */
 class MainActivity : ComponentActivity() {
@@ -51,21 +65,25 @@ class MainActivity : ComponentActivity() {
     private lateinit var highSpeedCamera: HighSpeedCamera
     private lateinit var burstRecorder: HighSpeedBurstRecorder
     private lateinit var previewSpikeCapture: PreviewTimestampSpikeCapture
+    private lateinit var directProofCapture: DirectCompanionTimingProofCapture
     private val burstVideoDecoder = BurstVideoDecoder()
     private val decodeCompletionGate = DecodeCompletionGate()
     private val decodeSupervisorExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val decodeWorkerExecutor: ExecutorService = Executors.newCachedThreadPool()
+    private val directProofExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var previewSurface: Surface? = null
     private var modes: List<HighSpeedMode> = emptyList()
     private var selectedMode: HighSpeedMode? = null
     private var lastDiagnostics: BurstDiagnostics? = null
     private var lastDecodeOutcome: DecodeOutcome? = null
     private var lastPreviewOutcome: PreviewFrameOutcome? = null
+    private var lastDirectProofResult: DirectTimingSourceProofRunResult? = null
     private var lastFailure: BurstOutcome.Failure? = null
     private var captureStatus: String = "Idle"
     private var shellState by mutableStateOf(speedBallPlaceholderState())
     private var autoStartPending = false
     private var autoStartPreviewPending = false
+    private var autoStartDirectProofPending = false
     private var activityResumed = false
     private var windowFocused = false
 
@@ -79,8 +97,10 @@ class MainActivity : ComponentActivity() {
         highSpeedCamera = HighSpeedCamera(this)
         burstRecorder = HighSpeedBurstRecorder(this)
         previewSpikeCapture = PreviewTimestampSpikeCapture(this)
+        directProofCapture = DirectCompanionTimingProofCapture(this)
         autoStartPending = intent.getBooleanExtra("autoStart120", false)
         autoStartPreviewPending = intent.getBooleanExtra("autoStartPreview120", false)
+        autoStartDirectProofPending = intent.getBooleanExtra("autoStartDirectProof120", false)
         configurePreviewProofWindow()
         updateShellState(status = "Idle")
         setContent {
@@ -97,19 +117,21 @@ class MainActivity : ComponentActivity() {
                 onStopBurst = { stopBurst() },
             )
         }
-        if (autoStartPending || autoStartPreviewPending) refreshModes()
+        if (autoStartPending || autoStartPreviewPending || autoStartDirectProofPending) refreshModes()
     }
 
     override fun onResume() {
         super.onResume()
         activityResumed = true
         startAutoPreviewIfReady()
+        startAutoDirectProofIfReady()
     }
 
     override fun onPause() {
         activityResumed = false
         stopBurst()
         stopPreviewSpike()
+        stopDirectProof()
         super.onPause()
     }
 
@@ -117,17 +139,20 @@ class MainActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         windowFocused = hasFocus
         if (hasFocus) startAutoPreviewIfReady()
+        if (hasFocus) startAutoDirectProofIfReady()
     }
 
     override fun onStop() {
         stopBurst()
         stopPreviewSpike()
+        stopDirectProof()
         super.onStop()
     }
 
     override fun onDestroy() {
         decodeSupervisorExecutor.shutdownNow()
         decodeWorkerExecutor.shutdownNow()
+        directProofExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -153,6 +178,7 @@ class MainActivity : ComponentActivity() {
                 Log.i(logTag, "MODES ${modes.joinToString { it.label + ":recordSupported=" + it.recordSupported }}")
                 updateShellState(status = "Modes loaded")
                 startAutoPreviewIfReady()
+                startAutoDirectProofIfReady()
                 startAutoBurstIfReady()
             }
             is HighSpeedModesResult.Failure -> {
@@ -183,6 +209,7 @@ class MainActivity : ComponentActivity() {
         lastFailure = null
         lastDecodeOutcome = null
         lastPreviewOutcome = null
+        lastDirectProofResult = null
         updateShellState(status = captureStatus)
         val immediateFailure = burstRecorder.start(BurstOptions(mode), surface, modes) { outcome ->
             runOnUiThread {
@@ -268,6 +295,86 @@ class MainActivity : ComponentActivity() {
         previewSpikeCapture.stopActive()
     }
 
+    private fun startDirectProof() {
+        if (!hasCameraPermission()) {
+            lastDirectProofResult = immediateDirectProofFailure(DirectTimingSourceFailure.CAMERA_OPEN_FAILED, "Camera permission is required.")
+            updateShellState(status = "Permission required")
+            return
+        }
+        if (modes.isEmpty()) refreshModes()
+        val mode = selectedMode
+        if (mode == null) {
+            lastDirectProofResult = immediateDirectProofFailure(DirectTimingSourceFailure.UNSUPPORTED_MODE, "A fixed high-speed mode is required.")
+            updateShellState(status = "Direct proof unavailable")
+            return
+        }
+        captureStatus = "Direct proof running"
+        lastDirectProofResult = null
+        lastPreviewOutcome = null
+        lastFailure = null
+        lastDecodeOutcome = null
+        updateShellState(status = captureStatus)
+        val options = BurstOptions(mode)
+        directProofExecutor.execute {
+            val runner = DirectTimingSourceProofRunner(
+                companionProbe = { runDirectCompanionProbe(options) },
+                previewControl = { runPreviewControlProbe(options) },
+                logger = { line -> Log.i(logTag, line) },
+            )
+            val result = runner.run(
+                runId = DirectProofRunId("direct-${System.currentTimeMillis()}"),
+                mode = mode,
+                pixelConfig = DIRECT_UI_PIXEL_CONFIG,
+            )
+            runOnUiThread {
+                lastDirectProofResult = result
+                captureStatus = when (result.proofOutcome) {
+                    is DirectTimingSourceProofOutcome.Success -> "Direct proof complete"
+                    is DirectTimingSourceProofOutcome.Failure -> "Direct proof failed"
+                    DirectTimingSourceProofOutcome.Cancelled -> "Direct proof cancelled"
+                }
+                updateShellState(status = captureStatus)
+            }
+        }
+    }
+
+    private fun stopDirectProof() {
+        directProofCapture.stopActive()
+    }
+
+    private fun runDirectCompanionProbe(options: BurstOptions): DirectSessionProbeOutcome {
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<DirectSessionProbeOutcome?>()
+        val immediateFailure = directProofCapture.start(options, modes) { outcome ->
+            result.set(outcome)
+            latch.countDown()
+        }
+        if (immediateFailure != null) return immediateFailure
+        val completed = latch.await(options.durationMillis + DIRECT_PROOF_TIMEOUT_PADDING_MILLIS, TimeUnit.MILLISECONDS)
+        if (!completed) {
+            directProofCapture.stopActive()
+            return directProbeFailure(DirectTimingSourceFailure.RESOURCE_LIMIT_EXCEEDED, "Direct proof timed out before completion.")
+        }
+        return result.get() ?: directProbeFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct proof completed without an outcome.")
+    }
+
+    private fun runPreviewControlProbe(options: BurstOptions): PreviewFrameOutcome {
+        Thread.sleep(DIRECT_PROOF_CAMERA_SETTLE_MILLIS)
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<PreviewFrameOutcome?>()
+        val immediateFailure = previewSpikeCapture.start(options, modes) { outcome ->
+            result.set(outcome)
+            latch.countDown()
+        }
+        if (immediateFailure != null) return immediateFailure
+        val completed = latch.await(options.durationMillis + DIRECT_PROOF_TIMEOUT_PADDING_MILLIS, TimeUnit.MILLISECONDS)
+        if (!completed) {
+            previewSpikeCapture.stopActive()
+            return PreviewFrameOutcome.Failure(com.speedball.app.capture.PreviewFrameFailure.FRAME_TIMEOUT, "Preview control timed out before completion.")
+        }
+        return result.get() ?: PreviewFrameOutcome.Failure(com.speedball.app.capture.PreviewFrameFailure.SESSION_CONFIGURATION_FAILED, "Preview control completed without an outcome.")
+    }
+
     private fun startDecodeProof(outcome: BurstOutcome.Success) {
         val file = outcome.outputFile
         val fps = outcome.requestedFps
@@ -332,8 +439,14 @@ class MainActivity : ComponentActivity() {
         startPreviewSpike()
     }
 
+    private fun startAutoDirectProofIfReady() {
+        if (!autoStartDirectProofPending || selectedMode == null || !activityResumed || !windowFocused) return
+        autoStartDirectProofPending = false
+        startDirectProof()
+    }
+
     private fun configurePreviewProofWindow() {
-        if (!autoStartPreviewPending || !isDebuggableBuild()) return
+        if ((!autoStartPreviewPending && !autoStartDirectProofPending) || !isDebuggableBuild()) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -360,10 +473,33 @@ class MainActivity : ComponentActivity() {
                 "${mode.label} ($support)"
             },
             selectedModeLine = selectedMode?.label,
-            diagnosticLines = lastDiagnostics?.toUiLines().orEmpty() + decodeOutcomeUiLines(lastDecodeOutcome) + previewOutcomeUiLines(lastPreviewOutcome),
+            diagnosticLines = lastDiagnostics?.toUiLines().orEmpty() +
+                decodeOutcomeUiLines(lastDecodeOutcome) +
+                previewOutcomeUiLines(lastPreviewOutcome) +
+                directProofRunUiLines(lastDirectProofResult),
             failureLine = lastFailure?.let { "Failure: ${it.reason} - ${it.message}" },
         )
     }
+
+    private fun immediateDirectProofFailure(
+        reason: DirectTimingSourceFailure,
+        message: String,
+    ): DirectTimingSourceProofRunResult =
+        DirectTimingSourceProofRunResult(
+            companionOutcome = directProbeFailure(reason, message),
+            previewControl = DirectPreviewControlReport(attempted = false, outcome = null),
+            proofOutcome = DirectTimingSourceProofOutcome.Failure(reason, message),
+        )
+
+    private fun directProbeFailure(
+        reason: DirectTimingSourceFailure,
+        message: String,
+    ): DirectSessionProbeOutcome.Failure =
+        DirectSessionProbeOutcome.Failure(
+            shape = DirectProofSessionShape.COMPANION_ENCODER,
+            reason = reason,
+            message = message,
+        )
 
     private fun hasCameraPermission(): Boolean =
         checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -446,5 +582,8 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         const val LOG_VALUE_CHUNK_SIZE = 80
+        const val DIRECT_PROOF_TIMEOUT_PADDING_MILLIS = 15_000L
+        const val DIRECT_PROOF_CAMERA_SETTLE_MILLIS = 1_000L
+        val DIRECT_UI_PIXEL_CONFIG = DirectPixelProofConfig(maxTotalSamples = 1_440)
     }
 }

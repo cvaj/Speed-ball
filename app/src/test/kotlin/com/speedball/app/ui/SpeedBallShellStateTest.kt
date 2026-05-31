@@ -1,5 +1,11 @@
 package com.speedball.app.ui
 
+import com.speedball.app.capture.DirectPreviewControlReport
+import com.speedball.app.capture.DirectProofSessionShape
+import com.speedball.app.capture.DirectSessionProbeOutcome
+import com.speedball.app.capture.DirectTimingSourceFailure
+import com.speedball.app.capture.DirectTimingSourceProofOutcome
+import com.speedball.app.capture.DirectTimingSourceProofRunResult
 import com.speedball.app.capture.PreviewFrameDiagnostics
 import com.speedball.app.capture.PreviewFrameFailure
 import com.speedball.app.capture.PreviewFrameOutcome
@@ -135,6 +141,36 @@ class SpeedBallShellStateTest {
     }
 
     @Test
+    fun directProofFailureDiagnosticsRemainNoReadAndPathFree() {
+        val lines = directProofRunUiLines(
+            DirectTimingSourceProofRunResult(
+                companionOutcome = DirectSessionProbeOutcome.Failure(
+                    shape = DirectProofSessionShape.COMPANION_ENCODER,
+                    reason = DirectTimingSourceFailure.DIRECT_CADENCE_MISMATCH,
+                    message = "Consumed direct cadence did not match requested rate.",
+                    requestListSize = 4,
+                    directTimestampCount = 66,
+                    sensorTimestampCount = 320,
+                    pixelProofCount = 66,
+                ),
+                previewControl = DirectPreviewControlReport(attempted = true, outcome = previewControlFailure()),
+                proofOutcome = DirectTimingSourceProofOutcome.Failure(
+                    reason = DirectTimingSourceFailure.DIRECT_CADENCE_MISMATCH,
+                    message = "Consumed direct cadence did not match requested rate.",
+                ),
+            ),
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("directProofFailure=DIRECT_CADENCE_MISMATCH"))
+        assertTrue(joined.contains("directCompanionFailure=DIRECT_CADENCE_MISMATCH"))
+        assertTrue(joined.contains("directPreviewControl attempted=true"))
+        assertFalse(joined.contains("/storage/"))
+        assertFalse(joined.contains(".mp4"))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
     fun fullPrivatePathsAreNotIntroducedByDecodeLines() {
         val joined = decodeOutcomeUiLines(successOutcome()).joinToString("\n")
 
@@ -197,6 +233,9 @@ class SpeedBallShellStateTest {
             coalescingEvidence = false,
             verdict = PreviewFramePairingVerdict.NOT_EVALUATED,
         )
+
+    private fun previewControlFailure(): PreviewFrameOutcome.Failure =
+        PreviewFrameOutcome.Failure(PreviewFrameFailure.PREVIEW_CADENCE_MISMATCH, "Preview remains diagnostic.")
 
     private fun assertNoMeasurementWords(text: String) {
         assertFalse(text.contains("m" + "ph", ignoreCase = true))

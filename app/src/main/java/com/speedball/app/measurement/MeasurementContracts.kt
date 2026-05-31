@@ -35,9 +35,10 @@ data class TimedFrameSequence(
 /**
  * Evidence token for a frame source whose image/timestamp pairing has been proven.
  *
- * Phase 8 deliberately provides no implementation in main source. Integration
- * fixtures define a synthetic implementation in test source only; Phase 9 must
- * add a real production token only after source-specific timing proof exists.
+ * Integration fixtures define synthetic implementations in test source only.
+ * Main source may expose only the vetted Phase 9 direct-source implementation,
+ * and direct-source measurement must use the inseparable bound input emitted by
+ * the vetted factory rather than caller-settable sequence fields.
  */
 interface MeasurementTimingProof {
     val evidenceLabel: String

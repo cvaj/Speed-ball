@@ -37,6 +37,28 @@ object MeasurementPipeline {
         timingProof: MeasurementTimingProof,
         config: MeasurementPipelineConfig,
     ): MeasurementRunOutcome {
+        if (timingProof is DirectSourceMeasurementTimingProof) {
+            return MeasurementRunOutcome.NoRead(
+                reason = MeasurementRunFailure.UNPROVEN_TIMING,
+                message = "Direct timing proof must be used through its bound direct-source input.",
+            )
+        }
+        return measureValidated(sequence, calibration, timingProof, config)
+    }
+
+    fun measureWithDirectProof(
+        input: DirectSourceMeasurementInput,
+        calibration: MeasurementCalibrationState,
+        config: MeasurementPipelineConfig,
+    ): MeasurementRunOutcome =
+        measureValidated(input.sequence, calibration, input.timingProof, config)
+
+    private fun measureValidated(
+        sequence: TimedFrameSequence,
+        calibration: MeasurementCalibrationState,
+        timingProof: MeasurementTimingProof,
+        config: MeasurementPipelineConfig,
+    ): MeasurementRunOutcome {
         val pixelsPerFoot = when (val calibrationResult = calibration.pixelsPerFoot()) {
             is CalibrationResult.Failure -> return calibrationResult.toNoRead()
             is CalibrationResult.Success -> calibrationResult.pixelsPerFoot

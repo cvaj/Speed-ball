@@ -116,6 +116,74 @@ and return `UNPROVEN_TIMING`. Dropped or rejected interior frames do not renumbe
 timestamps; surviving detections keep the source frame timestamp so residual and
 time-spread gates still see gaps.
 
+## Phase 9 Direct Proof Domain Model
+
+```text
+DirectFrameProof list
+  -> require at least 12 consumed same-update direct frames
+  -> direct timestamps checked against SENSOR_TIMESTAMP values
+  -> exact membership or reviewed <1,000 ns zero-offset equivalent
+  -> reject wrong-by-k offsets, cadence/drop/duplicate/non-monotonic gaps
+  -> same-update tile/ROI pixels consumed into aggregate signatures only
+  -> reject blank/stale signatures, count mismatch, and resource overrun
+  -> companion encoder scratch MP4 is app-private cache data only
+  -> scratch MP4 deleted on terminal paths and never read as a source
+  -> timestamp + dimensions + frame order + aggregate pixel-signature digests
+  -> DirectSequenceContentIdentity
+  -> DirectProofTokenEligibility only after all source gates pass
+  -> vetted factory emits inseparable DirectSourceMeasurementInput
+  -> MeasurementPipeline.measureWithDirectProof
+```
+
+Task 1 adds the pure proof model only. It does not create an Android capture
+path and does not mint a production `MeasurementTimingProof`. A run id alone is
+not enough to authorize measurement. The direct-source token cannot be passed
+through the generic `measureWithProvenTiming` path, and `TimedFrameSequence`
+does not expose caller-settable proof identity fields. The vetted factory binds
+current-run proof success to an inseparable `DirectSourceMeasurementInput` only
+when the candidate `TimedFrameSequence` matches the proven direct frames by
+count, relative timestamp, dimensions, and aggregate pixel signature. Only then
+can `MeasurementPipeline.measureWithDirectProof` return success. Direct proof
+diagnostics carry counts, session shape, sequence identity, and token-eligibility metadata, but no
+raw pixels, paths, user media identifiers, mph, angle, or trajectory values.
+The timestamp proof accepts exact `SENSOR_TIMESTAMP` membership first. A
+nonzero zero-offset-equivalent path is limited to offsets below `1,000 ns` and
+still rejects offsets ambiguous with whole-frame `k * expectedGap` displacement.
+The pixel proof consumes raw tile pixels only long enough to compute aggregate
+hash/checksum/variation metrics; no raw pixels are stored in diagnostics or
+logs.
+The companion encoder scratch helper exists only to provide a bounded
+`MediaRecorder` surface for the later Camera2 session shape. Its file is created
+under app-private cache, bounded by duration/size, deleted on terminal paths,
+and is not decoded, imported, path-logged, or measurement-consumed.
+The direct GL readback helper consumes each accepted `SurfaceTexture` callback
+with one `updateTexImage()` call, records that same consumed-frame timestamp,
+draws the external OES texture into a bounded pbuffer, and immediately converts
+`glReadPixels` output into the aggregate pixel signature. The frame collector
+stores only one atomic timestamp/signature proof record per callback, rejects
+late callbacks after teardown, and fails loud on frame/sample resource caps.
+The companion-first proof runner attempts the companion-encoder session shape
+before the preview-only control. It validates the companion's consumed direct
+timestamps and aggregate pixel signatures before producing token eligibility,
+and it rejects fewer than `12` consumed same-update frames with
+`INSUFFICIENT_DIRECT_FRAMES` before any token eligibility exists. The
+preview-only result is logged as a regression diagnostic only and cannot
+authorize a proof token. Camera-busy, camera-open, or scratch-cleanup failures
+stop before the preview control so the app cannot mask an unreleased camera or
+leftover scratch file with a later control result.
+The production direct-source timing token is structurally bound to the factory
+emitted `DirectSourceMeasurementInput`. A stale token, a naked direct token on
+the generic pipeline, a forged success outside the allowlisted proof producers,
+or a measured sequence that does not recreate the proof-frame signatures remains
+`UNPROVEN_TIMING`.
+The debug `autoStartDirectProof120` entry point runs the direct companion proof
+from `MainActivity`. It owns a companion `MediaRecorder` scratch surface and a
+direct `SurfaceTexture`/GL readback surface in the same constrained high-speed
+session, then runs the preview-only control as a separate diagnostic when the
+companion teardown permits it. UI diagnostics show only direct proof status,
+typed failures, counts, and whether preview control was attempted; they do not
+show paths, raw pixels, mph, angle, or trajectory on failure.
+
 ## Preview Timestamp Proof Path
 
 ```text
