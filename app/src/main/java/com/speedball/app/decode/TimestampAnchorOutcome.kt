@@ -52,6 +52,7 @@ data class TimestampAnchorDiagnostics(
     val rawSensorTimestampCount: Int,
     val uniqueSensorTimestampCount: Int,
     val nearDuplicateEvidence: NearDuplicateEvidence? = null,
+    val evaluatedCandidates: List<TimestampAnchorCandidate> = emptyList(),
     val evaluatedCandidateCount: Int = 0,
     val survivingCandidateCount: Int = 0,
     val maximumResidualMicros: Long? = null,
