@@ -28,6 +28,10 @@ mode, trajectory, or placeholder result value.
 
 Frame coordinates are raw image pixels. Image `y` points downward, so upward velocity is negative `vy`.
 
+The core measurement API accepts validated detections and distance calibration,
+then returns either a typed success or a typed failure. Failures do not contain
+mph, angle, or partial result values.
+
 Speed is:
 
 ```text
@@ -50,9 +54,20 @@ The app must show "No read" rather than a wrong speed when:
 
 - fewer than three valid detections exist;
 - timestamps are missing, duplicate, non-monotonic, or unpaired;
+- timestamps are too close together to produce a meaningful fit;
 - calibration is missing or invalid;
 - the fit is non-finite or residuals are too large;
 - the detector cannot distinguish the ball from background blobs.
+
+Core failure reasons are:
+
+- `INSUFFICIENT_DETECTIONS`
+- `BAD_TIMESTAMP`
+- `INVALID_DETECTION`
+- `INVALID_CALIBRATION`
+- `INVALID_OPTIONS`
+- `NON_FINITE_FIT`
+- `EXCESSIVE_RESIDUAL`
 
 ## Capture Modes
 

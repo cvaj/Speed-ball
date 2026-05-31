@@ -12,11 +12,28 @@ MainActivity
 
 The root project now has two modules:
 
-- `:core` is pure Kotlin/JVM and currently exposes only a module identity marker.
+- `:core` is pure Kotlin/JVM and contains measurement model, calibration,
+  unit-conversion, velocity-fit, outlier-rejection, and fail-loud measurement
+  outcome logic.
 - `:app` depends on `:core` and renders the placeholder Android shell.
 
 No camera frames, imported media, calibration data, detections, timestamps,
-velocity fits, or trajectory values flow through the app in Phase 1.
+velocity fits, or trajectory values flow through the app shell yet.
+
+## Core Measurement Path
+
+```text
+List<Detection> + pixelsPerFoot + MeasurementOptions
+  -> timestamp/input/calibration validation
+  -> centered-time OLS fit
+  -> optional leave-one-out rejection
+  -> residual gate
+  -> px/s -> ft/s -> mph
+  -> MeasurementOutcome.Success or MeasurementOutcome.Failure
+```
+
+`MeasurementOutcome.Failure` carries only a reason and message, never a partial
+speed or angle.
 
 ## Live 120 fps Path
 

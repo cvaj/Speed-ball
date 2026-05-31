@@ -12,9 +12,10 @@ Every Speed-ball capability must have functional proof. New capabilities must ad
 | HSV color calibration | Tap/sample -> HSV band -> mask preview/detection | Planned |
 | Ball centroid detection | Real frame fixtures produce centroids within tolerance | Planned |
 | Flight window selection | No read on insufficient/ambiguous detections; valid window on known clip | Planned |
-| Velocity fit | Golden values for slope, speed, angle, residuals, outlier rejection | Planned |
-| Distance calibration | Known pixel gap and real distance produce expected pixels/foot | Planned |
-| Unit conversion | px/s -> ft/s -> mph golden values | Planned |
+| Velocity fit | Golden values for slope, speed, angle, residuals, outlier rejection | Phase 2 implemented in `:core:test`; canonical `hitting2` parity pending until fixture data exists |
+| Distance calibration | Known pixel gap and real distance produce expected pixels/foot | Phase 2 implemented in `:core:test` |
+| Unit conversion | px/s -> ft/s -> mph golden values | Phase 2 implemented in `:core:test` |
+| Core measurement outcome | Detections + calibration -> typed success/failure; no partial mph/angle on failure | Phase 2 implemented in `:core:test` with synthetic end-to-end golden and invalid-options failure coverage |
 | Drag trajectory | No-drag closed form, drag monotonicity, hand-calculated case | Planned |
 | Results UI | Valid read and no-read states display correct user-facing messages | Planned |
 | Import mode | Imported clip runs same detector/math pipeline | Planned |
