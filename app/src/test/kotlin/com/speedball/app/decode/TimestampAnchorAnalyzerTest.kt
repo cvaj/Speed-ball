@@ -2,6 +2,7 @@ package com.speedball.app.decode
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertInstanceOf
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import kotlin.math.roundToLong
@@ -108,6 +109,140 @@ class TimestampAnchorAnalyzerTest {
         assertTrue(diagnostics.evaluatedCandidates.all { it.provenance.contains("shift=") })
     }
 
+    @Test
+    fun cleanCaptureBasedFixtureMapsEveryPts() {
+        val metadata = metadata(presentationTimeMicros = listOf(0L, 8_333L, 16_666L, 24_999L))
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata,
+            uniqueSensorTimestampsNanos = metadata.presentationTimeMicros
+                .map { (1_000_000L + it) * 1_000L },
+            candidate = candidate(offsetMicros = 1_000_000L),
+        )
+
+        assertNull(evaluation.failure)
+        assertEquals(metadata.frameCount, evaluation.matches.size)
+        assertEquals(listOf(0, 1, 2, 3), evaluation.matches.map { it.sensorIndex })
+        assertEquals(0L, evaluation.maximumResidualMicros)
+        assertEquals(0L, evaluation.medianResidualMicros)
+    }
+
+    @Test
+    fun mappingTraversalAdvancesMonotonicSensorPointerInPtsOrder() {
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L)),
+            uniqueSensorTimestampsNanos = listOf(1_000L, 1_800L, 2_000L, 3_000L).map { it * 1_000L },
+            candidate = candidate(offsetMicros = 1_000L),
+        )
+
+        assertNull(evaluation.failure)
+        assertEquals(listOf(0, 2, 3), evaluation.matches.map { it.sensorIndex })
+        assertEquals(listOf(0L, 0L, 0L), evaluation.matches.map { it.residualMicros })
+    }
+
+    @Test
+    fun manyToOneMatchesReject() {
+        val failure = validateTimestampAnchorMatches(
+            matches = listOf(
+                match(frameIndex = 0, sensorIndex = 0),
+                match(frameIndex = 1, sensorIndex = 0),
+                match(frameIndex = 2, sensorIndex = 1),
+            ),
+            decodedFrameCount = 3,
+        )
+
+        assertEquals(TimestampAnchorFailure.MANY_TO_ONE_MAPPING, failure)
+    }
+
+    @Test
+    fun nonMonotonicMatchesReject() {
+        val failure = validateTimestampAnchorMatches(
+            matches = listOf(
+                match(frameIndex = 0, sensorIndex = 1),
+                match(frameIndex = 1, sensorIndex = 0),
+                match(frameIndex = 2, sensorIndex = 2),
+            ),
+            decodedFrameCount = 3,
+        )
+
+        assertEquals(TimestampAnchorFailure.NON_MONOTONIC_MAPPING, failure)
+    }
+
+    @Test
+    fun residualsJustInsideMaxTolerancePass() {
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L)),
+            uniqueSensorTimestampsNanos = listOf(1_000L, 2_000L, 3_749L).map { it * 1_000L },
+            candidate = candidate(offsetMicros = 1_000L),
+        )
+
+        assertNull(evaluation.failure)
+        assertEquals(749L, evaluation.maximumResidualMicros)
+    }
+
+    @Test
+    fun residualsJustOutsideMaxToleranceReject() {
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L)),
+            uniqueSensorTimestampsNanos = listOf(1_000L, 2_000L, 3_751L).map { it * 1_000L },
+            candidate = candidate(offsetMicros = 1_000L),
+        )
+
+        assertEquals(TimestampAnchorFailure.RESIDUAL_TOO_LARGE, evaluation.failure)
+        assertEquals(751L, evaluation.maximumResidualMicros)
+    }
+
+    @Test
+    fun residualsJustInsideMedianTolerancePass() {
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L)),
+            uniqueSensorTimestampsNanos = listOf(1_250L, 2_250L, 3_000L).map { it * 1_000L },
+            candidate = candidate(offsetMicros = 1_000L),
+        )
+
+        assertNull(evaluation.failure)
+        assertEquals(250L, evaluation.medianResidualMicros)
+    }
+
+    @Test
+    fun residualsJustOutsideMedianToleranceReject() {
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L)),
+            uniqueSensorTimestampsNanos = listOf(1_251L, 2_251L, 3_000L).map { it * 1_000L },
+            candidate = candidate(offsetMicros = 1_000L),
+        )
+
+        assertEquals(TimestampAnchorFailure.RESIDUAL_TOO_LARGE, evaluation.failure)
+        assertEquals(251L, evaluation.medianResidualMicros)
+    }
+
+    @Test
+    fun fewerThanThreeMatchedFramesRejects() {
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L)),
+            uniqueSensorTimestampsNanos = listOf(1_000L, 2_000L).map { it * 1_000L },
+            candidate = candidate(offsetMicros = 1_000L),
+        )
+
+        assertEquals(TimestampAnchorFailure.INSUFFICIENT_MATCHED_FRAMES, evaluation.failure)
+        assertEquals(2, evaluation.matches.size)
+    }
+
+    @Test
+    fun analyzerReportsResidualGateDiagnosticsWithoutProvingAnchor() {
+        val metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L))
+        val outcome = analyzeTimestampAnchorEvidence(
+            metadata = metadata,
+            rawSensorTimestampsNanos = listOf(1_000L, 2_000L, 3_000L).map { it * 1_000L },
+        )
+        val rejected = assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, outcome)
+
+        assertEquals(TimestampAnchorFailure.NO_CANDIDATE, rejected.reason)
+        assertTrue(rejected.diagnostics.survivingCandidateCount > 0)
+        assertEquals(0L, rejected.diagnostics.maximumResidualMicros)
+        assertEquals(0L, rejected.diagnostics.medianResidualMicros)
+        assertTrue(outcome !is TimestampAnchorOutcome.Proven)
+    }
+
     private fun metadata(frameCount: Int): DecodedVideoMetadata =
         metadata(List(frameCount) { index -> (index * 8_333.333).roundToLong() })
 
@@ -128,6 +263,25 @@ class TimestampAnchorAnalyzerTest {
         gapMicros: Long = 8_333L,
     ): List<Long> =
         List(count) { index -> (baseMicros + index * gapMicros) * 1_000L }
+
+    private fun candidate(offsetMicros: Long): TimestampAnchorCandidate =
+        TimestampAnchorCandidate(
+            offsetMicros = offsetMicros,
+            wholeFrameShift = 0,
+            provenance = "test",
+        )
+
+    private fun match(
+        frameIndex: Int,
+        sensorIndex: Int,
+    ): TimestampAnchorMatch =
+        TimestampAnchorMatch(
+            frameIndex = frameIndex,
+            presentationTimeMicros = frameIndex * 1_000L,
+            sensorIndex = sensorIndex,
+            sensorTimestampNanos = sensorIndex * 1_000_000L,
+            residualMicros = 0L,
+        )
 
     private fun ts(offsetMillis: Double): Long =
         1_000_000_000L + (offsetMillis * 1_000_000.0).roundToLong()

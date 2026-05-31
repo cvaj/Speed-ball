@@ -6,6 +6,8 @@ private const val DEFAULT_ANCHOR_REQUESTED_FPS = 120
 private const val BOUNDARY_SENSOR_SAMPLE_COUNT = 3
 private const val INTERIOR_SAMPLE_COUNT = 3
 private const val WHOLE_FRAME_SHIFT_GUARD_BAND = 2
+private const val MAX_ANCHOR_RESIDUAL_MICROS = 750L
+private const val MEDIAN_ANCHOR_RESIDUAL_MICROS = 250L
 
 internal data class TimestampAnchorCandidateGenerationDiagnostics(
     val expectedGapMicros: Long,
@@ -14,6 +16,16 @@ internal data class TimestampAnchorCandidateGenerationDiagnostics(
     val evaluatedWholeFrameShifts: List<Int>,
     val candidates: List<TimestampAnchorCandidate>,
 )
+
+internal data class TimestampAnchorMappingEvaluation(
+    val candidate: TimestampAnchorCandidate,
+    val matches: List<TimestampAnchorMatch>,
+    val failure: TimestampAnchorFailure?,
+    val maximumResidualMicros: Long?,
+    val medianResidualMicros: Long?,
+) {
+    val passes: Boolean = failure == null
+}
 
 private data class BaseOffsetSource(
     val offsetMicros: Long,
@@ -56,12 +68,23 @@ fun analyzeTimestampAnchorEvidence(
         rawSensorTimestampsNanos = rawSensorTimestampsNanos,
         requestedFps = requestedFps,
     )
+    val evaluations = evaluateTimestampAnchorMappings(
+        metadata = metadata,
+        rawSensorTimestampsNanos = rawSensorTimestampsNanos,
+        requestedFps = requestedFps,
+        candidateGeneration = candidates,
+    )
+    val survivors = evaluations.filter { it.passes }
+    val rejectionReason = mostSpecificMappingFailure(evaluations)
     return TimestampAnchorOutcome.Rejected(
-        reason = TimestampAnchorFailure.NO_CANDIDATE,
-        message = "Timestamp anchor candidate generation is diagnostic-only until mapping and ambiguity gates are implemented.",
+        reason = rejectionReason,
+        message = "Timestamp anchor mapping is diagnostic-only until dropped-hole and ambiguity gates are implemented.",
         diagnostics = diagnostics.copy(
             evaluatedCandidates = candidates.candidates,
             evaluatedCandidateCount = candidates.candidates.size,
+            survivingCandidateCount = survivors.size,
+            maximumResidualMicros = evaluations.mapNotNull { it.maximumResidualMicros }.minOrNull(),
+            medianResidualMicros = evaluations.mapNotNull { it.medianResidualMicros }.minOrNull(),
         ),
     )
 }
@@ -102,6 +125,108 @@ internal fun generateTimestampAnchorCandidates(
             expectedGapMicros = expectedGapMicros,
         ),
     )
+}
+
+internal fun evaluateTimestampAnchorMappings(
+    metadata: DecodedVideoMetadata,
+    rawSensorTimestampsNanos: List<Long>,
+    requestedFps: Int = DEFAULT_ANCHOR_REQUESTED_FPS,
+    candidateGeneration: TimestampAnchorCandidateGenerationDiagnostics =
+        generateTimestampAnchorCandidates(metadata, rawSensorTimestampsNanos, requestedFps),
+): List<TimestampAnchorMappingEvaluation> {
+    require(requestedFps > 0) { "FPS must be positive." }
+    val uniqueSensorTimestampsNanos = buildTimestampDiagnostics(rawSensorTimestampsNanos, requestedFps)
+        .uniqueTimestampsNanos
+    return candidateGeneration.candidates.map { candidate ->
+        mapTimestampAnchorCandidate(
+            metadata = metadata,
+            uniqueSensorTimestampsNanos = uniqueSensorTimestampsNanos,
+            candidate = candidate,
+        )
+    }
+}
+
+internal fun mapTimestampAnchorCandidate(
+    metadata: DecodedVideoMetadata,
+    uniqueSensorTimestampsNanos: List<Long>,
+    candidate: TimestampAnchorCandidate,
+    maximumResidualToleranceMicros: Long = MAX_ANCHOR_RESIDUAL_MICROS,
+    medianResidualToleranceMicros: Long = MEDIAN_ANCHOR_RESIDUAL_MICROS,
+): TimestampAnchorMappingEvaluation {
+    require(maximumResidualToleranceMicros >= 0L) { "Maximum residual tolerance must be non-negative." }
+    require(medianResidualToleranceMicros >= 0L) { "Median residual tolerance must be non-negative." }
+    val matches = mutableListOf<TimestampAnchorMatch>()
+    var sensorCursor = 0
+    for ((frameIndex, ptsMicros) in metadata.presentationTimeMicros.withIndex()) {
+        if (sensorCursor >= uniqueSensorTimestampsNanos.size) break
+        val targetMicros = ptsMicros + candidate.offsetMicros
+        var bestIndex = sensorCursor
+        while (bestIndex + 1 < uniqueSensorTimestampsNanos.size) {
+            val currentResidual = abs(uniqueSensorTimestampsNanos[bestIndex] / 1_000L - targetMicros)
+            val nextResidual = abs(uniqueSensorTimestampsNanos[bestIndex + 1] / 1_000L - targetMicros)
+            if (nextResidual > currentResidual) break
+            bestIndex += 1
+        }
+        val sensorTimestampNanos = uniqueSensorTimestampsNanos[bestIndex]
+        matches += TimestampAnchorMatch(
+            frameIndex = frameIndex,
+            presentationTimeMicros = ptsMicros,
+            sensorIndex = bestIndex,
+            sensorTimestampNanos = sensorTimestampNanos,
+            residualMicros = abs(sensorTimestampNanos / 1_000L - targetMicros),
+        )
+        sensorCursor = bestIndex + 1
+    }
+    val structuralFailure = validateTimestampAnchorMatches(matches, metadata.frameCount)
+    val residuals = matches.map { it.residualMicros }
+    val maxResidual = residuals.maxOrNull()
+    val medianResidual = residuals.medianLongOrNull()
+    val residualFailure = if (
+        structuralFailure == null &&
+        ((maxResidual ?: 0L) > maximumResidualToleranceMicros || (medianResidual ?: 0L) > medianResidualToleranceMicros)
+    ) {
+        TimestampAnchorFailure.RESIDUAL_TOO_LARGE
+    } else {
+        null
+    }
+    return TimestampAnchorMappingEvaluation(
+        candidate = candidate,
+        matches = matches,
+        failure = structuralFailure ?: residualFailure,
+        maximumResidualMicros = maxResidual,
+        medianResidualMicros = medianResidual,
+    )
+}
+
+internal fun validateTimestampAnchorMatches(
+    matches: List<TimestampAnchorMatch>,
+    decodedFrameCount: Int,
+): TimestampAnchorFailure? {
+    if (matches.size < MINIMUM_RECONCILABLE_FRAME_COUNT) {
+        return TimestampAnchorFailure.INSUFFICIENT_MATCHED_FRAMES
+    }
+    if (matches.map { it.sensorIndex }.distinct().size != matches.size) {
+        return TimestampAnchorFailure.MANY_TO_ONE_MAPPING
+    }
+    if (!matches.map { it.sensorIndex }.zipWithNext().all { (a, b) -> b > a }) {
+        return TimestampAnchorFailure.NON_MONOTONIC_MAPPING
+    }
+    if (matches.size != decodedFrameCount) {
+        return TimestampAnchorFailure.NO_CANDIDATE
+    }
+    return null
+}
+
+private fun mostSpecificMappingFailure(evaluations: List<TimestampAnchorMappingEvaluation>): TimestampAnchorFailure {
+    if (evaluations.any { it.passes }) return TimestampAnchorFailure.NO_CANDIDATE
+    val failures = evaluations.mapNotNull { it.failure }.toSet()
+    return when {
+        TimestampAnchorFailure.RESIDUAL_TOO_LARGE in failures -> TimestampAnchorFailure.RESIDUAL_TOO_LARGE
+        TimestampAnchorFailure.MANY_TO_ONE_MAPPING in failures -> TimestampAnchorFailure.MANY_TO_ONE_MAPPING
+        TimestampAnchorFailure.NON_MONOTONIC_MAPPING in failures -> TimestampAnchorFailure.NON_MONOTONIC_MAPPING
+        TimestampAnchorFailure.INSUFFICIENT_MATCHED_FRAMES in failures -> TimestampAnchorFailure.INSUFFICIENT_MATCHED_FRAMES
+        else -> TimestampAnchorFailure.NO_CANDIDATE
+    }
 }
 
 private fun wholeFrameShiftRange(
@@ -184,4 +309,15 @@ private fun expandAndDeduplicateCandidates(
                 },
             )
         }
+}
+
+private fun List<Long>.medianLongOrNull(): Long? {
+    if (isEmpty()) return null
+    val sorted = sorted()
+    val middle = sorted.size / 2
+    return if (sorted.size % 2 == 0) {
+        ((sorted[middle - 1] + sorted[middle]) / 2.0).toLong()
+    } else {
+        sorted[middle]
+    }
 }
