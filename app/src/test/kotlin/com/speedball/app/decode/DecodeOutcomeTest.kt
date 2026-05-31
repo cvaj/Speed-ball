@@ -49,4 +49,20 @@ class DecodeOutcomeTest {
 
         assertFalse(outcome is DecodeOutcome.Failure)
     }
+
+    @Test
+    fun anchorOutcomeDoesNotImplementDecodeOutcome() {
+        val anchorOutcome = TimestampAnchorOutcome.Rejected(
+            reason = TimestampAnchorFailure.NO_CANDIDATE,
+            message = "Timestamp anchor rejected.",
+            diagnostics = TimestampAnchorDiagnostics(
+                decodedFrameCount = 3,
+                rawSensorTimestampCount = 3,
+                uniqueSensorTimestampCount = 3,
+            ),
+        )
+        val asAny: Any = anchorOutcome
+
+        assertFalse(asAny is DecodeOutcome)
+    }
 }
