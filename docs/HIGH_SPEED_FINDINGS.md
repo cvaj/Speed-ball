@@ -47,6 +47,58 @@ MediaRecorder MP4 distinct frames (cv2):
   1080p@240 slow-mo  -> 328 frames  (~124 fps; no gain — 108 MB file is bitrate×duration, not more frames)
 ```
 
+## Phase 4 app proof (S10+)
+
+After the Camera2 capture foundation landed in `:app`, we reran the proof through
+the real app on the connected S10+ (`SM-G975U`, Android 12), not the standalone
+prototype.
+
+HAL enumeration from the app:
+
+```text
+1280x720 @ 120 fps: recordSupported=true
+1920x1080 @ 120 fps: recordSupported=true
+1280x720 @ 240 fps: recordSupported=true
+1920x1080 @ 240 fps: recordSupported=true
+```
+
+Successful 720p@120 burst proof:
+
+```text
+callbacks=520
+uniqueTs=325
+expected=300
+min=240
+medianGapMs=8.33
+band=7.08..9.58
+medianPass=true
+proof=true
+file=speed_ball_1280x720_120_1780220549068.mp4
+bytes=6460459
+```
+
+The MP4 existed under the app-specific external files Movies directory with
+`6460459` bytes.
+
+Lifecycle-stop proof:
+
+```text
+callbacks=72
+uniqueTs=45
+expected=300
+min=240
+medianGapMs=8.33
+band=7.08..9.58
+medianPass=true
+proof=false
+file=speed_ball_1280x720_120_1780220593313.mp4
+bytes=612495
+```
+
+This run sent HOME during the burst. The app stopped early, closed a nonzero MP4,
+and correctly refused to claim 120 fps proof because the unique timestamp floor
+was not met.
+
 ## What this proves / disproves
 
 - ✅ Third-party Camera2 high-speed works on the S10+.

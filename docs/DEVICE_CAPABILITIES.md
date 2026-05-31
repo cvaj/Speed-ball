@@ -42,6 +42,7 @@ Probed with `prototype/hs-probe` (Camera2 `CONSTRAINED_HIGH_SPEED`, back camera 
 | 1080p @ 240 | 640 (all unique) | **4.12 ms** | **~242 fps** ✅ |
 | 720p @ 240 | 640 (all unique) | **4.12 ms** | **~242 fps** ✅ |
 | 1080p @ 120 | 400 | **8.33 ms** | ~120 fps ✅ |
+| Phase 4 app 720p @ 120 | 325 | **8.33 ms** | ~120 fps ✅ |
 
 The sensor + pipeline genuinely deliver **true ~242 fps at full 1080p** to our app. (Raw
 capture-callback counts were inflated on the 120 run by per-batch double-firing; the median
@@ -54,6 +55,7 @@ sensor-timestamp gap is the robust truth and was used here.)
 | 720p @ 240 (real-time) | 331 / 2.75 s | ~120 fps |
 | 1080p @ 120 (real-time) | 328 / 2.74 s | ~120 fps (clean) |
 | 1080p @ 240 (slow-mo tag) | 328 | ~124 fps (no gain) |
+| Phase 4 app 720p @ 120 | nonzero MP4, 6,460,459 bytes | timestamp proof passed |
 
 **The Exynos 9820 H.264 hardware encoder caps real-time persistence at ~120 fps** (true at
 both 720p and 1080p; slow-mo tagging did not help — frames arrive in real time and the

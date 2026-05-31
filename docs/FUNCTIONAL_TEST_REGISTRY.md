@@ -6,8 +6,8 @@ Every Speed-ball capability must have functional proof. New capabilities must ad
 |---|---|---|
 | Root Gradle app skeleton | Wrapper checksum, dependency resolution, `:core:test`, `:app:testDebugUnitTest`, `:app:assembleDebug`, `:app:lintDebug`, root scripts, and `:core` boundary check | Phase 1 implemented locally; all listed proofs passed before implementation review |
 | Placeholder no-read shell | JVM test asserts all workflow sections exist and no fake speed, frame rate, camera mode, or result value is exposed | Phase 1 implemented in `:app:testDebugUnitTest` |
-| Camera2 high-speed HAL enumeration | Device/prototype log proving supported fps/res combos; app mapper tests for fixed vs blended ranges | Phase 4 app implementation approved; S10+ proven in `docs/HIGH_SPEED_FINDINGS.md`; S22+ pending |
-| 120 fps burst capture | On-device burst with unique timestamp count, median gap in band, nonzero MP4, and clean release; decode reconciliation comes in Phase 5 | Phase 4 code-level implementation approved; device burst proof BLOCKED/pending locked-device unlock |
+| Camera2 high-speed HAL enumeration | Device/prototype log proving supported fps/res combos; app mapper tests for fixed vs blended ranges | Phase 4 app implementation approved and S10+ app HAL enumeration proven in `docs/HIGH_SPEED_FINDINGS.md`; S22+ pending |
+| 120 fps burst capture | On-device burst with unique timestamp count, median gap in band, nonzero MP4, and clean release; decode reconciliation comes in Phase 5 | Phase 4 S10+ app proof passed for 720p@120; lifecycle-stop early burst correctly failed proof while releasing output |
 | 240 fps GPU capture | On-device true 240 detections from preview/GPU path | Planned |
 | HSV color calibration | Tap/sample -> HSV band -> mask preview/detection | Planned |
 | Ball centroid detection | Real frame fixtures produce centroids within tolerance | Planned |
