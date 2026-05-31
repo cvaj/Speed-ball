@@ -1,6 +1,7 @@
 package com.speedball.app.ui
 
 import com.speedball.app.decode.DecodeOutcome
+import com.speedball.app.capture.PreviewFrameOutcome
 
 /** Availability marker for skeleton workflow sections before implementation phases land. */
 enum class PlaceholderStatus {
@@ -109,6 +110,30 @@ fun decodeOutcomeUiLines(outcome: DecodeOutcome?): List<String> =
                     },
                 )
             }
+        }
+    }
+
+fun previewOutcomeUiLines(outcome: PreviewFrameOutcome?): List<String> =
+    when (outcome) {
+        null -> emptyList()
+        PreviewFrameOutcome.Cancelled -> listOf("previewProof=cancelled")
+        is PreviewFrameOutcome.Failure -> buildList {
+            add("previewFailure=${outcome.reason} message=${outcome.message}")
+            outcome.diagnostics?.let { diagnostics ->
+                add("previewFrames=${diagnostics.uniquePreviewTimestampCount} sensorTs=${diagnostics.uniqueSensorTimestampCount} exactMatches=${diagnostics.exactMatchCount}")
+                add(
+                    "previewGapMs median=${diagnostics.medianPreviewGapMillis.formatOrNa()} max=${diagnostics.maximumPreviewGapMillis.formatOrNa()} " +
+                        "sensorMedian=${diagnostics.medianSensorGapMillis.formatOrNa()} coalescing=${diagnostics.coalescingEvidence}",
+                )
+            }
+        }
+        is PreviewFrameOutcome.Success -> buildList {
+            val diagnostics = outcome.diagnostics
+            add("previewPairs=${outcome.pairs.size} exactMatches=${diagnostics.exactMatchCount}")
+            add(
+                "previewGapMs median=${diagnostics.medianPreviewGapMillis.formatOrNa()} max=${diagnostics.maximumPreviewGapMillis.formatOrNa()} " +
+                    "sensorMedian=${diagnostics.medianSensorGapMillis.formatOrNa()}",
+            )
         }
     }
 

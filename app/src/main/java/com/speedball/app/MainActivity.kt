@@ -1,10 +1,13 @@
 package com.speedball.app
 
 import android.Manifest
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.Surface
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
@@ -19,6 +22,9 @@ import com.speedball.app.capture.HighSpeedBurstRecorder
 import com.speedball.app.capture.HighSpeedCamera
 import com.speedball.app.capture.HighSpeedMode
 import com.speedball.app.capture.HighSpeedModesResult
+import com.speedball.app.capture.PreviewFrameOutcome
+import com.speedball.app.capture.PreviewTimestampSpikeCapture
+import com.speedball.app.capture.previewFrameDiagnosticLogLines
 import com.speedball.app.capture.selectDefaultMode
 import com.speedball.app.decode.BurstVideoDecoder
 import com.speedball.app.decode.DecodeCompletionGate
@@ -32,6 +38,7 @@ import com.speedball.app.decode.timestampAnchorDiagnosticLogLines
 import com.speedball.app.ui.SpeedBallApp
 import com.speedball.app.ui.SpeedBallShellState
 import com.speedball.app.ui.decodeOutcomeUiLines
+import com.speedball.app.ui.previewOutcomeUiLines
 import com.speedball.app.ui.speedBallCaptureState
 import com.speedball.app.ui.speedBallPlaceholderState
 import java.io.File
@@ -43,6 +50,7 @@ class MainActivity : ComponentActivity() {
     private val logTag = "SPEEDBALL_CAPTURE"
     private lateinit var highSpeedCamera: HighSpeedCamera
     private lateinit var burstRecorder: HighSpeedBurstRecorder
+    private lateinit var previewSpikeCapture: PreviewTimestampSpikeCapture
     private val burstVideoDecoder = BurstVideoDecoder()
     private val decodeCompletionGate = DecodeCompletionGate()
     private val decodeSupervisorExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -52,10 +60,14 @@ class MainActivity : ComponentActivity() {
     private var selectedMode: HighSpeedMode? = null
     private var lastDiagnostics: BurstDiagnostics? = null
     private var lastDecodeOutcome: DecodeOutcome? = null
+    private var lastPreviewOutcome: PreviewFrameOutcome? = null
     private var lastFailure: BurstOutcome.Failure? = null
     private var captureStatus: String = "Idle"
     private var shellState by mutableStateOf(speedBallPlaceholderState())
     private var autoStartPending = false
+    private var autoStartPreviewPending = false
+    private var activityResumed = false
+    private var windowFocused = false
 
     private val requestCameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         updateShellState(status = if (it) "Permission granted" else "Permission denied")
@@ -66,7 +78,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         highSpeedCamera = HighSpeedCamera(this)
         burstRecorder = HighSpeedBurstRecorder(this)
+        previewSpikeCapture = PreviewTimestampSpikeCapture(this)
         autoStartPending = intent.getBooleanExtra("autoStart120", false)
+        autoStartPreviewPending = intent.getBooleanExtra("autoStartPreview120", false)
+        configurePreviewProofWindow()
         updateShellState(status = "Idle")
         setContent {
             val state: SpeedBallShellState = shellState
@@ -82,16 +97,31 @@ class MainActivity : ComponentActivity() {
                 onStopBurst = { stopBurst() },
             )
         }
-        if (autoStartPending) refreshModes()
+        if (autoStartPending || autoStartPreviewPending) refreshModes()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+        startAutoPreviewIfReady()
     }
 
     override fun onPause() {
+        activityResumed = false
         stopBurst()
+        stopPreviewSpike()
         super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        windowFocused = hasFocus
+        if (hasFocus) startAutoPreviewIfReady()
     }
 
     override fun onStop() {
         stopBurst()
+        stopPreviewSpike()
         super.onStop()
     }
 
@@ -122,6 +152,7 @@ class MainActivity : ComponentActivity() {
                 lastFailure = null
                 Log.i(logTag, "MODES ${modes.joinToString { it.label + ":recordSupported=" + it.recordSupported }}")
                 updateShellState(status = "Modes loaded")
+                startAutoPreviewIfReady()
                 startAutoBurstIfReady()
             }
             is HighSpeedModesResult.Failure -> {
@@ -151,6 +182,7 @@ class MainActivity : ComponentActivity() {
         captureStatus = "Recording"
         lastFailure = null
         lastDecodeOutcome = null
+        lastPreviewOutcome = null
         updateShellState(status = captureStatus)
         val immediateFailure = burstRecorder.start(BurstOptions(mode), surface, modes) { outcome ->
             runOnUiThread {
@@ -191,6 +223,49 @@ class MainActivity : ComponentActivity() {
     private fun stopBurst() {
         burstRecorder.stopActive()
         cancelDecodeProof()
+    }
+
+    private fun startPreviewSpike() {
+        if (!hasCameraPermission()) {
+            lastPreviewOutcome = PreviewFrameOutcome.Failure(com.speedball.app.capture.PreviewFrameFailure.CAMERA_PERMISSION_DENIED, "Camera permission is required.")
+            updateShellState(status = "Permission required")
+            return
+        }
+        if (modes.isEmpty()) refreshModes()
+        val mode = selectedMode
+        if (mode == null) {
+            lastPreviewOutcome = PreviewFrameOutcome.Failure(com.speedball.app.capture.PreviewFrameFailure.UNSUPPORTED_MODE, "A fixed high-speed mode is required.")
+            updateShellState(status = "Preview proof unavailable")
+            return
+        }
+        captureStatus = "Preview proof running"
+        lastPreviewOutcome = null
+        lastFailure = null
+        lastDecodeOutcome = null
+        Log.i(logTag, "PREVIEW_PATH_START mode=${mode.label.compactForLog()}")
+        updateShellState(status = captureStatus)
+        val immediateFailure = previewSpikeCapture.start(BurstOptions(mode), modes) { outcome ->
+            runOnUiThread {
+                lastPreviewOutcome = outcome
+                captureStatus = when (outcome) {
+                    is PreviewFrameOutcome.Success -> "Preview proof complete"
+                    is PreviewFrameOutcome.Failure -> "Preview proof failed"
+                    PreviewFrameOutcome.Cancelled -> "Preview proof cancelled"
+                }
+                logPreviewOutcome(mode, outcome)
+                updateShellState(status = captureStatus)
+            }
+        }
+        if (immediateFailure != null) {
+            lastPreviewOutcome = immediateFailure
+            captureStatus = "Preview proof failed"
+            logPreviewOutcome(mode, immediateFailure)
+            updateShellState(status = captureStatus)
+        }
+    }
+
+    private fun stopPreviewSpike() {
+        previewSpikeCapture.stopActive()
     }
 
     private fun startDecodeProof(outcome: BurstOutcome.Success) {
@@ -251,6 +326,30 @@ class MainActivity : ComponentActivity() {
         startBurst()
     }
 
+    private fun startAutoPreviewIfReady() {
+        if (!autoStartPreviewPending || selectedMode == null || !activityResumed || !windowFocused) return
+        autoStartPreviewPending = false
+        startPreviewSpike()
+    }
+
+    private fun configurePreviewProofWindow() {
+        if (!autoStartPreviewPending || !isDebuggableBuild()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
+            @Suppress("DEPRECATION")
+            window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Log.i(logTag, "PREVIEW_PROOF_WINDOW debugShowWhenLocked=true")
+    }
+
+    private fun isDebuggableBuild(): Boolean =
+        (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
     private fun updateShellState(status: String) {
         captureStatus = status
         shellState = speedBallCaptureState(
@@ -261,7 +360,7 @@ class MainActivity : ComponentActivity() {
                 "${mode.label} ($support)"
             },
             selectedModeLine = selectedMode?.label,
-            diagnosticLines = lastDiagnostics?.toUiLines().orEmpty() + decodeOutcomeUiLines(lastDecodeOutcome),
+            diagnosticLines = lastDiagnostics?.toUiLines().orEmpty() + decodeOutcomeUiLines(lastDecodeOutcome) + previewOutcomeUiLines(lastPreviewOutcome),
             failureLine = lastFailure?.let { "Failure: ${it.reason} - ${it.message}" },
         )
     }
@@ -315,6 +414,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun logPreviewOutcome(mode: HighSpeedMode, outcome: PreviewFrameOutcome) {
+        when (outcome) {
+            PreviewFrameOutcome.Cancelled -> Log.i(logTag, "PREVIEW_TIMESTAMP_SPIKE_CANCELLED mode=${mode.label.compactForLog()}")
+            is PreviewFrameOutcome.Failure -> Log.i(logTag, "PREVIEW_TIMESTAMP_SPIKE_FAILURE mode=${mode.label.compactForLog()} reason=${outcome.reason} message=${outcome.message.compactForLog()}")
+            is PreviewFrameOutcome.Success -> Log.i(logTag, "PREVIEW_TIMESTAMP_SPIKE_SUCCESS mode=${mode.label.compactForLog()} pairs=${outcome.pairs.size}")
+        }
+        previewFrameDiagnosticLogLines(outcome, mode.label, LOG_VALUE_CHUNK_SIZE).forEach { line ->
+            Log.i(logTag, line)
+        }
+    }
+
     private fun File.displayNameOnly(): String =
         name.ifBlank { absolutePath.substringAfterLast('/') }
 
@@ -330,6 +440,9 @@ class MainActivity : ComponentActivity() {
 
     private fun Double.format(decimals: Int): String =
         "%.${decimals}f".format(this)
+
+    private fun String.compactForLog(): String =
+        replace(Regex("\\s+"), "_")
 
     private companion object {
         const val LOG_VALUE_CHUNK_SIZE = 80

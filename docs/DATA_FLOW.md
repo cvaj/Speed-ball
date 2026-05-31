@@ -16,16 +16,16 @@ The root project now has two modules:
   unit-conversion, velocity-fit, outlier-rejection, fail-loud measurement outcome
   logic, and trajectory physics.
 - `:app` depends on `:core`, renders the Android shell, and owns the Camera2
-  capture foundation plus Phase 5 decode/frame-timestamp proof and Phase 6
-  value-anchor investigation logging.
+  capture foundation plus Phase 5 decode/frame-timestamp proof, Phase 6
+  value-anchor investigation logging, and Phase 7 preview timestamp proof.
 
 No imported media, calibration data, detections, velocity fits, mph results, or
 trajectory values flow through the app shell yet. Camera HAL modes,
-SENSOR_TIMESTAMP diagnostics, decoded frame counts, PTS gap diagnostics, and
-sampled frame dimensions may flow through the developer diagnostics surface only
-after real enumeration/capture/decode proof or a typed failure. Phase 6 anchor
-diagnostics flow only to bounded logcat lines and remain outside the Compose
-result state.
+SENSOR_TIMESTAMP diagnostics, decoded frame counts, PTS gap diagnostics, preview
+timestamp proof diagnostics, and sampled frame dimensions may flow through the
+developer diagnostics surface only after real enumeration/capture/decode/proof
+or a typed failure. Phase 6 anchor diagnostics flow only to bounded logcat lines
+and remain outside the Compose result state.
 
 ## Core Measurement Path
 
@@ -91,6 +91,30 @@ and the S10+ device proof for anchor behavior now rejects fail-loud with
 sensor timestamps `325`, hypothetical post-collapse sensor count `260`).
 Detection, calibration UI, result UI, import mode, and 240 fps GPU proof remain
 planned.
+
+## Preview Timestamp Proof Path
+
+```text
+MainActivity --ez autoStartPreview120 true
+  -> debug-only show-when-locked / turn-screen-on proof window
+  -> PreviewTimestampSpikeCapture
+  -> Camera2 constrained high-speed session
+  -> single SurfaceTexture preview target
+  -> SurfaceTexture.updateTexImage() consumed-frame timestamps
+  -> CaptureResult.SENSOR_TIMESTAMP callback timestamps
+  -> pure PreviewFramePairer exact-membership proof
+  -> PreviewFrameOutcome.Success or typed PreviewFrameOutcome.Failure
+  -> bounded PREVIEW_* logcat diagnostics and developer UI lines only
+  -> no measurement result
+```
+
+The S10+ measured 720p@120 proof accepts the preview-only session and Camera2
+generates a high-speed request list of size `4`. The consumed preview timestamps
+exactly match `SENSOR_TIMESTAMP` values, but the median preview cadence is
+`33.3775 ms` instead of the requested `8.3333 ms`; the latest run had
+equal preview and sensor counts with all offsets zero. The pairer therefore
+returns
+`PREVIEW_CADENCE_MISMATCH` and keeps the app no-read.
 
 ## Live 240 fps Path
 

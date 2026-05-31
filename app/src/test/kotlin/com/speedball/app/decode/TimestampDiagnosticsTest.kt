@@ -8,6 +8,30 @@ import kotlin.math.roundToLong
 
 class TimestampDiagnosticsTest {
     @Test
+    fun sharedNormalizerFiltersNonPositiveValues() {
+        val normalized = normalizeSensorTimestamps(listOf(-5L, 0L, 10L, 20L))
+
+        assertEquals(2, normalized.positiveCount)
+        assertEquals(listOf(10L, 20L), normalized.uniqueTimestampsNanos)
+    }
+
+    @Test
+    fun sharedNormalizerKeepsPositiveCountBeforeDistinctSorting() {
+        val normalized = normalizeSensorTimestamps(listOf(30L, 10L, 30L, 20L, 10L))
+
+        assertEquals(5, normalized.positiveCount)
+        assertEquals(listOf(10L, 20L, 30L), normalized.uniqueTimestampsNanos)
+    }
+
+    @Test
+    fun sharedNormalizerHandlesEmptyInput() {
+        val normalized = normalizeSensorTimestamps(emptyList())
+
+        assertEquals(0, normalized.positiveCount)
+        assertTrue(normalized.uniqueTimestampsNanos.isEmpty())
+    }
+
+    @Test
     fun exactDuplicatesCollapseButNearDuplicatesRemain() {
         val diagnostics = buildTimestampDiagnostics(
             listOf(ts(0.0), ts(8.33), ts(8.33), ts(8.34), ts(16.66)),
@@ -73,9 +97,12 @@ class TimestampDiagnosticsTest {
     fun nearDuplicateEvidenceSharesExactDistinctNormalizationWithTimestampDiagnostics() {
         val first = ts(0.0)
         val raw = listOf(0L, -1L, first, first, first + 1L, ts(16.666))
+        val normalized = normalizeSensorTimestamps(raw)
         val diagnostics = buildTimestampDiagnostics(raw, fps = 120)
         val evidence = buildNearDuplicateEvidence(raw, decodedFrameCount = 3)
 
+        assertEquals(normalized.positiveCount, diagnostics.positiveCount)
+        assertEquals(normalized.uniqueTimestampsNanos, diagnostics.uniqueTimestampsNanos)
         assertEquals(diagnostics.positiveCount, evidence.rawPositiveSensorTimestampCount)
         assertEquals(diagnostics.uniqueCount, evidence.exactDistinctSensorTimestampCount)
         assertEquals(diagnostics.uniqueTimestampsNanos.size, evidence.exactDistinctSensorTimestampCount)

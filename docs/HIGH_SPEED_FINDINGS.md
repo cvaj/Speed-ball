@@ -194,6 +194,52 @@ Interpretation:
 - Record-then-decode remains no-read on the S10+ for measurement because decoded
   frames still cannot be paired to sensor timestamps safely.
 
+## Phase 7 preview timestamp proof (S10+)
+
+After adding the decoder-free `SurfaceTexture` preview timestamp proof and pure
+preview pairer, we ran the real app on the connected S10+ (`SM-G975U`) using the
+developer auto-start hook. The device was launched over Wi-Fi ADB, and the debug
+proof window was allowed to show over keyguard for this diagnostic run.
+
+Command shape:
+
+```bash
+ANDROID_HOME=$HOME/Android/Sdk ./gradlew :app:assembleDebug --no-daemon
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell pm grant com.speedball.app android.permission.CAMERA
+adb logcat -c
+adb shell am force-stop com.speedball.app
+adb shell am start -n com.speedball.app/.MainActivity --ez autoStartPreview120 true
+sleep 12
+adb logcat -d -s SPEEDBALL_CAPTURE
+```
+
+Observed result:
+
+```text
+PREVIEW_PROOF_WINDOW debugShowWhenLocked=true
+MODES 1280x720 @ 120 fps:recordSupported=true, 1920x1080 @ 120 fps:recordSupported=true, 1280x720 @ 240 fps:recordSupported=true, 1920x1080 @ 240 fps:recordSupported=true
+PREVIEW_PATH_START mode=1280x720_@_120_fps
+PREVIEW_HIGH_SPEED_REQUEST_LIST mode=1280x720_@_120_fps requests=4
+PREVIEW_TIMESTAMP_SPIKE_FAILURE mode=1280x720_@_120_fps reason=PREVIEW_CADENCE_MISMATCH message=Median_SurfaceTexture_timestamp_gap_was_outside_the_requested_fps_band.
+PREVIEW_FRAME_DIAGNOSTICS mode=1280x720_@_120_fps verdict=FAILURE reason=PREVIEW_CADENCE_MISMATCH rawPreviewTs=66 positivePreviewTs=66 uniquePreviewTs=66 rawSensorTs=66 positiveSensorTs=66 uniqueSensorTs=66 previewMedianMs=33.3775 previewMaxMs=33.377553 sensorMedianMs=33.3775 sensorMaxMs=33.377553 expectedMs=8.333333333333334 dropThresholdMs=12.5 exactMatches=66 sensorMembership=66 unmatchedLeadingPreview=0 unmatchedTrailingPreview=0 coalescing=false pairingVerdict=REJECTED
+PREVIEW_TIMESTAMP_OFFSETS_NS mode=1280x720_@_120_fps chunk=1 count=64 values=[0, 0, 0, 0, ...]
+```
+
+Interpretation:
+
+- The S10+ accepts the preview-only constrained-high-speed `SurfaceTexture`
+  session; this is not a session-configuration rejection.
+- Camera2 returns a high-speed request list of size `4`.
+- For every consumed preview frame, `SurfaceTexture.timestamp` exactly matches a
+  `SENSOR_TIMESTAMP` value, so the shared-clock hypothesis is proven for consumed
+  frames on this device.
+- The consumed preview stream is not 120 fps. Median preview and sensor gaps are
+  `33.3775 ms`, with max gap `33.377553 ms`. That is roughly 30 fps,
+  not the requested 120 fps.
+- Phase 7 therefore correctly remains **fail-loud/no-read** with
+  `PREVIEW_CADENCE_MISMATCH`; no measurement-ready preview path is claimed.
+
 ## What this proves / disproves
 
 - ✅ Third-party Camera2 high-speed works on the S10+.
@@ -207,6 +253,10 @@ Interpretation:
 - ❌ Phase 6 value-anchor S10+ device evidence is captured and rejects fail-loud:
   near-duplicate callbacks remain, post-collapse sensor count still mismatches
   decoded frames, and no measurement-ready pairing is produced.
+- ✅ Phase 7 proves `SurfaceTexture.timestamp == SENSOR_TIMESTAMP` for consumed
+  preview frames on the S10+.
+- ❌ Phase 7 preview-only `SurfaceTexture` delivery on the S10+ is not 120 fps in
+  the measured app path; it fails loud with `PREVIEW_CADENCE_MISMATCH`.
 
 ## Open items carried into the plan
 
@@ -214,3 +264,6 @@ Interpretation:
 - Build the **GPU (SurfaceTexture + GLSL) frame path** for true 240 on the S10+.
 - Find a verified per-frame timestamp pairing strategy for record-then-decode,
   or keep this path no-read and use the preview/GPU path for measurement.
+- Investigate whether the S10+ requires a companion encoder surface, vendor
+  camera constraints, or a different session shape before a preview/GPU path can
+  consume true high-speed frames.

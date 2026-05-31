@@ -1,5 +1,9 @@
 package com.speedball.app.ui
 
+import com.speedball.app.capture.PreviewFrameDiagnostics
+import com.speedball.app.capture.PreviewFrameFailure
+import com.speedball.app.capture.PreviewFrameOutcome
+import com.speedball.app.capture.PreviewFramePairingVerdict
 import com.speedball.app.decode.DecodedFrameSample
 import com.speedball.app.decode.DecodedVideoMetadata
 import com.speedball.app.decode.DecodeFailure
@@ -12,6 +16,29 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class SpeedBallShellStateTest {
+    @Test
+    fun previewFailureDiagnosticsDoNotExposeMeasurementWords() {
+        val lines = previewOutcomeUiLines(
+            PreviewFrameOutcome.Failure(
+                reason = PreviewFrameFailure.SURFACE_CONFIGURATION_REJECTED,
+                message = "Preview surface rejected.",
+                diagnostics = previewDiagnostics(),
+            ),
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("previewFailure=SURFACE_CONFIGURATION_REJECTED"))
+        assertTrue(joined.contains("previewFrames=3"))
+        assertTrue(joined.contains("sensorTs=5"))
+        assertTrue(joined.contains("coalescing=false"))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
+    fun previewCancelledIsDistinct() {
+        assertTrue(previewOutcomeUiLines(PreviewFrameOutcome.Cancelled).single().contains("cancelled"))
+    }
+
     @Test
     fun decodeSuccessDiagnosticsExposeOnlyRawProofValues() {
         val lines = decodeOutcomeUiLines(successOutcome())
@@ -104,6 +131,28 @@ class SpeedBallShellStateTest {
                     DecodedFrameSample(2, 1280, 720, 16_666L),
                 ),
             ),
+        )
+
+    private fun previewDiagnostics(): PreviewFrameDiagnostics =
+        PreviewFrameDiagnostics(
+            rawPreviewTimestampCount = 3,
+            positivePreviewTimestampCount = 3,
+            uniquePreviewTimestampCount = 3,
+            rawSensorTimestampCount = 6,
+            positiveSensorTimestampCount = 5,
+            uniqueSensorTimestampCount = 5,
+            medianPreviewGapMillis = 8.33,
+            maximumPreviewGapMillis = 8.33,
+            medianSensorGapMillis = 8.33,
+            maximumSensorGapMillis = 8.33,
+            expectedGapMillis = 8.33,
+            droppedFrameGapThresholdMillis = 12.5,
+            exactMatchCount = 3,
+            sensorMembershipCount = 3,
+            unmatchedLeadingPreviewCount = 0,
+            unmatchedTrailingPreviewCount = 0,
+            coalescingEvidence = false,
+            verdict = PreviewFramePairingVerdict.NOT_EVALUATED,
         )
 
     private fun assertNoMeasurementWords(text: String) {

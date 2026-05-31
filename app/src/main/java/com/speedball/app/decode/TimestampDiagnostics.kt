@@ -56,7 +56,8 @@ fun buildTimestampDiagnostics(
     )
 }
 
-private data class NormalizedSensorTimestamps(
+/** Positive, exact-distinct, sorted nanosecond timestamps shared by capture proof paths. */
+internal data class NormalizedSensorTimestamps(
     val positiveCount: Int,
     val uniqueTimestampsNanos: List<Long>,
 )
@@ -143,7 +144,7 @@ fun buildNearDuplicateEvidence(
     )
 }
 
-private fun normalizeSensorTimestamps(timestampsNanos: List<Long>): NormalizedSensorTimestamps {
+internal fun normalizeSensorTimestamps(timestampsNanos: List<Long>): NormalizedSensorTimestamps {
     val positives = timestampsNanos.filter { it > 0L }
     return NormalizedSensorTimestamps(
         positiveCount = positives.size,

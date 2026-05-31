@@ -43,10 +43,18 @@ Probed with `prototype/hs-probe` (Camera2 `CONSTRAINED_HIGH_SPEED`, back camera 
 | 720p @ 240 | 640 (all unique) | **4.12 ms** | **~242 fps** ✅ |
 | 1080p @ 120 | 400 | **8.33 ms** | ~120 fps ✅ |
 | Phase 4 app 720p @ 120 | 325 | **8.33 ms** | ~120 fps ✅ |
+| Phase 7 preview-only app 720p @ 120 | 66 consumed preview / 66 sensor callbacks | **33.38 ms** | ~30 fps ❌ |
 
 The sensor + pipeline genuinely deliver **true ~242 fps at full 1080p** to our app. (Raw
 capture-callback counts were inflated on the 120 run by per-batch double-firing; the median
 sensor-timestamp gap is the robust truth and was used here.)
+
+The Phase 7 app preview-only `SurfaceTexture` proof is a separate session shape:
+the S10+ accepted the constrained-high-speed session and Camera2 generated a
+request list of size `4`, but the consumed preview stream ran at about 30 fps.
+`SurfaceTexture.timestamp` exactly matched `SENSOR_TIMESTAMP` for consumed
+frames, so the timestamp clock is usable only if a later session shape can deliver
+true high-speed preview frames.
 
 ### MP4 persistence via real-time MediaRecorder (H.264) — THE bottleneck
 | Config | Distinct frames saved | Effective saved fps |
@@ -113,7 +121,7 @@ actual HAL configs (only show combos the device reports). Suggested defaults:
 
 | Device | Default | Notes |
 |---|---|---|
-| S10+ | **720p @ 120** | Clean end-to-end today, coolest, ±5 mph easily met. 720p @ 240 for more samples (GPU path, mild extra heat). 1080p available. |
+| S10+ | **720p @ 120** | Capture proof is clean and coolest, but measurement remains no-read until frame/timestamp pairing and detection are proven. Preview-only Phase 7 proof currently fails loud at ~30 fps. 1080p remains selectable. |
 | S22+ | 720p @ 240 (pending verify) | Stronger encoder likely persists 240 directly. |
 
 ---

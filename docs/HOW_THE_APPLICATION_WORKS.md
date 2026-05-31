@@ -12,16 +12,21 @@ run Phase 5 decode/frame-timestamp reconciliation on the exact app-created MP4.
 When exact-count reconciliation fails from near-duplicate sensor timestamps or a
 decoded/sensor count mismatch, Phase 6 can emit logcat-only value-anchor
 diagnostics. Those diagnostics are investigation evidence only; they cannot
-produce a measurement-ready pairing or a result. The results section stays in a
+produce a measurement-ready pairing or a result. Phase 7 adds a developer-only
+decoder-free `SurfaceTexture` timestamp proof path. On the measured S10+ run,
+`SurfaceTexture.timestamp` exactly matched `SENSOR_TIMESTAMP`, but the
+preview-only stream delivered about 30 fps while 120 fps was requested, so the
+path fails loud with `PREVIEW_CADENCE_MISMATCH`. The results section stays in a
 no-read state until later phases wire detection, calibration UI, and results UI.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
-foundation, timestamp diagnostics, Phase 5 decode proof, and Phase 6 value-anchor
-investigation logging. It must still not display a sample speed, trajectory, or
-placeholder result value. Camera mode, timestamp, frame-count, raw decode, and
-anchor diagnostics may be shown only after real HAL enumeration, a real burst,
-a typed decode failure, or bounded logcat diagnostics.
+foundation, timestamp diagnostics, Phase 5 decode proof, Phase 6 value-anchor
+investigation logging, and Phase 7 preview timestamp proof. It must still not
+display a sample speed, trajectory, or placeholder result value. Camera mode,
+timestamp, frame-count, raw decode, preview proof, and anchor diagnostics may be
+shown only after real HAL enumeration, a real capture/proof run, a typed
+failure, or bounded logcat diagnostics.
 
 ## User Flow
 
@@ -108,6 +113,11 @@ The app must show "No read" rather than a wrong speed when:
 - value-anchor diagnostics are rejected, ambiguous, unavailable, or only
   investigation-proven; Phase 6 never turns them into `DecodeOutcome.Success`
   or measurement timestamps;
+- decoder-free preview proof lacks positive `SurfaceTexture` timestamps, lacks
+  positive `SENSOR_TIMESTAMP` callbacks, has duplicate/non-monotonic/near-duplicate
+  preview timestamps, has preview cadence outside the requested fps band, contains
+  dropped preview gaps, cannot prove exact sensor membership, indicates preview
+  undercount/coalescing, or hits a nonzero/ambiguous offset hypothesis;
 - bounded frame extraction cannot prove two non-adjacent decoded frames at the
   expected dimensions;
 - fewer than three valid detections exist;
@@ -167,6 +177,34 @@ Phase 5 decode failure reasons are:
 - `DECODE_WORK_LIMIT_EXCEEDED`
 - `RESOURCE_RELEASE_FAILED`
 
+Phase 7 preview proof failure reasons are diagnostic-only and include:
+
+- `CAMERA_PERMISSION_DENIED`
+- `NO_BACK_CAMERA`
+- `UNSUPPORTED_MODE`
+- `CAPTURE_BUSY`
+- `CAMERA_OPEN_FAILED`
+- `CAMERA_DEVICE_DISCONNECTED`
+- `CAMERA_DEVICE_ERROR`
+- `SESSION_CONFIGURATION_FAILED`
+- `SURFACE_CONFIGURATION_REJECTED`
+- `GL_SETUP_FAILED`
+- `FRAME_TIMEOUT`
+- `MISSING_PREVIEW_TIMESTAMPS`
+- `MISSING_SENSOR_TIMESTAMPS`
+- `DUPLICATE_PREVIEW_TIMESTAMPS`
+- `PREVIEW_TIMESTAMPS_NON_MONOTONIC`
+- `PREVIEW_TIMESTAMP_NEAR_DUPLICATE`
+- `PREVIEW_CADENCE_MISMATCH`
+- `PREVIEW_DROPPED_FRAME_GAP`
+- `SENSOR_MEMBERSHIP_UNAVAILABLE`
+- `FRAME_SENSOR_COUNT_MISMATCH`
+- `PREVIEW_UNDERCOUNT_COALESCING`
+- `NONZERO_OFFSET_REQUIRES_REVIEW`
+- `AMBIGUOUS_OFFSET`
+- `LATE_CALLBACK_AFTER_TEARDOWN`
+- `RESOURCE_RELEASE_FAILED`
+
 ## Capture Modes
 
 - 120 fps on S10+ uses record-then-decode because it records cleanly.
@@ -191,3 +229,11 @@ Phase 5 decode failure reasons are:
   distinct sensor timestamps `325`, and hypothetical post-collapse sensor count
   `260`. That is evidence against using the record-then-decode path as a
   measurement-ready pairing source.
+- Phase 7 preview proof uses a debug-only `autoStartPreview120` developer entry
+  point and a Camera2 constrained-high-speed `SurfaceTexture` target. It logs
+  bounded `PREVIEW_*` diagnostics and runs the pure Kotlin preview pairer. The
+  measured S10+ result accepted the preview-only session and generated a
+  high-speed request list of size `4`, but delivered `66` consumed preview
+  timestamps at median gap `33.3775 ms` for a requested `8.3333 ms`; exact
+  timestamp identity still held for all consumed preview frames. The app therefore
+  returns no-read with `PREVIEW_CADENCE_MISMATCH`, not a speed.
