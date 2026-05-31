@@ -76,13 +76,76 @@ class TimestampAnchorOutcomeTest {
         assertNoFrameTimestampPairField(TimestampAnchorOutcome.Proven::class.java)
     }
 
-    private fun diagnostics(): TimestampAnchorDiagnostics =
+    @Test
+    fun anchorDiagnosticFormatterChunksEvidenceAndUsesDisplayNameOnly() {
+        val outcome = TimestampAnchorOutcome.Rejected(
+            reason = TimestampAnchorFailure.AMBIGUOUS_OFFSETS,
+            message = "Timestamp anchor rejected.",
+            diagnostics = diagnostics(
+                nearDuplicateEvidence = NearDuplicateEvidence(
+                    rawPositiveSensorTimestampCount = 5,
+                    exactDistinctSensorTimestampCount = 4,
+                    nearDuplicateGroupCount = 1,
+                    hypotheticalPostCollapseSensorCount = 3,
+                    representativeNearDuplicateGapsNanos = listOf(1L, 2L),
+                    postCollapseComparison = PostCollapseSensorCountComparison.MATCHES_DECODED_COUNT,
+                    interpretation = "Post-collapse evidence only.",
+                ),
+                evaluatedCandidates = listOf(
+                    TimestampAnchorCandidate(offsetMicros = 1_000L, wholeFrameShift = -1, provenance = "hidden"),
+                    TimestampAnchorCandidate(offsetMicros = 2_000L, wholeFrameShift = 0, provenance = "hidden"),
+                    TimestampAnchorCandidate(offsetMicros = 3_000L, wholeFrameShift = 1, provenance = "hidden"),
+                ),
+                candidateFailureReasons = listOf(TimestampAnchorFailure.NO_CANDIDATE),
+                presentationDroppedHoles = listOf(TimestampAnchorDroppedHole(adjacentIndex = 1, gapMicros = 2_000L, gapMultiple = 2)),
+                sensorDroppedHoles = listOf(TimestampAnchorDroppedHole(adjacentIndex = 2, gapMicros = 2_000L, gapMultiple = 2)),
+            ),
+        )
+        val lines = timestampAnchorDiagnosticLogLines(
+            outcome = outcome,
+            displayFileName = "/storage/emulated/0/DCIM/private/session.mp4",
+            chunkSize = 1,
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("file=session.mp4"))
+        assertTrue(joined.contains("verdict=REJECTED reason=AMBIGUOUS_OFFSETS"))
+        assertTrue(joined.contains("rawPositiveSensorTs=5"))
+        assertTrue(joined.contains("exactDistinctSensorTs=4"))
+        assertTrue(joined.contains("hypotheticalPostCollapseSensorTs=3"))
+        assertTrue(joined.contains("postCollapse=postCollapseMatchesDecodedCount"))
+        assertTrue(joined.contains("TIMESTAMP_ANCHOR_CANDIDATE_OFFSETS_US file=session.mp4 chunk=3 count=3 values=[3000]"))
+        assertTrue(joined.contains("TIMESTAMP_ANCHOR_WHOLE_FRAME_SHIFTS file=session.mp4 chunk=3 count=3 values=[1]"))
+        assertTrue(joined.contains("TIMESTAMP_ANCHOR_NEAR_DUPLICATE_GAPS_NS file=session.mp4 chunk=2 count=2 values=[2]"))
+        assertTrue(joined.contains("holeAgreement=MISMATCH"))
+        assertTrue(joined.contains("TIMESTAMP_ANCHOR_PRESENTATION_HOLES"))
+        assertTrue(joined.contains("TIMESTAMP_ANCHOR_SENSOR_HOLES"))
+        assertFalse(joined.contains("/storage/"))
+        assertFalse(joined.contains("content://"))
+        assertFalse(joined.contains("hidden"))
+        assertNoPrivateOrMeasurementPayloadNames(lines)
+    }
+
+    private fun diagnostics(
+        nearDuplicateEvidence: NearDuplicateEvidence? = null,
+        evaluatedCandidates: List<TimestampAnchorCandidate> = emptyList(),
+        candidateFailureReasons: List<TimestampAnchorFailure> = emptyList(),
+        presentationDroppedHoles: List<TimestampAnchorDroppedHole> = emptyList(),
+        sensorDroppedHoles: List<TimestampAnchorDroppedHole> = emptyList(),
+    ): TimestampAnchorDiagnostics =
         TimestampAnchorDiagnostics(
             decodedFrameCount = 3,
             rawSensorTimestampCount = 4,
             uniqueSensorTimestampCount = 4,
-            evaluatedCandidateCount = 1,
+            nearDuplicateEvidence = nearDuplicateEvidence,
+            evaluatedCandidates = evaluatedCandidates,
+            evaluatedCandidateCount = evaluatedCandidates.size.coerceAtLeast(1),
             survivingCandidateCount = 0,
+            candidateFailureReasons = candidateFailureReasons,
+            maximumResidualMicros = 100L,
+            medianResidualMicros = 50L,
+            presentationDroppedHoles = presentationDroppedHoles,
+            sensorDroppedHoles = sensorDroppedHoles,
         )
 
     private fun assertNoFrameTimestampPairField(type: Class<*>) {

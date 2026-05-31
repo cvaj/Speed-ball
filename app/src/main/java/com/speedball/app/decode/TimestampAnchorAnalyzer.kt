@@ -30,12 +30,6 @@ internal data class TimestampAnchorMappingEvaluation(
     val passes: Boolean = failure == null
 }
 
-internal data class TimestampAnchorDroppedHole(
-    val adjacentIndex: Int,
-    val gapMicros: Long,
-    val gapMultiple: Int,
-)
-
 internal data class TimestampAnchorHoleClassification(
     val expectedGapMillis: Double,
     val droppedFrameGapThresholdMillis: Double,
@@ -97,6 +91,7 @@ fun analyzeTimestampAnchorEvidence(
     )
     val survivors = evaluations.filter { it.passes }
     val distinctSurvivors = distinctSurvivingMappings(survivors)
+    val diagnosticSurvivor = distinctSurvivors.singleOrNull()
     val mappedDiagnostics = diagnostics.copy(
         evaluatedCandidates = candidates.candidates,
         evaluatedCandidateCount = candidates.candidates.size,
@@ -104,6 +99,8 @@ fun analyzeTimestampAnchorEvidence(
         candidateFailureReasons = evaluations.mapNotNull { it.failure }.distinct(),
         maximumResidualMicros = evaluations.mapNotNull { it.maximumResidualMicros }.minOrNull(),
         medianResidualMicros = evaluations.mapNotNull { it.medianResidualMicros }.minOrNull(),
+        presentationDroppedHoles = diagnosticSurvivor?.presentationDroppedHoles.orEmpty(),
+        sensorDroppedHoles = diagnosticSurvivor?.sensorDroppedHoles.orEmpty(),
     )
     return when (distinctSurvivors.size) {
         1 -> {
