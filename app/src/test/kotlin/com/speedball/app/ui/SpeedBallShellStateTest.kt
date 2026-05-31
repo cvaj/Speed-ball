@@ -11,6 +11,13 @@ import com.speedball.app.decode.DecodeOutcome
 import com.speedball.app.decode.OffsetSummary
 import com.speedball.app.decode.PresentationClockAssessment
 import com.speedball.app.decode.ReconciliationDiagnostics
+import com.speedball.app.measurement.MeasurementRunFailure
+import com.speedball.app.measurement.MeasurementRunOutcome
+import com.speedball.app.measurement.MeasurementTimingProof
+import com.speedball.core.measurement.VelocityMeasurement
+import com.speedball.core.physics.TrajectoryResult
+import com.speedball.core.physics.TrajectorySample
+import com.speedball.core.velocity.VelocityFitResult
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -92,6 +99,42 @@ class SpeedBallShellStateTest {
     }
 
     @Test
+    fun measurementNoReadUiDoesNotExposeMeasurementValues() {
+        val lines = measurementOutcomeUiLines(
+            MeasurementRunOutcome.NoRead(
+                reason = MeasurementRunFailure.UNPROVEN_TIMING,
+                message = "Timing source is not proven.",
+            ),
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("result=no-read"))
+        assertTrue(joined.contains("UNPROVEN_TIMING"))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
+    fun defaultStateSurfacesProductionNoReadReason() {
+        val joined = speedBallPlaceholderState().resultLines.joinToString("\n")
+
+        assertTrue(joined.contains("result=no-read"))
+        assertTrue(joined.contains("UNPROVEN_TIMING"))
+        assertTrue(joined.contains("No production frame source has proven"))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
+    fun measurementSuccessUiDisplaysOnlySuccessValues() {
+        val lines = measurementOutcomeUiLines(successMeasurementOutcome())
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("result=success"))
+        assertTrue(joined.contains("mph=72.5"))
+        assertTrue(joined.contains("angleDeg=12.0"))
+        assertTrue(joined.contains("carryFt=328.1"))
+    }
+
+    @Test
     fun fullPrivatePathsAreNotIntroducedByDecodeLines() {
         val joined = decodeOutcomeUiLines(successOutcome()).joinToString("\n")
 
@@ -163,4 +206,36 @@ class SpeedBallShellStateTest {
         assertFalse(text.contains("car" + "ry", ignoreCase = true))
         assertFalse(text.contains("dist" + "ance", ignoreCase = true))
     }
+
+    private fun successMeasurementOutcome(): MeasurementRunOutcome.Success =
+        MeasurementRunOutcome.Success(
+            measurement = VelocityMeasurement(
+                fit = VelocityFitResult(
+                    xInterceptPx = 0.0,
+                    yInterceptPx = 0.0,
+                    vxPxPerSecond = 10.0,
+                    vyPxPerSecond = -2.0,
+                    speedPxPerSecond = 10.2,
+                    launchAngleDegrees = 12.0,
+                    rSquaredX = 1.0,
+                    rSquaredY = 1.0,
+                    rmsResidualPx = 0.1,
+                    usedOriginalIndices = listOf(0, 1, 2),
+                ),
+                pixelsPerFoot = 2.0,
+                feetPerSecond = 100.0,
+                milesPerHour = 72.5,
+                launchAngleDegrees = 12.0,
+            ),
+            trajectory = TrajectoryResult(
+                samples = listOf(TrajectorySample(0.0, 0.0, 0.0, 0.0, 0.0)),
+                apexMeters = 12.0,
+                carryMeters = 100.0,
+                hangTimeSeconds = 3.0,
+            ),
+            detectionCount = 3,
+            timingProof = object : MeasurementTimingProof {
+                override val evidenceLabel: String = "ui-test"
+            },
+        )
 }

@@ -16,17 +16,21 @@ produce a measurement-ready pairing or a result. Phase 7 adds a developer-only
 decoder-free `SurfaceTexture` timestamp proof path. On the measured S10+ run,
 `SurfaceTexture.timestamp` exactly matched `SENSOR_TIMESTAMP`, but the
 preview-only stream delivered about 30 fps while 120 fps was requested, so the
-path fails loud with `PREVIEW_CADENCE_MISMATCH`. The results section stays in a
-no-read state until later phases wire detection, calibration UI, and results UI.
+path fails loud with `PREVIEW_CADENCE_MISMATCH`. Phase 8 adds the pure Kotlin
+detection, calibration, measurement orchestration, and result-state foundation,
+but it deliberately has no production implementation of `MeasurementTimingProof`.
+The results section therefore stays in a no-read state for every real source
+until Phase 9 provides an evidence-derived timing source.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
 foundation, timestamp diagnostics, Phase 5 decode proof, Phase 6 value-anchor
-investigation logging, and Phase 7 preview timestamp proof. It must still not
-display a sample speed, trajectory, or placeholder result value. Camera mode,
-timestamp, frame-count, raw decode, preview proof, and anchor diagnostics may be
-shown only after real HAL enumeration, a real capture/proof run, a typed
-failure, or bounded logcat diagnostics.
+investigation logging, Phase 7 preview timestamp proof, and Phase 8 pure
+measurement pipeline foundation. It must still not display a sample speed,
+trajectory, or placeholder result value for any production source. Camera mode,
+timestamp, frame-count, raw decode, preview proof, anchor diagnostics, and
+no-read result reasons may be shown only after real HAL enumeration, a real
+capture/proof run, a typed failure, or bounded logcat diagnostics.
 
 ## User Flow
 
@@ -128,7 +132,10 @@ The app must show "No read" rather than a wrong speed when:
 - trajectory launch, ball, air, or numeric options are invalid;
 - trajectory integration becomes non-finite or does not cross ground within the
   max flight time;
-- the detector cannot distinguish the ball from background blobs.
+- the detector cannot distinguish the ball from background blobs;
+- Phase 8 frame-processing bounds are exceeded for dimensions, frame count,
+  threshold-passing pixels, connected-component count, or per-frame operations;
+- a production source attempts to measure without a Phase 9 timing proof.
 
 Core failure reasons are:
 
@@ -205,6 +212,16 @@ Phase 7 preview proof failure reasons are diagnostic-only and include:
 - `LATE_CALLBACK_AFTER_TEARDOWN`
 - `RESOURCE_RELEASE_FAILED`
 
+Phase 8 measurement-run failure reasons are:
+
+- `UNPROVEN_TIMING`
+- `BAD_FRAME_SEQUENCE`
+- `DETECTION_FAILED`
+- `INSUFFICIENT_DETECTIONS`
+- `BAD_CALIBRATION`
+- `MEASUREMENT_REJECTED`
+- `RESOURCE_LIMIT_EXCEEDED`
+
 ## Capture Modes
 
 - 120 fps on S10+ uses record-then-decode because it records cleanly.
@@ -237,3 +254,10 @@ Phase 7 preview proof failure reasons are diagnostic-only and include:
   timestamps at median gap `33.3775 ms` for a requested `8.3333 ms`; exact
   timestamp identity still held for all consumed preview frames. The app therefore
   returns no-read with `PREVIEW_CADENCE_MISMATCH`, not a speed.
+- Phase 8 contains a bounded pure Kotlin RGB/HSV detector, connected-components
+  blob selector, timestamp-preserving track extractor, calibration revalidation,
+  core measurement orchestration, trajectory projection, and result-state
+  formatting. Integration tests can produce `MeasurementRunOutcome.Success`
+  only with a synthetic timing-proof token defined in test source. Main
+  production source has no timing-proof implementation, so Phase 5/6/7 real
+  sources still return no-read with `UNPROVEN_TIMING`.

@@ -35,9 +35,18 @@ Run this on every code change before review and before commit.
 - [ ] Camera sessions, MediaRecorder, MediaCodec, OpenCV Mats, GL textures, and file handles are released on all paths.
 - [ ] Long-running processing is cancellable.
 - [ ] Thermal/resource guards exist for sustained high-speed capture.
+- [ ] Pure Kotlin frame processing has width, height, total-pixel, frame-count,
+      threshold-pixel, connected-component, and operation-count caps.
 
 ## Supply Chain
 
 - [ ] New dependencies are justified in the implementation plan.
 - [ ] Native/OpenCV dependencies come from expected repositories.
 - [ ] Build scripts do not download or execute unverified arbitrary scripts.
+
+## Phase 8 Notes
+
+- No media import path, OpenCV dependency, native dependency, private media path,
+  APK, keystore, or credential is added by the Phase 8 pure pipeline foundation.
+- Main source contains no concrete `MeasurementTimingProof`; every real source
+  remains no-read until Phase 9 source proof exists.

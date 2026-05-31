@@ -94,6 +94,20 @@ fun SpeedBallApp(
                         }
                     }
                 }
+                if (state.resultLines.isNotEmpty()) {
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "Results",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            state.resultLines.forEach { line ->
+                                Text(text = line, style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                    }
+                }
                 if (state.diagnosticLines.isNotEmpty()) {
                     item {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {

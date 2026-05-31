@@ -2,6 +2,9 @@ package com.speedball.app.ui
 
 import com.speedball.app.decode.DecodeOutcome
 import com.speedball.app.capture.PreviewFrameOutcome
+import com.speedball.app.measurement.MeasurementPipeline
+import com.speedball.app.measurement.MeasurementRunFailure
+import com.speedball.app.measurement.MeasurementRunOutcome
 
 /** Availability marker for skeleton workflow sections before implementation phases land. */
 enum class PlaceholderStatus {
@@ -24,6 +27,7 @@ data class SpeedBallShellState(
     val captureStatus: String = "Idle",
     val modeLines: List<String> = emptyList(),
     val selectedModeLine: String? = null,
+    val resultLines: List<String> = emptyList(),
     val diagnosticLines: List<String> = emptyList(),
     val failureLine: String? = null,
 ) {
@@ -35,6 +39,7 @@ data class SpeedBallShellState(
             add(captureStatus)
             selectedModeLine?.let(::add)
             addAll(modeLines)
+            addAll(resultLines)
             addAll(diagnosticLines)
             failureLine?.let(::add)
             sections.forEach { section ->
@@ -49,13 +54,14 @@ data class SpeedBallShellState(
 fun speedBallPlaceholderState(): SpeedBallShellState =
     SpeedBallShellState(
         title = "Speed-ball",
+        resultLines = productionNoReadResultLines(),
         sections = listOf(
             WorkflowSection("Mode", PlaceholderStatus.Pending, "Camera modes will come from device capability checks."),
             WorkflowSection("Calibrate", PlaceholderStatus.Pending, "Distance setup is not available in this skeleton."),
             WorkflowSection("Sample Color", PlaceholderStatus.Pending, "Color sampling arrives with detection."),
             WorkflowSection("Capture", PlaceholderStatus.Unavailable, "Camera capture is not implemented in this phase."),
             WorkflowSection("Import", PlaceholderStatus.Unavailable, "Video import is not implemented in this phase."),
-            WorkflowSection("Results", PlaceholderStatus.Unavailable, "No read until measurement phases exist."),
+            WorkflowSection("Results", PlaceholderStatus.Unavailable, "No read until a proven timing source exists."),
         ),
     )
 
@@ -72,6 +78,7 @@ fun speedBallCaptureState(
         captureStatus = captureStatus,
         modeLines = modeLines,
         selectedModeLine = selectedModeLine,
+        resultLines = productionNoReadResultLines(),
         diagnosticLines = diagnosticLines,
         failureLine = failureLine,
         sections = listOf(
@@ -80,9 +87,35 @@ fun speedBallCaptureState(
             WorkflowSection("Sample Color", PlaceholderStatus.Pending, "Color sampling arrives with detection."),
             WorkflowSection("Capture", PlaceholderStatus.Pending, "Developer burst diagnostics are available."),
             WorkflowSection("Import", PlaceholderStatus.Unavailable, "Video import is not implemented in this phase."),
-            WorkflowSection("Results", PlaceholderStatus.Unavailable, "No read until detection and measurement phases exist."),
+            WorkflowSection("Results", PlaceholderStatus.Unavailable, "No read until a proven timing source exists."),
         ),
     )
+
+sealed interface MeasurementResultUiState {
+    data object Ready : MeasurementResultUiState
+    data object Running : MeasurementResultUiState
+    data class Outcome(val outcome: MeasurementRunOutcome) : MeasurementResultUiState
+}
+
+fun measurementResultUiLines(state: MeasurementResultUiState): List<String> =
+    when (state) {
+        MeasurementResultUiState.Ready -> listOf("result=ready")
+        MeasurementResultUiState.Running -> listOf("result=running")
+        is MeasurementResultUiState.Outcome -> measurementOutcomeUiLines(state.outcome)
+    }
+
+fun measurementOutcomeUiLines(outcome: MeasurementRunOutcome?): List<String> =
+    when (outcome) {
+        null -> listOf("result=no-read reason=${MeasurementRunFailure.UNPROVEN_TIMING} message=Timing source is not proven.")
+        is MeasurementRunOutcome.NoRead -> listOf("result=no-read reason=${outcome.reason} message=${outcome.message}")
+        is MeasurementRunOutcome.Success -> listOf(
+            "result=success mph=${outcome.measurement.milesPerHour.format(1)} angleDeg=${outcome.measurement.launchAngleDegrees.format(1)}",
+            "trajectory carryFt=${(outcome.trajectory.carryMeters * FEET_PER_METER).format(1)} apexFt=${(outcome.trajectory.apexMeters * FEET_PER_METER).format(1)} detections=${outcome.detectionCount}",
+        )
+    }
+
+private fun productionNoReadResultLines(): List<String> =
+    measurementOutcomeUiLines(MeasurementPipeline.currentProductionNoRead())
 
 fun decodeOutcomeUiLines(outcome: DecodeOutcome?): List<String> =
     when (outcome) {
@@ -142,3 +175,5 @@ private fun Double?.formatOrNa(): String =
 
 private fun Double.format(decimals: Int): String =
     "%.${decimals}f".format(this)
+
+private const val FEET_PER_METER = 3.280839895013123

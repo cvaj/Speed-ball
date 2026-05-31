@@ -19,13 +19,15 @@ The root project now has two modules:
   capture foundation plus Phase 5 decode/frame-timestamp proof, Phase 6
   value-anchor investigation logging, and Phase 7 preview timestamp proof.
 
-No imported media, calibration data, detections, velocity fits, mph results, or
-trajectory values flow through the app shell yet. Camera HAL modes,
-SENSOR_TIMESTAMP diagnostics, decoded frame counts, PTS gap diagnostics, preview
-timestamp proof diagnostics, and sampled frame dimensions may flow through the
-developer diagnostics surface only after real enumeration/capture/decode/proof
-or a typed failure. Phase 6 anchor diagnostics flow only to bounded logcat lines
-and remain outside the Compose result state.
+No imported media or production mph results flow through the app shell yet.
+Camera HAL modes, SENSOR_TIMESTAMP diagnostics, decoded frame counts, PTS gap
+diagnostics, preview timestamp proof diagnostics, sampled frame dimensions, and
+Phase 8 no-read result reasons may flow through the developer diagnostics or
+result-state surfaces only after real enumeration/capture/decode/proof or a
+typed failure. Phase 6 anchor diagnostics flow only to bounded logcat lines and
+remain outside the Compose result state. Phase 8 success is reachable only from
+test source because main source contains no implementation of
+`MeasurementTimingProof`.
 
 ## Core Measurement Path
 
@@ -76,7 +78,7 @@ Camera2 constrained high-speed session
   -> fail loud on count mismatch, cadence mismatch, dropped gaps, or near-duplicates
   -> optional Phase 6 value-anchor diagnostics on near-duplicate/count mismatch
   -> TIMESTAMP_ANCHOR_* logcat lines only; never DecodeOutcome.Success
-  -> HSV/OpenCV centroid detection
+  -> bounded HSV/blob centroid detection after a source-specific timing proof exists
   -> flight window selection
   -> core velocity fit
   -> core trajectory physics
@@ -91,6 +93,28 @@ and the S10+ device proof for anchor behavior now rejects fail-loud with
 sensor timestamps `325`, hypothetical post-collapse sensor count `260`).
 Detection, calibration UI, result UI, import mode, and 240 fps GPU proof remain
 planned.
+
+## Phase 8 Pure Measurement Foundation
+
+```text
+TimedFrameSequence
+  -> finite, strictly increasing timestamps
+  -> bounded frame dimensions/count/pixels
+  -> RGB/ARGB to HSV threshold inside ROI
+  -> connected-components with threshold-pixel, component, and operation caps
+  -> exactly one selected blob per accepted frame
+  -> timestamp-preserving Detection list
+  -> measurement-time DistanceCalibration revalidation
+  -> VelocityMeasurementCalculator.measure
+  -> TrajectoryPhysics.simulate
+  -> MeasurementRunOutcome.Success only when caller supplies MeasurementTimingProof
+```
+
+In Phase 8 the only concrete timing proof lives in `app/src/test/...` synthetic
+fixtures. Production entrypoints use `MeasurementPipeline.currentProductionNoRead()`
+and return `UNPROVEN_TIMING`. Dropped or rejected interior frames do not renumber
+timestamps; surviving detections keep the source frame timestamp so residual and
+time-spread gates still see gaps.
 
 ## Preview Timestamp Proof Path
 
@@ -135,7 +159,7 @@ This path is required on S10+ because MediaRecorder cannot persist true 240 fps.
 ```text
 user-selected video URI
   -> validated metadata and frame extraction
-  -> offline HSV/OpenCV detection
+  -> offline HSV/blob detection after import timing proof exists
   -> timestamp/PTS validation
   -> core velocity and trajectory
   -> results UI
@@ -143,4 +167,7 @@ user-selected video URI
 
 ## Calibration
 
-Color calibration produces HSV bounds. Distance calibration produces `pixelsPerFoot`. Both are required before reporting mph.
+Color calibration produces HSV bounds. Distance calibration produces
+`pixelsPerFoot`. Both are required before reporting mph, and distance
+calibration is revalidated at measurement time rather than trusted from stale
+state.
