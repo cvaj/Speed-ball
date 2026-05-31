@@ -16,6 +16,6 @@ Every Speed-ball capability must have functional proof. New capabilities must ad
 | Distance calibration | Known pixel gap and real distance produce expected pixels/foot | Phase 2 implemented in `:core:test` |
 | Unit conversion | px/s -> ft/s -> mph golden values | Phase 2 implemented in `:core:test` |
 | Core measurement outcome | Detections + calibration -> typed success/failure; no partial mph/angle on failure | Phase 2 implemented in `:core:test` with synthetic end-to-end golden and invalid-options failure coverage |
-| Drag trajectory | No-drag closed form, drag monotonicity, hand-calculated case | Planned |
+| Drag trajectory | No-drag closed form, drag monotonicity, hand-calculated case | Phase 3 implemented in `:core:test` with drag-zeroed RK4 goldens, interpolation, angle-edge, zero-speed, and error-path coverage |
 | Results UI | Valid read and no-read states display correct user-facing messages | Planned |
 | Import mode | Imported clip runs same detector/math pipeline | Planned |

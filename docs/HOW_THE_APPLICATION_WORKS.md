@@ -4,14 +4,15 @@ Speed-ball measures a hit softball by tracking a neon-colored ball in high-speed
 
 ## Current App State
 
-Phase 1 provides the native Android shell only. The visible app opens to a
-Compose workflow list for mode selection, calibration, color sampling, capture,
-import, and results, but each section is marked pending or unavailable. The
-results section stays in a no-read state until later phases add calibrated
-measurement logic.
+The visible app still opens to a Compose workflow list for mode selection,
+calibration, color sampling, capture, import, and results, but each section is
+marked pending or unavailable. The results section stays in a no-read state until
+later phases wire capture, detection, calibration UI, and results UI.
 
-The Phase 1 shell must not display a sample speed, frame rate, concrete camera
-mode, trajectory, or placeholder result value.
+The implemented `:core` module now contains calibration, unit conversion,
+velocity measurement, and trajectory physics. The app shell must still not
+display a sample speed, frame rate, concrete camera mode, trajectory, or
+placeholder result value.
 
 ## User Flow
 
@@ -48,6 +49,28 @@ angle_degrees = atan2(-vy, abs(vx))
 
 The camera must be roughly side-on to the swing plane. Off-axis setup creates foreshortening error and must be surfaced to the user.
 
+## Trajectory Rules
+
+Core trajectory physics simulates the measured launch in meters with quadratic
+drag and fixed-step RK4 integration. The default ball/environment model is a
+12-inch-circumference softball with standard sea-level air:
+
+- softball diameter `0.0955 m`, mass `0.1899 kg`;
+- air density `1.225 kg/m^3`, drag coefficient `0.40`;
+- gravity `9.81 m/s^2`;
+- integration time step `0.001 s`, max flight `15.0 s`.
+
+Trajectory results report:
+
+- `apexMeters`: maximum absolute height above ground;
+- `carryMeters`: interpolated horizontal distance at the first `y = 0` ground
+  crossing;
+- `hangTimeSeconds`: interpolated time to that ground crossing.
+
+Angles from `-90` through `90` degrees are valid. Negative or horizontal launches
+from ground return an immediate ground result. Negative or horizontal launches
+from positive height simulate to ground. Angles outside that range fail loudly.
+
 ## Fail-Loud Behavior
 
 The app must show "No read" rather than a wrong speed when:
@@ -57,6 +80,9 @@ The app must show "No read" rather than a wrong speed when:
 - timestamps are too close together to produce a meaningful fit;
 - calibration is missing or invalid;
 - the fit is non-finite or residuals are too large;
+- trajectory launch, ball, air, or numeric options are invalid;
+- trajectory integration becomes non-finite or does not cross ground within the
+  max flight time;
 - the detector cannot distinguish the ball from background blobs.
 
 Core failure reasons are:

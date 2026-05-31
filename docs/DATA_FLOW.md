@@ -13,8 +13,8 @@ MainActivity
 The root project now has two modules:
 
 - `:core` is pure Kotlin/JVM and contains measurement model, calibration,
-  unit-conversion, velocity-fit, outlier-rejection, and fail-loud measurement
-  outcome logic.
+  unit-conversion, velocity-fit, outlier-rejection, fail-loud measurement outcome
+  logic, and trajectory physics.
 - `:app` depends on `:core` and renders the placeholder Android shell.
 
 No camera frames, imported media, calibration data, detections, timestamps,
@@ -34,6 +34,21 @@ List<Detection> + pixelsPerFoot + MeasurementOptions
 
 `MeasurementOutcome.Failure` carries only a reason and message, never a partial
 speed or angle.
+
+## Core Trajectory Path
+
+```text
+LaunchState + BallSpec + AirSpec + TrajectoryOptions
+  -> launch/ball/air/options validation
+  -> RK4 projectile integration
+  -> quadratic drag acceleration
+  -> interpolated y=0 ground crossing
+  -> apex/carry/hang summary
+  -> TrajectoryOutcome.Success or TrajectoryOutcome.Failure
+```
+
+`TrajectoryOutcome.Failure` carries only a reason and message, never partial
+trajectory samples or plausible carry/hang/apex values.
 
 ## Live 120 fps Path
 

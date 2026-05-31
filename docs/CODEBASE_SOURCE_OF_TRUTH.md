@@ -25,7 +25,7 @@ This is the starting point for every Speed-ball task.
 - `prototype/hs-probe/` is the proven Camera2 high-speed reference.
 - Implemented modules:
   - `:core` pure Kotlin/JVM model, calibration, units, velocity fit, and
-    fail-loud measurement outcome logic.
+    fail-loud measurement outcome logic, plus trajectory physics.
   - `:app` Android Compose shell. Camera2, OpenCV, import, and results UI remain
     planned.
 - `docs/ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md` is the current implementation plan under review.
