@@ -1,5 +1,23 @@
 # Data Flow
 
+## Phase 1 Shell
+
+```text
+MainActivity
+  -> SpeedBallApp Compose shell
+  -> Compose-free SpeedBallShellState
+  -> pending/unavailable workflow rows
+  -> no-read results state
+```
+
+The root project now has two modules:
+
+- `:core` is pure Kotlin/JVM and currently exposes only a module identity marker.
+- `:app` depends on `:core` and renders the placeholder Android shell.
+
+No camera frames, imported media, calibration data, detections, timestamps,
+velocity fits, or trajectory values flow through the app in Phase 1.
+
 ## Live 120 fps Path
 
 ```text

@@ -15,7 +15,9 @@ computes launch angle and a drag-corrected trajectory.
   `docs/HIGH_SPEED_FINDINGS.md`.
 - **Architecture decided:** fully native Android (Kotlin + Jetpack Compose + Camera2
   high-speed + OpenCV). vision-camera/CameraX is out (no high-speed support).
-- **Now:** detailed architecture & implementation plan under adversarial review before code.
+- **Now:** Phase 1 root Gradle skeleton is present: `:core` is a pure
+  Kotlin/JVM module and `:app` is a native Android Compose shell with no camera,
+  import, calibration, detection, or measurement implementation yet.
 
 ## Docs
 
@@ -51,3 +53,18 @@ core/           pure-Kotlin math (velocity fit, calibration, units, trajectory) 
 prototype/      proven Camera2 high-speed probe (reference)
 docs/           capability docs + architecture/implementation plan
 ```
+
+## Build and test
+
+The root Gradle project uses the checked-in wrapper.
+
+```bash
+./gradlew projects
+./gradlew :core:test
+./gradlew :app:testDebugUnitTest
+./gradlew :app:assembleDebug
+```
+
+Repository scripts resolve the Android SDK from `ANDROID_HOME`, then
+`ANDROID_SDK_ROOT`, then `$HOME/Android/Sdk`, and fail loudly if no SDK is
+available.

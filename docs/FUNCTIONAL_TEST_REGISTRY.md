@@ -4,6 +4,8 @@ Every Speed-ball capability must have functional proof. New capabilities must ad
 
 | Capability | Required Proof | Current Status |
 |---|---|---|
+| Root Gradle app skeleton | Wrapper checksum, dependency resolution, `:core:test`, `:app:testDebugUnitTest`, `:app:assembleDebug`, `:app:lintDebug`, root scripts, and `:core` boundary check | Phase 1 implemented locally; all listed proofs passed before implementation review |
+| Placeholder no-read shell | JVM test asserts all workflow sections exist and no fake speed, frame rate, camera mode, or result value is exposed | Phase 1 implemented in `:app:testDebugUnitTest` |
 | Camera2 high-speed HAL enumeration | Device/prototype log proving supported fps/res combos | S10+ proven in `docs/HIGH_SPEED_FINDINGS.md`; S22+ pending |
 | 120 fps burst capture | On-device burst with timestamp count and decoded frame reconciliation | Planned |
 | 240 fps GPU capture | On-device true 240 detections from preview/GPU path | Planned |

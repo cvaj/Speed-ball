@@ -2,6 +2,17 @@
 
 Speed-ball measures a hit softball by tracking a neon-colored ball in high-speed phone-camera frames.
 
+## Current App State
+
+Phase 1 provides the native Android shell only. The visible app opens to a
+Compose workflow list for mode selection, calibration, color sampling, capture,
+import, and results, but each section is marked pending or unavailable. The
+results section stays in a no-read state until later phases add calibrated
+measurement logic.
+
+The Phase 1 shell must not display a sample speed, frame rate, concrete camera
+mode, trajectory, or placeholder result value.
+
 ## User Flow
 
 1. The user selects a supported camera mode, such as 720p at 120 fps.
