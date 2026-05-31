@@ -9,15 +9,19 @@ surface for high-speed capture and decode proof. The app can request camera
 permission, enumerate Camera2 high-speed modes from the device HAL, start a
 bounded 120 fps MediaRecorder burst when a fixed 120 fps range is exposed, and
 run Phase 5 decode/frame-timestamp reconciliation on the exact app-created MP4.
-The results section stays in a no-read state until later phases wire detection,
-calibration UI, and results UI.
+When exact-count reconciliation fails from near-duplicate sensor timestamps or a
+decoded/sensor count mismatch, Phase 6 can emit logcat-only value-anchor
+diagnostics. Those diagnostics are investigation evidence only; they cannot
+produce a measurement-ready pairing or a result. The results section stays in a
+no-read state until later phases wire detection, calibration UI, and results UI.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
-foundation, timestamp diagnostics, and Phase 5 decode proof. It must still not
-display a sample speed, trajectory, or placeholder result value. Camera mode,
-timestamp, frame-count, and raw decode diagnostics may be shown only after real
-HAL enumeration, a real burst, or a typed decode failure.
+foundation, timestamp diagnostics, Phase 5 decode proof, and Phase 6 value-anchor
+investigation logging. It must still not display a sample speed, trajectory, or
+placeholder result value. Camera mode, timestamp, frame-count, raw decode, and
+anchor diagnostics may be shown only after real HAL enumeration, a real burst,
+a typed decode failure, or bounded logcat diagnostics.
 
 ## User Flow
 
@@ -101,6 +105,9 @@ The app must show "No read" rather than a wrong speed when:
   cadence outside the requested fps band, or contain a gap larger than `1.5 *
   expectedGap`;
 - decoded frame count does not exactly equal unique `SENSOR_TIMESTAMP` count;
+- value-anchor diagnostics are rejected, ambiguous, unavailable, or only
+  investigation-proven; Phase 6 never turns them into `DecodeOutcome.Success`
+  or measurement timestamps;
 - bounded frame extraction cannot prove two non-adjacent decoded frames at the
   expected dimensions;
 - fewer than three valid detections exist;
@@ -174,3 +181,11 @@ Phase 5 decode failure reasons are:
   timestamps for decoded-order diagnostics, then pairs frames by index only when
   decoded frame count exactly equals unique `SENSOR_TIMESTAMP` count. Container
   PTS is diagnostic; `SENSOR_TIMESTAMP` remains the measurement timing authority.
+- Phase 6 value-anchor analysis runs only as developer diagnostics after
+  near-duplicate sensor timestamps or decoded/sensor count mismatch. It compares
+  decoded PTS values to real `SENSOR_TIMESTAMP` values, logs candidate offsets,
+  residuals, dropped-hole agreement, near-duplicate/post-collapse evidence, and
+  a diagnostic verdict, but it never feeds measurement or the user-facing result
+  path. S10+ Phase 6 device evidence is currently blocked pending a manually
+  unlocked run that emits `BURST_SUCCESS`, `DECODE_*`, and `TIMESTAMP_ANCHOR_*`
+  logs.
