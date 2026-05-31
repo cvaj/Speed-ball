@@ -96,18 +96,35 @@ fun analyzeTimestampAnchorEvidence(
         candidateGeneration = candidates,
     )
     val survivors = evaluations.filter { it.passes }
-    val rejectionReason = mostSpecificMappingFailure(evaluations)
-    return TimestampAnchorOutcome.Rejected(
-        reason = rejectionReason,
-        message = "Timestamp anchor mapping is diagnostic-only until ambiguity gates are implemented.",
-        diagnostics = diagnostics.copy(
-            evaluatedCandidates = candidates.candidates,
-            evaluatedCandidateCount = candidates.candidates.size,
-            survivingCandidateCount = survivors.size,
-            maximumResidualMicros = evaluations.mapNotNull { it.maximumResidualMicros }.minOrNull(),
-            medianResidualMicros = evaluations.mapNotNull { it.medianResidualMicros }.minOrNull(),
-        ),
+    val distinctSurvivors = distinctSurvivingMappings(survivors)
+    val mappedDiagnostics = diagnostics.copy(
+        evaluatedCandidates = candidates.candidates,
+        evaluatedCandidateCount = candidates.candidates.size,
+        survivingCandidateCount = distinctSurvivors.size,
+        candidateFailureReasons = evaluations.mapNotNull { it.failure }.distinct(),
+        maximumResidualMicros = evaluations.mapNotNull { it.maximumResidualMicros }.minOrNull(),
+        medianResidualMicros = evaluations.mapNotNull { it.medianResidualMicros }.minOrNull(),
     )
+    return when (distinctSurvivors.size) {
+        1 -> {
+            val survivor = distinctSurvivors.single()
+            TimestampAnchorOutcome.Proven(
+                candidate = survivor.candidate,
+                matches = survivor.matches,
+                diagnostics = mappedDiagnostics,
+            )
+        }
+        0 -> TimestampAnchorOutcome.Rejected(
+            reason = mostSpecificMappingFailure(evaluations),
+            message = "No timestamp anchor candidate survived mapping, residual, and dropped-hole gates.",
+            diagnostics = mappedDiagnostics,
+        )
+        else -> TimestampAnchorOutcome.Rejected(
+            reason = TimestampAnchorFailure.AMBIGUOUS_OFFSETS,
+            message = "Multiple timestamp anchor candidates survived; refusing to choose a frame-shifted offset.",
+            diagnostics = mappedDiagnostics,
+        )
+    }
 }
 
 /**
@@ -304,7 +321,6 @@ internal fun classifyTimestampAnchorDroppedHoles(
 }
 
 private fun mostSpecificMappingFailure(evaluations: List<TimestampAnchorMappingEvaluation>): TimestampAnchorFailure {
-    if (evaluations.any { it.passes }) return TimestampAnchorFailure.NO_CANDIDATE
     val failures = evaluations.mapNotNull { it.failure }.toSet()
     return when {
         TimestampAnchorFailure.RESIDUAL_TOO_LARGE in failures -> TimestampAnchorFailure.RESIDUAL_TOO_LARGE
@@ -316,6 +332,21 @@ private fun mostSpecificMappingFailure(evaluations: List<TimestampAnchorMappingE
         else -> TimestampAnchorFailure.NO_CANDIDATE
     }
 }
+
+private fun distinctSurvivingMappings(
+    survivors: List<TimestampAnchorMappingEvaluation>,
+): List<TimestampAnchorMappingEvaluation> =
+    survivors
+        .groupBy { evaluation -> evaluation.matches.map { it.sensorIndex } }
+        .values
+        .map { equivalentMappings ->
+            equivalentMappings.minWith(
+                compareBy<TimestampAnchorMappingEvaluation> { it.maximumResidualMicros ?: Long.MAX_VALUE }
+                    .thenBy { it.medianResidualMicros ?: Long.MAX_VALUE }
+                    .thenBy { abs(it.candidate.offsetMicros) }
+                    .thenBy { it.candidate.offsetMicros }
+            )
+        }
 
 private fun wholeFrameShiftRange(
     decodedFrameCount: Int,

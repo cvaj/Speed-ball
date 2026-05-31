@@ -97,11 +97,14 @@ class TimestampAnchorAnalyzerTest {
             metadata = metadata,
             rawSensorTimestampsNanos = sensorTimestamps(count = 4, baseMicros = 1_000_000L),
         )
-        val rejected = assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, outcome)
-        val diagnostics = rejected.diagnostics
+        val proven = assertInstanceOf(TimestampAnchorOutcome.Proven::class.java, outcome)
+        val diagnostics = proven.diagnostics
 
-        assertEquals(TimestampAnchorFailure.NO_CANDIDATE, rejected.reason)
+        assertTrue(proven.candidate.offsetMicros in 999_999L..1_000_000L)
+        assertEquals(listOf(0, 1, 2, 3), proven.matches.map { it.sensorIndex })
+        assertEquals(1, diagnostics.survivingCandidateCount)
         assertEquals(diagnostics.evaluatedCandidates.size, diagnostics.evaluatedCandidateCount)
+        assertTrue(diagnostics.candidateFailureReasons.contains(TimestampAnchorFailure.NO_CANDIDATE))
         assertTrue(diagnostics.evaluatedCandidates.any { it.wholeFrameShift == -1 })
         assertTrue(diagnostics.evaluatedCandidates.any { it.wholeFrameShift == 0 })
         assertTrue(diagnostics.evaluatedCandidates.any { it.wholeFrameShift == 1 })
@@ -228,18 +231,86 @@ class TimestampAnchorAnalyzerTest {
     }
 
     @Test
-    fun analyzerReportsResidualGateDiagnosticsWithoutProvingAnchor() {
+    fun analyzerReportsUniqueSurvivorAsDiagnosticProven() {
         val metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L))
         val outcome = analyzeTimestampAnchorEvidence(
             metadata = metadata,
             rawSensorTimestampsNanos = listOf(1_000L, 2_000L, 3_000L).map { it * 1_000L },
+            requestedFps = 1_000,
+        )
+        val proven = assertInstanceOf(TimestampAnchorOutcome.Proven::class.java, outcome)
+
+        assertEquals(1_000L, proven.candidate.offsetMicros)
+        assertEquals(metadata.frameCount, proven.matches.size)
+        assertEquals(1, proven.diagnostics.survivingCandidateCount)
+        assertEquals(0L, proven.diagnostics.maximumResidualMicros)
+        assertEquals(0L, proven.diagnostics.medianResidualMicros)
+        assertEquals(TimestampAnchorMatch::class.java, proven.matches.first()::class.java)
+    }
+
+    @Test
+    fun syntheticUniformPtsWithMultipleShiftedCleanCandidatesRejectsAmbiguous() {
+        val metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L, 3_000L))
+        val outcome = analyzeTimestampAnchorEvidence(
+            metadata = metadata,
+            rawSensorTimestampsNanos = listOf(999_000L, 1_000_000L, 1_001_000L, 1_002_000L, 1_003_000L, 1_004_000L)
+                .map { it * 1_000L },
+            requestedFps = 1_000,
         )
         val rejected = assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, outcome)
 
-        assertEquals(TimestampAnchorFailure.NO_CANDIDATE, rejected.reason)
-        assertTrue(rejected.diagnostics.survivingCandidateCount > 0)
-        assertEquals(0L, rejected.diagnostics.maximumResidualMicros)
-        assertEquals(0L, rejected.diagnostics.medianResidualMicros)
+        assertEquals(TimestampAnchorFailure.AMBIGUOUS_OFFSETS, rejected.reason)
+        assertTrue(rejected.diagnostics.survivingCandidateCount > 1)
+        assertTrue(rejected.diagnostics.candidateFailureReasons.contains(TimestampAnchorFailure.NO_CANDIDATE))
+        assertTrue(outcome !is TimestampAnchorOutcome.Proven)
+    }
+
+    @Test
+    fun nearDuplicateInputShortCircuitsBeforeCandidateGeneration() {
+        val first = ts(0.0)
+        val outcome = analyzeTimestampAnchorEvidence(
+            metadata = metadata(frameCount = 3),
+            rawSensorTimestampsNanos = listOf(first, first + 1L, ts(8.333), ts(16.666)),
+        )
+        val rejected = assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, outcome)
+
+        assertEquals(TimestampAnchorFailure.SENSOR_NEAR_DUPLICATE, rejected.reason)
+        assertEquals(0, rejected.diagnostics.evaluatedCandidateCount)
+        assertEquals(0, rejected.diagnostics.survivingCandidateCount)
+        assertEquals(PostCollapseSensorCountComparison.MATCHES_DECODED_COUNT, rejected.diagnostics.nearDuplicateEvidence!!.postCollapseComparison)
+    }
+
+    @Test
+    fun captureBasedFixtureWithMatchingHoleAcceptsOneDiagnosticProvenCandidate() {
+        val metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 3_000L, 4_000L))
+        val outcome = analyzeTimestampAnchorEvidence(
+            metadata = metadata,
+            rawSensorTimestampsNanos = metadata.presentationTimeMicros
+                .map { (1_000_000L + it) * 1_000L },
+            requestedFps = 1_000,
+        )
+        val proven = assertInstanceOf(TimestampAnchorOutcome.Proven::class.java, outcome)
+
+        assertEquals(1_000_000L, proven.candidate.offsetMicros)
+        assertEquals(1, proven.diagnostics.survivingCandidateCount)
+        assertEquals(listOf(0, 1, 2, 3), proven.matches.map { it.sensorIndex })
+        assertEquals(TimestampAnchorMatch::class.java, proven.matches.first()::class.java)
+    }
+
+    @Test
+    fun holeMismatchedAnalyzerStillRejectsBeforeProven() {
+        val metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 2_000L, 3_000L))
+        val outcome = analyzeTimestampAnchorEvidence(
+            metadata = metadata,
+            rawSensorTimestampsNanos = listOf(1_000_000L, 1_001_000L, 1_003_000L, 1_004_000L)
+                .map { it * 1_000L },
+            requestedFps = 1_000,
+        )
+        val rejected = assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, outcome)
+
+        assertEquals(TimestampAnchorFailure.RESIDUAL_TOO_LARGE, rejected.reason)
+        assertEquals(0, rejected.diagnostics.survivingCandidateCount)
+        assertTrue(rejected.diagnostics.candidateFailureReasons.contains(TimestampAnchorFailure.RESIDUAL_TOO_LARGE))
         assertTrue(outcome !is TimestampAnchorOutcome.Proven)
     }
 

@@ -55,6 +55,7 @@ data class TimestampAnchorDiagnostics(
     val evaluatedCandidates: List<TimestampAnchorCandidate> = emptyList(),
     val evaluatedCandidateCount: Int = 0,
     val survivingCandidateCount: Int = 0,
+    val candidateFailureReasons: List<TimestampAnchorFailure> = emptyList(),
     val maximumResidualMicros: Long? = null,
     val medianResidualMicros: Long? = null,
 )
