@@ -34,10 +34,10 @@ class DecodeOutcomeTest {
     }
 
     @Test
-    fun failureCarriesOnlyReasonAndMessage() {
+    fun failureCarriesOnlyReasonMessageAndOptionalDiagnostics() {
         val failure = DecodeOutcome.Failure(DecodeFailure.FRAME_SENSOR_COUNT_MISMATCH, "No read.")
 
-        assertEquals(listOf("reason", "message"), failure::class.java.declaredFields.map { it.name }.filterNot { it.startsWith("$") })
+        assertEquals(listOf("reason", "message", "diagnostics"), failure::class.java.declaredFields.map { it.name }.filterNot { it.startsWith("$") })
         assertFalse(failure.message.contains("m" + "ph", ignoreCase = true))
         assertFalse(failure.message.contains("tra" + "jectory", ignoreCase = true))
         assertInstanceOf(DecodeOutcome.Failure::class.java, failure)

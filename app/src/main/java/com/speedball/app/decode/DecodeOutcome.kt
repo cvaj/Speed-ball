@@ -46,6 +46,8 @@ data class DecodedFrameSample(
 data class ReconciliationDiagnostics(
     val decodedFrameCount: Int,
     val uniqueSensorTimestampCount: Int,
+    val sensorGapNanos: List<Long> = emptyList(),
+    val presentationGapMicros: List<Long> = emptyList(),
     val medianSensorGapMillis: Double?,
     val maximumSensorGapMillis: Double?,
     val medianPresentationGapMillis: Double?,
@@ -57,6 +59,7 @@ data class ReconciliationDiagnostics(
     val exactCountPasses: Boolean,
     val nearDuplicateGapMillis: Double?,
     val ptsToSensorOffsetSummary: OffsetSummary?,
+    val ptsToSensorOffsetMicros: List<Long> = emptyList(),
     val presentationClockAssessment: PresentationClockAssessment,
     val sampledFrames: List<DecodedFrameSample> = emptyList(),
 )
@@ -72,6 +75,7 @@ sealed interface DecodeOutcome {
     data class Failure(
         val reason: DecodeFailure,
         val message: String,
+        val diagnostics: ReconciliationDiagnostics? = null,
     ) : DecodeOutcome
 
     data object Cancelled : DecodeOutcome

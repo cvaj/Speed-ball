@@ -24,6 +24,7 @@ import com.speedball.app.decode.BurstVideoDecoder
 import com.speedball.app.decode.DecodeCompletionGate
 import com.speedball.app.decode.DecodeFailure
 import com.speedball.app.decode.DecodeOutcome
+import com.speedball.app.decode.ReconciliationDiagnostics
 import com.speedball.app.decode.buildDecodeWorkBounds
 import com.speedball.app.decode.runDecodeWithTimeout
 import com.speedball.app.ui.SpeedBallApp
@@ -275,25 +276,53 @@ class MainActivity : ComponentActivity() {
     private fun logDecodeOutcome(file: File, outcome: DecodeOutcome) {
         when (outcome) {
             DecodeOutcome.Cancelled -> Log.i(logTag, "DECODE_CANCELLED file=${file.displayNameOnly()}")
-            is DecodeOutcome.Failure -> Log.e(logTag, "DECODE_FAILURE reason=${outcome.reason} message=${outcome.message} file=${file.displayNameOnly()}")
+            is DecodeOutcome.Failure -> {
+                Log.e(logTag, "DECODE_FAILURE reason=${outcome.reason} message=${outcome.message} file=${file.displayNameOnly()}")
+                outcome.diagnostics?.let(::logDecodeDiagnostics)
+            }
             is DecodeOutcome.Success -> {
-                val diagnostics = outcome.diagnostics
                 Log.i(
                     logTag,
-                    "DECODE_SUCCESS decoded=${diagnostics.decodedFrameCount} uniqueTs=${diagnostics.uniqueSensorTimestampCount} " +
-                        "sensorMedianMs=${diagnostics.medianSensorGapMillis?.format(2)} sensorMaxMs=${diagnostics.maximumSensorGapMillis?.format(2)} " +
-                        "ptsMedianMs=${diagnostics.medianPresentationGapMillis?.format(2)} ptsMaxMs=${diagnostics.maximumPresentationGapMillis?.format(2)} " +
-                        "dropThresholdMs=${diagnostics.droppedFrameGapThresholdMillis.format(2)} exactCount=${diagnostics.exactCountPasses} " +
-                        "clock=${diagnostics.presentationClockAssessment} samples=${diagnostics.sampledFrames.joinToString { it.frameIndex.toString() }} " +
+                    "DECODE_SUCCESS " +
                         "file=${file.displayNameOnly()}",
                 )
+                logDecodeDiagnostics(outcome.diagnostics)
             }
         }
+    }
+
+    private fun logDecodeDiagnostics(diagnostics: ReconciliationDiagnostics) {
+        Log.i(
+            logTag,
+            "DECODE_DIAGNOSTICS decoded=${diagnostics.decodedFrameCount} uniqueTs=${diagnostics.uniqueSensorTimestampCount} " +
+                "sensorMedianMs=${diagnostics.medianSensorGapMillis?.format(2)} sensorMaxMs=${diagnostics.maximumSensorGapMillis?.format(2)} " +
+                "ptsMedianMs=${diagnostics.medianPresentationGapMillis?.format(2)} ptsMaxMs=${diagnostics.maximumPresentationGapMillis?.format(2)} " +
+                "dropThresholdMs=${diagnostics.droppedFrameGapThresholdMillis.format(2)} exactCount=${diagnostics.exactCountPasses} " +
+                "nearDuplicateMs=${diagnostics.nearDuplicateGapMillis?.format(6)} clock=${diagnostics.presentationClockAssessment} " +
+                "samples=${diagnostics.sampledFrames.joinToString { "${it.frameIndex}:${it.width}x${it.height}@${it.presentationTimeMicros}us" }}",
+        )
+        logLongList("DECODE_SENSOR_GAPS_NS", diagnostics.sensorGapNanos)
+        logLongList("DECODE_PTS_GAPS_US", diagnostics.presentationGapMicros)
+        logLongList("DECODE_PTS_SENSOR_OFFSETS_US", diagnostics.ptsToSensorOffsetMicros)
     }
 
     private fun File.displayNameOnly(): String =
         name.ifBlank { absolutePath.substringAfterLast('/') }
 
+    private fun logLongList(label: String, values: List<Long>) {
+        if (values.isEmpty()) {
+            Log.i(logTag, "$label count=0 values=[]")
+            return
+        }
+        values.chunked(LOG_VALUE_CHUNK_SIZE).forEachIndexed { index, chunk ->
+            Log.i(logTag, "$label chunk=${index + 1} count=${values.size} values=${chunk.joinToString(prefix = "[", postfix = "]")}")
+        }
+    }
+
     private fun Double.format(decimals: Int): String =
         "%.${decimals}f".format(this)
+
+    private companion object {
+        const val LOG_VALUE_CHUNK_SIZE = 80
+    }
 }
