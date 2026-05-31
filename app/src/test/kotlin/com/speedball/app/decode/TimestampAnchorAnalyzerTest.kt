@@ -243,6 +243,79 @@ class TimestampAnchorAnalyzerTest {
         assertTrue(outcome !is TimestampAnchorOutcome.Proven)
     }
 
+    @Test
+    fun captureBasedPtsWithMatchingTwoIntervalHolePassesHoleGate() {
+        val metadata = metadata(presentationTimeMicros = listOf(0L, 1_000L, 3_000L, 4_000L))
+        val evaluation = mapTimestampAnchorCandidate(
+            metadata = metadata,
+            uniqueSensorTimestampsNanos = metadata.presentationTimeMicros
+                .map { (1_000_000L + it) * 1_000L },
+            candidate = candidate(offsetMicros = 1_000_000L),
+            requestedFps = 1_000,
+        )
+
+        assertNull(evaluation.failure)
+        assertEquals(listOf(TimestampAnchorDroppedHole(adjacentIndex = 1, gapMicros = 2_000L, gapMultiple = 2)), evaluation.presentationDroppedHoles)
+        assertEquals(evaluation.presentationDroppedHoles, evaluation.sensorDroppedHoles)
+    }
+
+    @Test
+    fun uniformPtsOverMappedSensorHoleRejectsAsSynthetic() {
+        val agreement = validateTimestampAnchorHoleAgreement(
+            matches = matches(
+                presentationTimeMicros = listOf(0L, 1_000L, 2_000L, 3_000L),
+                sensorTimeMicros = listOf(1_000_000L, 1_001_000L, 1_003_000L, 1_004_000L),
+            ),
+            requestedFps = 1_000,
+        )
+
+        assertEquals(TimestampAnchorFailure.SYNTHETIC_UNIFORM_PTS, agreement.failure)
+        assertEquals(emptyList<TimestampAnchorDroppedHole>(), agreement.presentation.holes)
+        assertEquals(listOf(TimestampAnchorDroppedHole(adjacentIndex = 1, gapMicros = 2_000L, gapMultiple = 2)), agreement.sensor.holes)
+    }
+
+    @Test
+    fun ptsAndSensorHolesAtDifferentPositionsReject() {
+        val agreement = validateTimestampAnchorHoleAgreement(
+            matches = matches(
+                presentationTimeMicros = listOf(0L, 1_000L, 3_000L, 4_000L),
+                sensorTimeMicros = listOf(1_000_000L, 1_001_000L, 1_002_000L, 1_004_000L),
+            ),
+            requestedFps = 1_000,
+        )
+
+        assertEquals(TimestampAnchorFailure.DROPPED_HOLE_MISMATCH, agreement.failure)
+        assertEquals(listOf(1), agreement.presentation.holes.map { it.adjacentIndex })
+        assertEquals(listOf(2), agreement.sensor.holes.map { it.adjacentIndex })
+    }
+
+    @Test
+    fun samePositionDifferentHoleSizeRejects() {
+        val agreement = validateTimestampAnchorHoleAgreement(
+            matches = matches(
+                presentationTimeMicros = listOf(0L, 1_000L, 3_000L, 4_000L),
+                sensorTimeMicros = listOf(1_000_000L, 1_001_000L, 1_004_000L, 1_005_000L),
+            ),
+            requestedFps = 1_000,
+        )
+
+        assertEquals(TimestampAnchorFailure.DROPPED_HOLE_MISMATCH, agreement.failure)
+        assertEquals(listOf(2), agreement.presentation.holes.map { it.gapMultiple })
+        assertEquals(listOf(3), agreement.sensor.holes.map { it.gapMultiple })
+    }
+
+    @Test
+    fun droppedHoleClassifierUsesPhaseFiveExpectedGapAndThreshold() {
+        val classification = classifyTimestampAnchorDroppedHoles(
+            timestampsNanos = listOf(0L, 1_500_000L, 3_001_000L),
+            requestedFps = 1_000,
+        )
+
+        assertEquals(1.0, classification.expectedGapMillis, 0.0)
+        assertEquals(1.5, classification.droppedFrameGapThresholdMillis, 0.0)
+        assertEquals(listOf(TimestampAnchorDroppedHole(adjacentIndex = 1, gapMicros = 1_501L, gapMultiple = 2)), classification.holes)
+    }
+
     private fun metadata(frameCount: Int): DecodedVideoMetadata =
         metadata(List(frameCount) { index -> (index * 8_333.333).roundToLong() })
 
@@ -274,14 +347,29 @@ class TimestampAnchorAnalyzerTest {
     private fun match(
         frameIndex: Int,
         sensorIndex: Int,
+        presentationTimeMicros: Long = frameIndex * 1_000L,
+        sensorTimestampNanos: Long = sensorIndex * 1_000_000L,
     ): TimestampAnchorMatch =
         TimestampAnchorMatch(
             frameIndex = frameIndex,
-            presentationTimeMicros = frameIndex * 1_000L,
+            presentationTimeMicros = presentationTimeMicros,
             sensorIndex = sensorIndex,
-            sensorTimestampNanos = sensorIndex * 1_000_000L,
+            sensorTimestampNanos = sensorTimestampNanos,
             residualMicros = 0L,
         )
+
+    private fun matches(
+        presentationTimeMicros: List<Long>,
+        sensorTimeMicros: List<Long>,
+    ): List<TimestampAnchorMatch> =
+        presentationTimeMicros.zip(sensorTimeMicros).mapIndexed { index, (ptsMicros, sensorMicros) ->
+            match(
+                frameIndex = index,
+                sensorIndex = index,
+                presentationTimeMicros = ptsMicros,
+                sensorTimestampNanos = sensorMicros * 1_000L,
+            )
+        }
 
     private fun ts(offsetMillis: Double): Long =
         1_000_000_000L + (offsetMillis * 1_000_000.0).roundToLong()

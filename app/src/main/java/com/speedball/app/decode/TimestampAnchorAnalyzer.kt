@@ -1,6 +1,7 @@
 package com.speedball.app.decode
 
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 private const val DEFAULT_ANCHOR_REQUESTED_FPS = 120
 private const val BOUNDARY_SENSOR_SAMPLE_COUNT = 3
@@ -23,9 +24,29 @@ internal data class TimestampAnchorMappingEvaluation(
     val failure: TimestampAnchorFailure?,
     val maximumResidualMicros: Long?,
     val medianResidualMicros: Long?,
+    val presentationDroppedHoles: List<TimestampAnchorDroppedHole> = emptyList(),
+    val sensorDroppedHoles: List<TimestampAnchorDroppedHole> = emptyList(),
 ) {
     val passes: Boolean = failure == null
 }
+
+internal data class TimestampAnchorDroppedHole(
+    val adjacentIndex: Int,
+    val gapMicros: Long,
+    val gapMultiple: Int,
+)
+
+internal data class TimestampAnchorHoleClassification(
+    val expectedGapMillis: Double,
+    val droppedFrameGapThresholdMillis: Double,
+    val holes: List<TimestampAnchorDroppedHole>,
+)
+
+internal data class TimestampAnchorHoleAgreement(
+    val presentation: TimestampAnchorHoleClassification,
+    val sensor: TimestampAnchorHoleClassification,
+    val failure: TimestampAnchorFailure?,
+)
 
 private data class BaseOffsetSource(
     val offsetMicros: Long,
@@ -78,7 +99,7 @@ fun analyzeTimestampAnchorEvidence(
     val rejectionReason = mostSpecificMappingFailure(evaluations)
     return TimestampAnchorOutcome.Rejected(
         reason = rejectionReason,
-        message = "Timestamp anchor mapping is diagnostic-only until dropped-hole and ambiguity gates are implemented.",
+        message = "Timestamp anchor mapping is diagnostic-only until ambiguity gates are implemented.",
         diagnostics = diagnostics.copy(
             evaluatedCandidates = candidates.candidates,
             evaluatedCandidateCount = candidates.candidates.size,
@@ -142,6 +163,7 @@ internal fun evaluateTimestampAnchorMappings(
             metadata = metadata,
             uniqueSensorTimestampsNanos = uniqueSensorTimestampsNanos,
             candidate = candidate,
+            requestedFps = requestedFps,
         )
     }
 }
@@ -152,9 +174,11 @@ internal fun mapTimestampAnchorCandidate(
     candidate: TimestampAnchorCandidate,
     maximumResidualToleranceMicros: Long = MAX_ANCHOR_RESIDUAL_MICROS,
     medianResidualToleranceMicros: Long = MEDIAN_ANCHOR_RESIDUAL_MICROS,
+    requestedFps: Int = DEFAULT_ANCHOR_REQUESTED_FPS,
 ): TimestampAnchorMappingEvaluation {
     require(maximumResidualToleranceMicros >= 0L) { "Maximum residual tolerance must be non-negative." }
     require(medianResidualToleranceMicros >= 0L) { "Median residual tolerance must be non-negative." }
+    require(requestedFps > 0) { "FPS must be positive." }
     val matches = mutableListOf<TimestampAnchorMatch>()
     var sensorCursor = 0
     for ((frameIndex, ptsMicros) in metadata.presentationTimeMicros.withIndex()) {
@@ -189,12 +213,19 @@ internal fun mapTimestampAnchorCandidate(
     } else {
         null
     }
+    val holeAgreement = if (structuralFailure == null && residualFailure == null) {
+        validateTimestampAnchorHoleAgreement(matches, requestedFps)
+    } else {
+        null
+    }
     return TimestampAnchorMappingEvaluation(
         candidate = candidate,
         matches = matches,
-        failure = structuralFailure ?: residualFailure,
+        failure = structuralFailure ?: residualFailure ?: holeAgreement?.failure,
         maximumResidualMicros = maxResidual,
         medianResidualMicros = medianResidual,
+        presentationDroppedHoles = holeAgreement?.presentation?.holes.orEmpty(),
+        sensorDroppedHoles = holeAgreement?.sensor?.holes.orEmpty(),
     )
 }
 
@@ -217,11 +248,68 @@ internal fun validateTimestampAnchorMatches(
     return null
 }
 
+internal fun validateTimestampAnchorHoleAgreement(
+    matches: List<TimestampAnchorMatch>,
+    requestedFps: Int = DEFAULT_ANCHOR_REQUESTED_FPS,
+): TimestampAnchorHoleAgreement {
+    val presentation = classifyTimestampAnchorDroppedHoles(
+        timestampsNanos = matches.map { it.presentationTimeMicros * 1_000L },
+        requestedFps = requestedFps,
+    )
+    val sensor = classifyTimestampAnchorDroppedHoles(
+        timestampsNanos = matches.map { it.sensorTimestampNanos },
+        requestedFps = requestedFps,
+    )
+    val presentationPositions = presentation.holes.map { it.adjacentIndex }
+    val sensorPositions = sensor.holes.map { it.adjacentIndex }
+    val failure = when {
+        presentation.holes.isEmpty() && sensor.holes.isNotEmpty() ->
+            TimestampAnchorFailure.SYNTHETIC_UNIFORM_PTS
+        presentationPositions != sensorPositions ->
+            TimestampAnchorFailure.DROPPED_HOLE_MISMATCH
+        presentation.holes.zip(sensor.holes).any { (pts, sensorHole) -> pts.gapMultiple != sensorHole.gapMultiple } ->
+            TimestampAnchorFailure.DROPPED_HOLE_MISMATCH
+        else ->
+            null
+    }
+    return TimestampAnchorHoleAgreement(
+        presentation = presentation,
+        sensor = sensor,
+        failure = failure,
+    )
+}
+
+internal fun classifyTimestampAnchorDroppedHoles(
+    timestampsNanos: List<Long>,
+    requestedFps: Int = DEFAULT_ANCHOR_REQUESTED_FPS,
+): TimestampAnchorHoleClassification {
+    val diagnostics = buildOrderedTimestampDiagnostics(timestampsNanos, requestedFps)
+    val holes = diagnostics.gapNanos.mapIndexedNotNull { index, gapNanos ->
+        val gapMillis = gapNanos / 1_000_000.0
+        if (gapMillis > diagnostics.droppedFrameGapThresholdMillis) {
+            TimestampAnchorDroppedHole(
+                adjacentIndex = index,
+                gapMicros = gapNanos / 1_000L,
+                gapMultiple = (gapMillis / diagnostics.expectedGapMillis).roundToInt().coerceAtLeast(2),
+            )
+        } else {
+            null
+        }
+    }
+    return TimestampAnchorHoleClassification(
+        expectedGapMillis = diagnostics.expectedGapMillis,
+        droppedFrameGapThresholdMillis = diagnostics.droppedFrameGapThresholdMillis,
+        holes = holes,
+    )
+}
+
 private fun mostSpecificMappingFailure(evaluations: List<TimestampAnchorMappingEvaluation>): TimestampAnchorFailure {
     if (evaluations.any { it.passes }) return TimestampAnchorFailure.NO_CANDIDATE
     val failures = evaluations.mapNotNull { it.failure }.toSet()
     return when {
         TimestampAnchorFailure.RESIDUAL_TOO_LARGE in failures -> TimestampAnchorFailure.RESIDUAL_TOO_LARGE
+        TimestampAnchorFailure.SYNTHETIC_UNIFORM_PTS in failures -> TimestampAnchorFailure.SYNTHETIC_UNIFORM_PTS
+        TimestampAnchorFailure.DROPPED_HOLE_MISMATCH in failures -> TimestampAnchorFailure.DROPPED_HOLE_MISMATCH
         TimestampAnchorFailure.MANY_TO_ONE_MAPPING in failures -> TimestampAnchorFailure.MANY_TO_ONE_MAPPING
         TimestampAnchorFailure.NON_MONOTONIC_MAPPING in failures -> TimestampAnchorFailure.NON_MONOTONIC_MAPPING
         TimestampAnchorFailure.INSUFFICIENT_MATCHED_FRAMES in failures -> TimestampAnchorFailure.INSUFFICIENT_MATCHED_FRAMES
