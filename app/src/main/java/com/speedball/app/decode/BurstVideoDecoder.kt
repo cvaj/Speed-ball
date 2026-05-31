@@ -36,6 +36,7 @@ class BurstVideoDecoder {
         rawSensorTimestampsNanos: List<Long>,
         requestedFps: Int,
         requestedDurationMillis: Long,
+        anchorDiagnosticsSink: ((TimestampAnchorOutcome) -> Unit)? = null,
     ): DecodeOutcome {
         val bounds = buildDecodeWorkBounds(requestedDurationMillis, requestedFps)
         val metadata = when (val read = readMetadata(outputFile, requestedFps, bounds)) {
@@ -46,7 +47,14 @@ class BurstVideoDecoder {
             is FrameProofResult.Success -> proof.sampledFrames
             is FrameProofResult.Failure -> return DecodeOutcome.Failure(proof.reason, proof.message)
         }
-        return when (val reconciled = reconcileFrameTimestamps(metadata, rawSensorTimestampsNanos, requestedFps)) {
+        return when (
+            val reconciled = reconcileFrameTimestamps(
+                metadata = metadata,
+                rawSensorTimestampsNanos = rawSensorTimestampsNanos,
+                requestedFps = requestedFps,
+                anchorDiagnosticsSink = anchorDiagnosticsSink,
+            )
+        ) {
             is DecodeOutcome.Success -> reconciled.copy(
                 diagnostics = reconciled.diagnostics.copy(sampledFrames = frameProof),
             )

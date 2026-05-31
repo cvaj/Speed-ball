@@ -17,6 +17,7 @@ fun reconcileFrameTimestamps(
     rawSensorTimestampsNanos: List<Long>,
     requestedFps: Int,
     nearDuplicateThresholdNanos: Long = DEFAULT_NEAR_DUPLICATE_SENSOR_THRESHOLD_NANOS,
+    anchorDiagnosticsSink: ((TimestampAnchorOutcome) -> Unit)? = null,
 ): DecodeOutcome {
     val sensorDiagnostics = buildTimestampDiagnostics(rawSensorTimestampsNanos, requestedFps)
     val presentationDiagnostics = buildOrderedTimestampDiagnostics(metadata.presentationTimeMicros.map { it * 1_000L }, requestedFps)
@@ -32,6 +33,14 @@ fun reconcileFrameTimestamps(
         return DecodeOutcome.Failure(DecodeFailure.MISSING_SENSOR_TIMESTAMPS, "No positive SENSOR_TIMESTAMP values were available for reconciliation.", baseDiagnostics)
     }
     if (baseDiagnostics.nearDuplicateGapMillis != null) {
+        anchorDiagnosticsSink?.invoke(
+            analyzeTimestampAnchorEvidence(
+                metadata = metadata,
+                rawSensorTimestampsNanos = rawSensorTimestampsNanos,
+                nearDuplicateThresholdNanos = nearDuplicateThresholdNanos,
+                requestedFps = requestedFps,
+            ),
+        )
         return DecodeOutcome.Failure(
             DecodeFailure.SENSOR_TIMESTAMP_NEAR_DUPLICATE,
             "Adjacent SENSOR_TIMESTAMP values were closer than the provisional near-duplicate threshold: ${baseDiagnostics.nearDuplicateGapMillis} ms.",
@@ -57,6 +66,14 @@ fun reconcileFrameTimestamps(
         return DecodeOutcome.Failure(DecodeFailure.SENSOR_DROPPED_FRAME_GAP, "SENSOR_TIMESTAMP values contain a dropped-frame-sized gap.", baseDiagnostics)
     }
     if (metadata.frameCount != sensorDiagnostics.uniqueCount) {
+        anchorDiagnosticsSink?.invoke(
+            analyzeTimestampAnchorEvidence(
+                metadata = metadata,
+                rawSensorTimestampsNanos = rawSensorTimestampsNanos,
+                nearDuplicateThresholdNanos = nearDuplicateThresholdNanos,
+                requestedFps = requestedFps,
+            ),
+        )
         return DecodeOutcome.Failure(DecodeFailure.FRAME_SENSOR_COUNT_MISMATCH, "Decoded frame count did not exactly match unique SENSOR_TIMESTAMP count.", baseDiagnostics)
     }
 

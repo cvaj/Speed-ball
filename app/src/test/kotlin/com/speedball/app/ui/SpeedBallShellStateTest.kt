@@ -38,6 +38,28 @@ class SpeedBallShellStateTest {
     }
 
     @Test
+    fun decodeFailureUiDoesNotExposeAnchorDiagnosticsOrRawArrays() {
+        val lines = decodeOutcomeUiLines(
+            DecodeOutcome.Failure(
+                reason = DecodeFailure.FRAME_SENSOR_COUNT_MISMATCH,
+                message = "Decoded frame count did not exactly match unique SENSOR_TIMESTAMP count.",
+                diagnostics = successOutcome().diagnostics.copy(
+                    exactCountPasses = false,
+                    sensorGapNanos = listOf(1_000_000L, 2_000_000L),
+                    presentationGapMicros = listOf(1_000L, 2_000L),
+                ),
+            ),
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("decodeFailure=FRAME_SENSOR_COUNT_MISMATCH"))
+        assertFalse(joined.contains("anchor", ignoreCase = true))
+        assertFalse(joined.contains("["))
+        assertFalse(joined.contains("1000000"))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
     fun decodeCancelledIsDistinct() {
         assertTrue(decodeOutcomeUiLines(DecodeOutcome.Cancelled).single().contains("cancelled"))
     }

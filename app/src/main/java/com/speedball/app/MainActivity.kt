@@ -25,6 +25,7 @@ import com.speedball.app.decode.DecodeCompletionGate
 import com.speedball.app.decode.DecodeFailure
 import com.speedball.app.decode.DecodeOutcome
 import com.speedball.app.decode.ReconciliationDiagnostics
+import com.speedball.app.decode.TimestampAnchorOutcome
 import com.speedball.app.decode.buildDecodeWorkBounds
 import com.speedball.app.decode.runDecodeWithTimeout
 import com.speedball.app.ui.SpeedBallApp
@@ -212,6 +213,7 @@ class MainActivity : ComponentActivity() {
                     rawSensorTimestampsNanos = outcome.sensorTimestampsNanos,
                     requestedFps = fps,
                     requestedDurationMillis = durationMillis,
+                    anchorDiagnosticsSink = { anchorOutcome -> logTimestampAnchorOutcome(file, anchorOutcome) },
                 )
             }
             runOnUiThread {
@@ -304,6 +306,29 @@ class MainActivity : ComponentActivity() {
         logLongList("DECODE_SENSOR_GAPS_NS", diagnostics.sensorGapNanos)
         logLongList("DECODE_PTS_GAPS_US", diagnostics.presentationGapMicros)
         logLongList("DECODE_PTS_SENSOR_OFFSETS_US", diagnostics.ptsToSensorOffsetMicros)
+    }
+
+    private fun logTimestampAnchorOutcome(file: File, outcome: TimestampAnchorOutcome) {
+        val diagnostics = when (outcome) {
+            is TimestampAnchorOutcome.Proven -> outcome.diagnostics
+            is TimestampAnchorOutcome.Rejected -> outcome.diagnostics
+        }
+        val verdictFields = when (outcome) {
+            is TimestampAnchorOutcome.Proven ->
+                "verdict=PROVEN offsetMicros=${outcome.candidate.offsetMicros} wholeFrameShift=${outcome.candidate.wholeFrameShift} matches=${outcome.matches.size}"
+            is TimestampAnchorOutcome.Rejected ->
+                "verdict=REJECTED reason=${outcome.reason}"
+        }
+        Log.i(
+            logTag,
+            "TIMESTAMP_ANCHOR_DIAGNOSTIC file=${file.displayNameOnly()} $verdictFields " +
+                "decoded=${diagnostics.decodedFrameCount} rawSensorTs=${diagnostics.rawSensorTimestampCount} " +
+                "uniqueSensorTs=${diagnostics.uniqueSensorTimestampCount} nearDuplicateGroups=${diagnostics.nearDuplicateEvidence?.nearDuplicateGroupCount ?: 0} " +
+                "postCollapse=${diagnostics.nearDuplicateEvidence?.postCollapseComparison?.diagnosticName ?: "n/a"} " +
+                "evaluatedCandidates=${diagnostics.evaluatedCandidateCount} survivingMappings=${diagnostics.survivingCandidateCount} " +
+                "maxResidualUs=${diagnostics.maximumResidualMicros} medianResidualUs=${diagnostics.medianResidualMicros} " +
+                "failures=${diagnostics.candidateFailureReasons.joinToString(prefix = "[", postfix = "]")}",
+        )
     }
 
     private fun File.displayNameOnly(): String =

@@ -22,6 +22,20 @@ class FrameTimestampReconcilerTest {
     }
 
     @Test
+    fun exactCountSuccessBypassesAnchorDiagnostics() {
+        val anchors = mutableListOf<TimestampAnchorOutcome>()
+        val outcome = reconcileFrameTimestamps(
+            metadata = metadata(frameCount = 4),
+            rawSensorTimestampsNanos = sensorTimestamps(count = 4),
+            requestedFps = 120,
+            anchorDiagnosticsSink = anchors::add,
+        )
+
+        assertInstanceOf(DecodeOutcome.Success::class.java, outcome)
+        assertTrue(anchors.isEmpty())
+    }
+
+    @Test
     fun exactCountSuccessUsesSensorTimestampsNotPresentationTimestampsForPairs() {
         val pts = listOf(99_000L, 107_333L, 115_666L, 123_999L)
         val sensor = sensorTimestamps(count = 4)
@@ -49,6 +63,22 @@ class FrameTimestampReconcilerTest {
         assertEquals(DecodeFailure.FRAME_SENSOR_COUNT_MISMATCH, failure.reason)
         val diagnostics: Any? = failure.diagnostics
         assertFalse(diagnostics is TimestampAnchorDiagnostics)
+    }
+
+    @Test
+    fun countMismatchPublishesAnchorDiagnosticsWithoutChangingFailureShape() {
+        val anchors = mutableListOf<TimestampAnchorOutcome>()
+        val failure = reconcileFrameTimestamps(
+            metadata = metadata(frameCount = 3),
+            rawSensorTimestampsNanos = sensorTimestamps(count = 4),
+            requestedFps = 120,
+            anchorDiagnosticsSink = anchors::add,
+        ).asFailure()
+
+        assertEquals(DecodeFailure.FRAME_SENSOR_COUNT_MISMATCH, failure.reason)
+        assertEquals(listOf("reason", "message", "diagnostics"), failure::class.java.declaredFields.map { it.name }.filterNot { it.startsWith("$") })
+        assertEquals(ReconciliationDiagnostics::class.java, failure.diagnostics!!::class.java)
+        assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, anchors.single())
     }
 
     @Test
@@ -120,12 +150,40 @@ class FrameTimestampReconcilerTest {
     fun oneNanosecondNearDuplicateRemainsHardFailureBeforeCountMismatch() {
         val first = ts(0.0)
         val sensor = listOf(first, first + 1L, ts(8.333), ts(16.666))
-        val failure = reconcileFrameTimestamps(metadata(frameCount = 3), sensor, 120).asFailure()
+        val anchors = mutableListOf<TimestampAnchorOutcome>()
+        val failure = reconcileFrameTimestamps(
+            metadata = metadata(frameCount = 3),
+            rawSensorTimestampsNanos = sensor,
+            requestedFps = 120,
+            anchorDiagnosticsSink = anchors::add,
+        ).asFailure()
 
         assertEquals(DecodeFailure.SENSOR_TIMESTAMP_NEAR_DUPLICATE, failure.reason)
         assertEquals(0.000001, failure.diagnostics!!.nearDuplicateGapMillis!!, 0.0)
         assertEquals(3, failure.diagnostics.decodedFrameCount)
         assertEquals(4, failure.diagnostics.uniqueSensorTimestampCount)
+        val rejected = assertInstanceOf(TimestampAnchorOutcome.Rejected::class.java, anchors.single())
+        assertEquals(TimestampAnchorFailure.SENSOR_NEAR_DUPLICATE, rejected.reason)
+    }
+
+    @Test
+    fun diagnosticProvenAnchorStillLeavesDecodeOutcomeNoRead() {
+        val anchors = mutableListOf<TimestampAnchorOutcome>()
+        val pts = listOf(0L, 1_000L, 3_900L, 6_800L, 7_800L)
+        val sensor = listOf(1_000_000L, 1_001_000L, 1_003_900L, 1_006_800L, 1_007_800L, 1_009_800L)
+            .map { it * 1_000L }
+        val outcome = reconcileFrameTimestamps(
+            metadata = metadata(pts),
+            rawSensorTimestampsNanos = sensor,
+            requestedFps = 500,
+            anchorDiagnosticsSink = anchors::add,
+        )
+
+        val failure = outcome.asFailure()
+        assertEquals(DecodeFailure.FRAME_SENSOR_COUNT_MISMATCH, failure.reason)
+        val proven = assertInstanceOf(TimestampAnchorOutcome.Proven::class.java, anchors.single())
+        assertEquals(5, proven.matches.size)
+        assertTrue(outcome !is DecodeOutcome.Success)
     }
 
     @Test
