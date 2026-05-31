@@ -44,6 +44,15 @@ class DecodeOutcomeTest {
     }
 
     @Test
+    fun failureShapeHasNoAnchorDiagnosticsField() {
+        val failureFields = DecodeOutcome.Failure::class.java.declaredFields.map { it.name }.filterNot { it.startsWith("$") }
+
+        assertEquals(listOf("reason", "message", "diagnostics"), failureFields)
+        assertFalse(failureFields.any { it.contains("anchor", ignoreCase = true) })
+        assertFalse(failureFields.any { it.contains("timestampAnchor", ignoreCase = true) })
+    }
+
+    @Test
     fun cancelledIsDistinctFromFailure() {
         val outcome: DecodeOutcome = DecodeOutcome.Cancelled
 
