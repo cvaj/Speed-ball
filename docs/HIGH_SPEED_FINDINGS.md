@@ -147,6 +147,44 @@ pairing proven**. Later work must either find a better timestamp source for the
 recorder stream, prove a value-anchored reconciliation strategy, or move to the
 preview/GPU path before reporting any measured result.
 
+## Phase 6 value-anchor device proof attempt (S10+)
+
+After the Phase 6 value-anchor diagnostics and privacy logging landed, we tried
+to rerun the real app on the connected S10+ (`SM-G975U`) for the required
+anchor verdict evidence.
+
+Command shape:
+
+```bash
+ANDROID_HOME=$HOME/Android/Sdk ./gradlew :app:assembleDebug --no-daemon
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb logcat -c
+adb shell am force-stop com.speedball.app
+adb shell am start -n com.speedball.app/.MainActivity --ez autoStart120 true
+sleep 12
+adb logcat -d -s SPEEDBALL_CAPTURE
+```
+
+Observed result:
+
+```text
+MODES 1280x720 @ 120 fps:recordSupported=true, 1920x1080 @ 120 fps:recordSupported=true, 1280x720 @ 240 fps:recordSupported=true, 1920x1080 @ 240 fps:recordSupported=true
+```
+
+The debug APK built and installed successfully, and wireless ADB reported the
+S10+ attached. The run did not produce `BURST_SUCCESS`, `DECODE_*`, or
+`TIMESTAMP_ANCHOR_*` evidence. Device state inspection showed the phone was
+awake but still behind the secure lockscreen bouncer, so the app never reached a
+usable preview/capture run.
+
+Interpretation:
+
+- Phase 6 S10+ anchor evidence is **blocked**, not measured.
+- No Phase 6 anchor rejection or diagnostic proof is claimed from this attempt.
+- Phase 5 fail-loud evidence remains the latest measured S10+ record-then-decode
+  result until the phone is manually unlocked and the full `autoStart120` run
+  emits burst, decode, and `TIMESTAMP_ANCHOR_*` logs.
+
 ## What this proves / disproves
 
 - ✅ Third-party Camera2 high-speed works on the S10+.
@@ -157,6 +195,9 @@ preview/GPU path before reporting any measured result.
 - ❌ The current Phase 5 exact-count record-then-decode path does **not** yet
   produce a verified decoded-frame-to-sensor-timestamp pairing on S10+; it fails
   loud on near-duplicate sensor gaps and decoded/sensor count mismatch.
+- ❌ Phase 6 value-anchor S10+ device evidence is not yet captured; the first
+  post-diagnostics attempt was blocked by the secure lockscreen before burst
+  capture.
 
 ## Open items carried into the plan
 
