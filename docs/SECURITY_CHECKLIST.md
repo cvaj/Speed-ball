@@ -76,3 +76,22 @@ Run this on every code change before review and before commit.
 - The `autoStartDirectProof120` developer entry point exposes only bounded
   proof diagnostics and no-read UI on failure; it does not display scratch
   paths, raw pixels, mph, angle, or trajectory values.
+
+## Phase 10 Notes
+
+- User-entered calibration remains pure in-memory workflow state. Distances must
+  be finite and positive, and measurement still revalidates
+  `pixelsPerFoot()` before any result can exist.
+- Color sampling remains pure in-memory workflow state. HSV values must be
+  finite, saturation/value stay in `0..1`, tolerances are clamped, and ROI is
+  clipped to frame bounds before detector use.
+- Phase 10 adds no media import, OpenCV/native dependency, persistence,
+  credential, file-picker, APK/AAB artifact, or private media path exposure.
+- Result display is proof-gated: no-read states contain reason/action/message
+  only; mph, angle, trajectory, carry, apex, and hang time appear only from a
+  `MeasurementRunOutcome.Success`.
+- Developer burst/decode/preview/direct proof diagnostics remain separate from
+  production result state and cannot authorize success. Synthetic timing proof
+  exists in test source only.
+- Production remains no-read until a future direct-readback-to-12-frames phase
+  can mint a Phase 9 bound direct input.

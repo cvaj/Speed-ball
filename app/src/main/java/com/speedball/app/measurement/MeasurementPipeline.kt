@@ -28,7 +28,7 @@ object MeasurementPipeline {
     fun currentProductionNoRead(): MeasurementRunOutcome.NoRead =
         MeasurementRunOutcome.NoRead(
             reason = MeasurementRunFailure.UNPROVEN_TIMING,
-            message = "No production frame source has proven image/timestamp pairing in Phase 8.",
+            message = "No production frame source has proven image/timestamp pairing in Phase 10.",
         )
 
     fun measureWithProvenTiming(

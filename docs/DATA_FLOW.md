@@ -21,13 +21,14 @@ The root project now has two modules:
 
 No imported media or production mph results flow through the app shell yet.
 Camera HAL modes, SENSOR_TIMESTAMP diagnostics, decoded frame counts, PTS gap
-diagnostics, preview timestamp proof diagnostics, sampled frame dimensions, and
-Phase 8 no-read result reasons may flow through the developer diagnostics or
-result-state surfaces only after real enumeration/capture/decode/proof or a
-typed failure. Phase 6 anchor diagnostics flow only to bounded logcat lines and
-remain outside the Compose result state. Phase 8 success is reachable only from
-test source because main source contains no implementation of
-`MeasurementTimingProof`.
+diagnostics, preview timestamp proof diagnostics, sampled frame dimensions,
+Phase 8/10 no-read result reasons, and Phase 10 workflow readiness lines may
+flow through the developer diagnostics or result-state surfaces only after real
+enumeration/capture/decode/proof, pure workflow validation, or a typed failure.
+Phase 6 anchor diagnostics flow only to bounded logcat lines and remain outside
+the Compose result state. Phase 8/10 success is reachable only from test source
+or a future Phase 9 bound direct input because main source contains no
+production-minted generic `MeasurementTimingProof`.
 
 ## Core Measurement Path
 
@@ -110,9 +111,10 @@ TimedFrameSequence
   -> MeasurementRunOutcome.Success only when caller supplies MeasurementTimingProof
 ```
 
-In Phase 8 the only concrete timing proof lives in `app/src/test/...` synthetic
-fixtures. Production entrypoints use `MeasurementPipeline.currentProductionNoRead()`
-and return `UNPROVEN_TIMING`. Dropped or rejected interior frames do not renumber
+In Phase 8/10 the only generic timing proof lives in `app/src/test/...`
+synthetic fixtures. Production entrypoints use
+`MeasurementPipeline.currentProductionNoRead()` and return `UNPROVEN_TIMING`.
+Dropped or rejected interior frames do not renumber
 timestamps; surviving detections keep the source frame timestamp so residual and
 time-spread gates still see gaps.
 
@@ -183,6 +185,32 @@ session, then runs the preview-only control as a separate diagnostic when the
 companion teardown permits it. UI diagnostics show only direct proof status,
 typed failures, counts, and whether preview control was attempted; they do not
 show paths, raw pixels, mph, angle, or trajectory on failure.
+
+## Phase 10 Workflow Foundation
+
+```text
+CalibrationWorkflowState
+  -> MeasurementCalibrationState.pixelsPerFoot() revalidation
+  -> calibration ready/not-ready line
+ColorWorkflowState
+  -> finite HSV sample + clamped tolerance + clipped ROI
+  -> detector-ready HsvThreshold/RegionOfInterest or not-ready line
+MeasurementWorkflowState
+  -> calibration/color/source/capture prerequisites
+  -> result carried only as MeasurementRunOutcome
+MeasurementResultUiState
+  -> no-read action text or success values from MeasurementRunOutcome.Success
+MainActivity
+  -> SpeedBallShellState guided checklist
+  -> Compose shell result/readiness lines
+```
+
+Phase 10 does not connect live Camera2 frames, decoder output, preview
+diagnostics, or Phase 9 device evidence to measurement success. The app shell
+shows calibration/color/source/capture readiness and the current
+`MeasurementRunOutcome`. Developer proof diagnostics remain separate diagnostic
+lines. Production stays `UNPROVEN_TIMING` until direct readback proves at least
+12 same-update frames and emits a bound direct input in a later phase.
 
 ## Preview Timestamp Proof Path
 

@@ -27,6 +27,12 @@ at least 12 consumed same-update direct frames plus timestamp and pixel gates.
 Direct timing tokens cannot authorize arbitrary frame sequences through the
 generic pipeline; they must come through the factory-emitted bound direct input
 whose RGB frames recreate the proven direct frame signatures.
+Phase 10 adds the user-facing workflow foundation around that boundary:
+calibration readiness, color-sample readiness, Phase 9 source-proof readiness,
+capture route state, and result presentation all flow through typed pure JVM
+state. It still adds zero production measurement capability on real hardware.
+Production remains no-read until the next phase proves direct readback can
+produce at least 12 bound frames for the Phase 9 token factory.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
@@ -143,6 +149,8 @@ The app must show "No read" rather than a wrong speed when:
   threshold-passing pixels, connected-component count, or per-frame operations;
 - Phase 9 direct source proof rejects the session, timestamps, pixel signature,
   sequence identity, resource bounds, or proof-token eligibility;
+- Phase 10 workflow state is missing calibration, color sample, or bound Phase 9
+  source proof;
 - a production source attempts to measure without a Phase 9 timing proof.
 
 Core failure reasons are:
@@ -254,6 +262,21 @@ Phase 9 direct proof failure reasons are diagnostic-only and include:
 - `RESOURCE_LIMIT_EXCEEDED`
 - `LATE_CALLBACK_AFTER_TEARDOWN`
 - `PROOF_TOKEN_REJECTED`
+
+Phase 10 workflow/result behavior:
+
+- Calibration state stores two image points and a known distance, but readiness
+  always delegates to measurement-time `pixelsPerFoot()` validation.
+- Color state stores HSV sample, clamped tolerance, and optional ROI. The ROI is
+  clipped to frame bounds before detector use; missing sample, invalid HSV, bad
+  frame dimensions, or empty ROI stays not-ready/no-read.
+- Result formatting accepts only `MeasurementRunOutcome`. No calibration,
+  color, preview, or readiness formatter can synthesize mph, launch angle,
+  trajectory, carry, apex, or hang time.
+- Synthetic timing proof remains in test source only and exists solely for JVM
+  fixture coverage.
+- The next product blocker is direct-readback-to-12-frames so a real Phase 9
+  bound direct input can be attempted.
 
 ## Capture Modes
 

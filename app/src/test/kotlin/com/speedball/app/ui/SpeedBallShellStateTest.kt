@@ -17,9 +17,17 @@ import com.speedball.app.decode.DecodeOutcome
 import com.speedball.app.decode.OffsetSummary
 import com.speedball.app.decode.PresentationClockAssessment
 import com.speedball.app.decode.ReconciliationDiagnostics
+import com.speedball.app.measurement.CalibrationWorkflowState
+import com.speedball.app.measurement.ColorWorkflowState
+import com.speedball.app.measurement.HsvColor
+import com.speedball.app.measurement.HsvTolerance
 import com.speedball.app.measurement.MeasurementRunFailure
 import com.speedball.app.measurement.MeasurementRunOutcome
 import com.speedball.app.measurement.MeasurementTimingProof
+import com.speedball.app.measurement.MeasurementWorkflowEvent
+import com.speedball.app.measurement.MeasurementWorkflowState
+import com.speedball.app.measurement.RegionOfInterest
+import com.speedball.core.model.ImagePoint
 import com.speedball.core.measurement.VelocityMeasurement
 import com.speedball.core.physics.TrajectoryResult
 import com.speedball.core.physics.TrajectorySample
@@ -171,6 +179,164 @@ class SpeedBallShellStateTest {
     }
 
     @Test
+    fun calibrationWorkflowUiShowsReadinessWithoutResultValues() {
+        val lines = calibrationWorkflowUiLines(
+            CalibrationWorkflowState().select(
+                pointA = ImagePoint(0.0, 0.0),
+                pointB = ImagePoint(12.0, 0.0),
+                knownDistanceFeet = 6.0,
+            ),
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("calibration=ready"))
+        assertTrue(joined.contains("pixelsPerFoot=2.00"))
+        assertFalse(joined.contains("m" + "ph", ignoreCase = true))
+        assertFalse(joined.contains("ang" + "le", ignoreCase = true))
+        assertFalse(joined.contains("tra" + "jectory", ignoreCase = true))
+        assertFalse(joined.contains("car" + "ry", ignoreCase = true))
+        assertFalse(joined.contains("apex", ignoreCase = true))
+        assertFalse(joined.contains("hang", ignoreCase = true))
+    }
+
+    @Test
+    fun calibrationWorkflowUiShowsActionableNoReadWithoutResultValues() {
+        val lines = calibrationWorkflowUiLines(CalibrationWorkflowState())
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("calibration=not-ready"))
+        assertTrue(joined.contains("action=set-two-points-and-known-length"))
+        assertFalse(joined.contains("m" + "ph", ignoreCase = true))
+        assertFalse(joined.contains("ang" + "le", ignoreCase = true))
+        assertFalse(joined.contains("tra" + "jectory", ignoreCase = true))
+        assertFalse(joined.contains("car" + "ry", ignoreCase = true))
+        assertFalse(joined.contains("apex", ignoreCase = true))
+        assertFalse(joined.contains("hang", ignoreCase = true))
+    }
+
+    @Test
+    fun colorWorkflowUiShowsSamplePreviewWithoutResultValues() {
+        val lines = colorWorkflowUiLines(
+            ColorWorkflowState().selectSample(
+                sample = HsvColor(hueDegrees = 359.0, saturation = 1.0, value = 0.8),
+                tolerance = HsvTolerance(hueDegrees = 400.0, saturation = 0.2, value = 0.2),
+                regionOfInterest = RegionOfInterest(left = -5, top = 4, rightExclusive = 20, bottomExclusive = 12),
+            ),
+            frameWidth = 16,
+            frameHeight = 10,
+        )
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("colorSample=ready"))
+        assertTrue(joined.contains("preview=detector-setup"))
+        assertTrue(joined.contains("hueDeg=359.0"))
+        assertTrue(joined.contains("roi=0,4,16x10"))
+        assertFalse(joined.contains("result=", ignoreCase = true))
+        assertFalse(joined.contains("conf" + "idence", ignoreCase = true))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
+    fun colorWorkflowUiShowsActionableSetupWithoutResultValues() {
+        val lines = colorWorkflowUiLines(ColorWorkflowState(), frameWidth = 16, frameHeight = 10)
+        val joined = lines.joinToString("\n")
+
+        assertTrue(joined.contains("colorSample=not-ready"))
+        assertTrue(joined.contains("action=sample-ball-color"))
+        assertFalse(joined.contains("result=", ignoreCase = true))
+        assertFalse(joined.contains("conf" + "idence", ignoreCase = true))
+        assertNoMeasurementWords(joined)
+    }
+
+    @Test
+    fun appShellDefaultIsNoReadAndNotReady() {
+        val state = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Idle",
+            modeLines = emptyList(),
+            selectedModeLine = null,
+            diagnosticLines = emptyList(),
+            failureLine = null,
+        )
+        val joined = state.visibleText.joinToString("\n")
+
+        assertTrue(joined.contains("calibration=not-ready"))
+        assertTrue(joined.contains("colorSample=not-ready"))
+        assertTrue(joined.contains("sourceProof=not-ready"))
+        assertTrue(joined.contains("captureWorkflow=idle"))
+        assertTrue(joined.contains("result=no-read"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
+    fun developerProofDiagnosticsDoNotCreateMeasurementResultValues() {
+        val state = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Direct proof complete",
+            modeLines = listOf("1280x720 @ 120 fps (recordable)"),
+            selectedModeLine = "1280x720 @ 120 fps",
+            diagnosticLines = listOf("directProof=success frames=12 tokenEligible=false"),
+            failureLine = null,
+        )
+        val joined = state.visibleText.joinToString("\n")
+
+        assertTrue(joined.contains("directProof=success"))
+        assertTrue(joined.contains("result=no-read"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
+    fun calibrationAndColorReadinessUpdateShellText() {
+        val state = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Idle",
+            modeLines = emptyList(),
+            selectedModeLine = null,
+            diagnosticLines = emptyList(),
+            failureLine = null,
+            calibrationState = CalibrationWorkflowState().select(
+                pointA = ImagePoint(0.0, 0.0),
+                pointB = ImagePoint(12.0, 0.0),
+                knownDistanceFeet = 6.0,
+            ),
+            colorState = ColorWorkflowState().selectSample(
+                sample = HsvColor(0.0, 1.0, 1.0),
+                regionOfInterest = RegionOfInterest(0, 0, 16, 10),
+            ),
+            workflowFrameWidth = 16,
+            workflowFrameHeight = 10,
+        )
+        val joined = state.visibleText.joinToString("\n")
+
+        assertTrue(joined.contains("calibration=ready pixelsPerFoot=2.00"))
+        assertTrue(joined.contains("colorSample=ready"))
+        assertTrue(joined.contains("roi=0,0,16x10"))
+        assertTrue(joined.contains("result=no-read"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
+    fun sourceUnprovenShellContainsNoResultValues() {
+        val workflowState = MeasurementWorkflowState()
+            .reduce(MeasurementWorkflowEvent.CalibrationSelected)
+            .reduce(MeasurementWorkflowEvent.ColorSampleSelected)
+            .reduce(MeasurementWorkflowEvent.StartCapture)
+        val joined = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Idle",
+            modeLines = emptyList(),
+            selectedModeLine = null,
+            diagnosticLines = emptyList(),
+            failureLine = null,
+            workflowState = workflowState,
+        ).visibleText.joinToString("\n")
+
+        assertTrue(joined.contains("sourceProof=not-ready"))
+        assertTrue(joined.contains("reason=UNPROVEN_TIMING"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
     fun fullPrivatePathsAreNotIntroducedByDecodeLines() {
         val joined = decodeOutcomeUiLines(successOutcome()).joinToString("\n")
 
@@ -244,6 +410,16 @@ class SpeedBallShellStateTest {
         assertFalse(text.contains("velo" + "city", ignoreCase = true))
         assertFalse(text.contains("car" + "ry", ignoreCase = true))
         assertFalse(text.contains("dist" + "ance", ignoreCase = true))
+    }
+
+    private fun assertNoResultValuesExceptCalibrationText(text: String) {
+        assertFalse(text.contains("m" + "ph", ignoreCase = true))
+        assertFalse(text.contains("ang" + "le", ignoreCase = true))
+        assertFalse(text.contains("tra" + "jectory", ignoreCase = true))
+        assertFalse(text.contains("velo" + "city", ignoreCase = true))
+        assertFalse(text.contains("car" + "ry", ignoreCase = true))
+        assertFalse(text.contains("apex", ignoreCase = true))
+        assertFalse(text.contains("hang", ignoreCase = true))
     }
 
     private fun successMeasurementOutcome(): MeasurementRunOutcome.Success =

@@ -5,9 +5,13 @@ import com.speedball.app.capture.DirectSessionProbeOutcome
 import com.speedball.app.capture.DirectTimingSourceProofOutcome
 import com.speedball.app.capture.DirectTimingSourceProofRunResult
 import com.speedball.app.capture.PreviewFrameOutcome
-import com.speedball.app.measurement.MeasurementPipeline
-import com.speedball.app.measurement.MeasurementRunFailure
-import com.speedball.app.measurement.MeasurementRunOutcome
+import com.speedball.app.measurement.CalibrationWorkflowReadiness
+import com.speedball.app.measurement.CalibrationWorkflowState
+import com.speedball.app.measurement.ColorWorkflowReadiness
+import com.speedball.app.measurement.ColorWorkflowState
+import com.speedball.app.measurement.MeasurementWorkflowState
+import com.speedball.app.measurement.WorkflowCaptureState
+import com.speedball.app.measurement.WorkflowSourceProofState
 
 /** Availability marker for skeleton workflow sections before implementation phases land. */
 enum class PlaceholderStatus {
@@ -75,50 +79,90 @@ fun speedBallCaptureState(
     selectedModeLine: String?,
     diagnosticLines: List<String>,
     failureLine: String?,
+    calibrationState: CalibrationWorkflowState = CalibrationWorkflowState(),
+    colorState: ColorWorkflowState = ColorWorkflowState(),
+    workflowState: MeasurementWorkflowState = MeasurementWorkflowState(),
+    workflowFrameWidth: Int = 0,
+    workflowFrameHeight: Int = 0,
 ): SpeedBallShellState =
     speedBallPlaceholderState().copy(
         cameraPermission = permissionLabel,
         captureStatus = captureStatus,
         modeLines = modeLines,
         selectedModeLine = selectedModeLine,
-        resultLines = productionNoReadResultLines(),
+        resultLines = workflowGuidanceUiLines(
+            calibrationState = calibrationState,
+            colorState = colorState,
+            workflowState = workflowState,
+            frameWidth = workflowFrameWidth,
+            frameHeight = workflowFrameHeight,
+        ),
         diagnosticLines = diagnosticLines,
         failureLine = failureLine,
         sections = listOf(
             WorkflowSection("Mode", PlaceholderStatus.Pending, "Modes are loaded from the device HAL."),
-            WorkflowSection("Calibrate", PlaceholderStatus.Pending, "Distance setup is not available in this phase."),
-            WorkflowSection("Sample Color", PlaceholderStatus.Pending, "Color sampling arrives with detection."),
+            WorkflowSection("Calibrate", PlaceholderStatus.Pending, calibrationWorkflowUiLines(calibrationState).single()),
+            WorkflowSection("Sample Color", PlaceholderStatus.Pending, colorWorkflowUiLines(colorState, workflowFrameWidth, workflowFrameHeight).first()),
             WorkflowSection("Capture", PlaceholderStatus.Pending, "Developer burst diagnostics are available."),
             WorkflowSection("Import", PlaceholderStatus.Unavailable, "Video import is not implemented in this phase."),
-            WorkflowSection("Results", PlaceholderStatus.Unavailable, "No read until a proven timing source exists."),
+            WorkflowSection("Results", PlaceholderStatus.Unavailable, measurementOutcomeUiLines(workflowState.result).first()),
         ),
     )
 
-sealed interface MeasurementResultUiState {
-    data object Ready : MeasurementResultUiState
-    data object Running : MeasurementResultUiState
-    data class Outcome(val outcome: MeasurementRunOutcome) : MeasurementResultUiState
-}
+fun workflowGuidanceUiLines(
+    calibrationState: CalibrationWorkflowState,
+    colorState: ColorWorkflowState,
+    workflowState: MeasurementWorkflowState,
+    frameWidth: Int,
+    frameHeight: Int,
+): List<String> =
+    calibrationWorkflowUiLines(calibrationState) +
+        colorWorkflowUiLines(colorState, frameWidth, frameHeight) +
+        sourceProofUiLine(workflowState.sourceProof) +
+        captureWorkflowUiLine(workflowState.capture) +
+        measurementOutcomeUiLines(workflowState.result)
 
-fun measurementResultUiLines(state: MeasurementResultUiState): List<String> =
-    when (state) {
-        MeasurementResultUiState.Ready -> listOf("result=ready")
-        MeasurementResultUiState.Running -> listOf("result=running")
-        is MeasurementResultUiState.Outcome -> measurementOutcomeUiLines(state.outcome)
+private fun sourceProofUiLine(sourceProof: WorkflowSourceProofState): List<String> =
+    when (sourceProof) {
+        WorkflowSourceProofState.Unproven -> listOf("sourceProof=not-ready action=prove-direct-frame-source")
+        WorkflowSourceProofState.BoundDirectInputAvailable -> listOf("sourceProof=ready source=phase9-bound-direct-input")
     }
 
-fun measurementOutcomeUiLines(outcome: MeasurementRunOutcome?): List<String> =
-    when (outcome) {
-        null -> listOf("result=no-read reason=${MeasurementRunFailure.UNPROVEN_TIMING} message=Timing source is not proven.")
-        is MeasurementRunOutcome.NoRead -> listOf("result=no-read reason=${outcome.reason} message=${outcome.message}")
-        is MeasurementRunOutcome.Success -> listOf(
-            "result=success mph=${outcome.measurement.milesPerHour.format(1)} angleDeg=${outcome.measurement.launchAngleDegrees.format(1)}",
-            "trajectory carryFt=${(outcome.trajectory.carryMeters * FEET_PER_METER).format(1)} apexFt=${(outcome.trajectory.apexMeters * FEET_PER_METER).format(1)} detections=${outcome.detectionCount}",
+private fun captureWorkflowUiLine(capture: WorkflowCaptureState): List<String> =
+    listOf("captureWorkflow=${capture.name.lowercase()} route=phase9-bound-input-only")
+
+fun calibrationWorkflowUiLines(state: CalibrationWorkflowState): List<String> =
+    when (val readiness = state.readiness()) {
+        is CalibrationWorkflowReadiness.Ready -> listOf(
+            "calibration=ready pixelsPerFoot=${readiness.pixelsPerFoot.format(2)}",
+        )
+
+        is CalibrationWorkflowReadiness.NotReady -> listOf(
+            "calibration=not-ready action=set-two-points-and-known-length message=${readiness.message}",
         )
     }
 
-private fun productionNoReadResultLines(): List<String> =
-    measurementOutcomeUiLines(MeasurementPipeline.currentProductionNoRead())
+fun colorWorkflowUiLines(
+    state: ColorWorkflowState,
+    frameWidth: Int,
+    frameHeight: Int,
+): List<String> =
+    when (val readiness = state.readiness(frameWidth, frameHeight)) {
+        is ColorWorkflowReadiness.Ready -> {
+            val threshold = readiness.threshold
+            val sample = threshold.center
+            val tolerance = threshold.tolerance.clamped()
+            val roi = readiness.regionOfInterest
+            listOf(
+                "colorSample=ready preview=detector-setup hueDeg=${sample.hueDegrees.format(1)} sat=${sample.saturation.format(2)} value=${sample.value.format(2)}",
+                "colorTolerance hueDeg=${tolerance.hueDegrees.format(1)} sat=${tolerance.saturation.format(2)} value=${tolerance.value.format(2)} roi=${roi.left},${roi.top},${roi.rightExclusive}x${roi.bottomExclusive}",
+            )
+        }
+
+        is ColorWorkflowReadiness.NotReady -> listOf(
+            "colorSample=not-ready preview=setup action=sample-ball-color message=${readiness.message}",
+        )
+    }
 
 fun decodeOutcomeUiLines(outcome: DecodeOutcome?): List<String> =
     when (outcome) {
@@ -204,5 +248,3 @@ private fun Double?.formatOrNa(): String =
 
 private fun Double.format(decimals: Int): String =
     "%.${decimals}f".format(this)
-
-private const val FEET_PER_METER = 3.280839895013123

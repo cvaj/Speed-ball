@@ -45,6 +45,9 @@ import com.speedball.app.decode.TimestampAnchorOutcome
 import com.speedball.app.decode.buildDecodeWorkBounds
 import com.speedball.app.decode.runDecodeWithTimeout
 import com.speedball.app.decode.timestampAnchorDiagnosticLogLines
+import com.speedball.app.measurement.CalibrationWorkflowState
+import com.speedball.app.measurement.ColorWorkflowState
+import com.speedball.app.measurement.MeasurementWorkflowState
 import com.speedball.app.ui.SpeedBallApp
 import com.speedball.app.ui.SpeedBallShellState
 import com.speedball.app.ui.decodeOutcomeUiLines
@@ -79,6 +82,9 @@ class MainActivity : ComponentActivity() {
     private var lastPreviewOutcome: PreviewFrameOutcome? = null
     private var lastDirectProofResult: DirectTimingSourceProofRunResult? = null
     private var lastFailure: BurstOutcome.Failure? = null
+    private var calibrationWorkflowState = CalibrationWorkflowState()
+    private var colorWorkflowState = ColorWorkflowState()
+    private var measurementWorkflowState = MeasurementWorkflowState()
     private var captureStatus: String = "Idle"
     private var shellState by mutableStateOf(speedBallPlaceholderState())
     private var autoStartPending = false
@@ -478,6 +484,11 @@ class MainActivity : ComponentActivity() {
                 previewOutcomeUiLines(lastPreviewOutcome) +
                 directProofRunUiLines(lastDirectProofResult),
             failureLine = lastFailure?.let { "Failure: ${it.reason} - ${it.message}" },
+            calibrationState = calibrationWorkflowState,
+            colorState = colorWorkflowState,
+            workflowState = measurementWorkflowState,
+            workflowFrameWidth = selectedMode?.width ?: 0,
+            workflowFrameHeight = selectedMode?.height ?: 0,
         )
     }
 
