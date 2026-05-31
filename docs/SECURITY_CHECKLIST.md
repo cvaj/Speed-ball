@@ -13,6 +13,8 @@ Run this on every code change before review and before commit.
 - [ ] Camera permission is requested only when needed and denied gracefully.
 - [ ] Capture does not continue after lifecycle stop/pause without explicit intent.
 - [ ] Burst duration and high-speed duty cycle are bounded.
+- [ ] CameraDevice disconnect/error callbacks release all owned resources and
+      complete with typed failure.
 
 ## Input Validation
 
@@ -24,6 +26,7 @@ Run this on every code change before review and before commit.
 ## Error Handling
 
 - [ ] Measurement failures produce "No read" with actionable reason.
+- [ ] Capture failures produce developer diagnostics/no-read with actionable reason.
 - [ ] Exceptions that affect correctness are not swallowed.
 - [ ] Defaults do not hide missing calibration, missing timestamps, or failed detection.
 

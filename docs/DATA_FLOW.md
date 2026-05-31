@@ -15,10 +15,13 @@ The root project now has two modules:
 - `:core` is pure Kotlin/JVM and contains measurement model, calibration,
   unit-conversion, velocity-fit, outlier-rejection, fail-loud measurement outcome
   logic, and trajectory physics.
-- `:app` depends on `:core` and renders the placeholder Android shell.
+- `:app` depends on `:core`, renders the Android shell, and owns the Phase 4
+  Camera2 capture foundation.
 
-No camera frames, imported media, calibration data, detections, timestamps,
-velocity fits, or trajectory values flow through the app shell yet.
+No imported media, calibration data, detections, velocity fits, mph results, or
+trajectory values flow through the app shell yet. Camera HAL modes and
+SENSOR_TIMESTAMP diagnostics may flow through the developer diagnostics surface
+only after real enumeration/capture.
 
 ## Core Measurement Path
 
@@ -53,11 +56,17 @@ trajectory samples or plausible carry/hang/apex values.
 ## Live 120 fps Path
 
 ```text
+MainActivity
+  -> request CAMERA permission
+  -> HighSpeedCamera enumerates back-camera Camera2 high-speed HAL ranges
+  -> pure HighSpeedMode mapper validates fixed Range(fps,fps)
+  -> developer UI selects default 720p@120 when available
 Camera2 constrained high-speed session
   -> preview surface + MediaRecorder surface
   -> capture callback SENSOR_TIMESTAMP list
-  -> saved burst
-  -> decode frames in order
+  -> BurstDiagnostics unique-count floor + median-gap band
+  -> saved burst in app-specific external files
+  -> later phase decodes frames in order
   -> reconcile decoded frames with timestamps
   -> HSV/OpenCV centroid detection
   -> flight window selection
@@ -65,6 +74,9 @@ Camera2 constrained high-speed session
   -> core trajectory physics
   -> Compose results UI
 ```
+
+Phase 4 implements the path through `BurstDiagnostics` and saved burst output.
+Decode/frame pairing and detection remain planned.
 
 ## Live 240 fps Path
 

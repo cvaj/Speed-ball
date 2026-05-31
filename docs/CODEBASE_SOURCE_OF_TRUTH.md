@@ -26,8 +26,11 @@ This is the starting point for every Speed-ball task.
 - Implemented modules:
   - `:core` pure Kotlin/JVM model, calibration, units, velocity fit, and
     fail-loud measurement outcome logic, plus trajectory physics.
-  - `:app` Android Compose shell. Camera2, OpenCV, import, and results UI remain
-    planned.
+  - `:app` Android Compose shell plus Phase 4 Camera2 capture foundation:
+    permission flow, HAL high-speed mode enumeration, 120 fps constrained
+    high-speed MediaRecorder burst, `SENSOR_TIMESTAMP` diagnostics, and
+    developer capture proof UI. OpenCV, decode/frame pairing, import, and
+    results UI remain planned.
 - `docs/ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md` is the current implementation plan under review.
 
 ## Non-Negotiable Technical Facts

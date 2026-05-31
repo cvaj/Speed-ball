@@ -4,15 +4,18 @@ Speed-ball measures a hit softball by tracking a neon-colored ball in high-speed
 
 ## Current App State
 
-The visible app still opens to a Compose workflow list for mode selection,
-calibration, color sampling, capture, import, and results, but each section is
-marked pending or unavailable. The results section stays in a no-read state until
-later phases wire capture, detection, calibration UI, and results UI.
+The visible app opens to a Compose workflow list plus a developer diagnostics
+surface for Phase 4 high-speed capture proof. The app can request camera
+permission, enumerate Camera2 high-speed modes from the device HAL, and start a
+bounded 120 fps MediaRecorder burst when a fixed 120 fps range is exposed. The
+results section stays in a no-read state until later phases wire decode,
+detection, calibration UI, and results UI.
 
-The implemented `:core` module now contains calibration, unit conversion,
-velocity measurement, and trajectory physics. The app shell must still not
-display a sample speed, frame rate, concrete camera mode, trajectory, or
-placeholder result value.
+The implemented `:core` module contains calibration, unit conversion, velocity
+measurement, and trajectory physics. The `:app` module now owns the Camera2
+capture foundation and timestamp diagnostics. It must still not display a sample
+speed, trajectory, or placeholder result value. Camera mode and timestamp
+diagnostics may be shown only after real HAL enumeration or a real burst.
 
 ## User Flow
 
@@ -75,6 +78,16 @@ from positive height simulate to ground. Angles outside that range fail loudly.
 
 The app must show "No read" rather than a wrong speed when:
 
+- camera permission is denied;
+- no back camera or no supported high-speed HAL mode exists;
+- a requested high-speed mode lacks the exact fixed AE range needed for
+  recording;
+- a capture burst is already active;
+- Camera2 open, disconnect, device error, session configuration, recorder setup,
+  or recording fails;
+- no positive `SENSOR_TIMESTAMP` values are collected;
+- the 120 fps capture proof fails either the unique-count floor or median-gap
+  band;
 - fewer than three valid detections exist;
 - timestamps are missing, duplicate, non-monotonic, or unpaired;
 - timestamps are too close together to produce a meaningful fit;
@@ -95,8 +108,29 @@ Core failure reasons are:
 - `NON_FINITE_FIT`
 - `EXCESSIVE_RESIDUAL`
 
+Phase 4 capture failure reasons are:
+
+- `CAMERA_PERMISSION_DENIED`
+- `NO_BACK_CAMERA`
+- `NO_HIGH_SPEED_MODES`
+- `UNSUPPORTED_MODE`
+- `CAPTURE_BUSY`
+- `CAMERA_OPEN_FAILED`
+- `CAMERA_DEVICE_DISCONNECTED`
+- `CAMERA_DEVICE_ERROR`
+- `SESSION_CONFIGURATION_FAILED`
+- `RECORDER_PREPARE_FAILED`
+- `RECORDING_FAILED`
+- `NO_SENSOR_TIMESTAMPS`
+- `RESOURCE_RELEASE_FAILED`
+
 ## Capture Modes
 
 - 120 fps on S10+ uses record-then-decode because it records cleanly.
 - 240 fps on S10+ requires GPU/preview detection because MediaRecorder drops frames.
 - Device capabilities must come from Camera2 HAL enumeration, not hardcoded assumptions.
+- Phase 4 records only fixed-range 120 fps modes. It enumerates 240 fps modes
+  but returns `UNSUPPORTED_MODE` if asked to record them.
+- A burst is considered 120 fps proof only when unique sensor timestamps meet
+  the requested-duration floor and the median inter-frame gap is inside the
+  `1000/fps` ms +/-15% band. For 120 fps that is about `8.33 ms`.

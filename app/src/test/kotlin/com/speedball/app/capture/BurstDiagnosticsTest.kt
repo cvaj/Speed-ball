@@ -1,0 +1,141 @@
+package com.speedball.app.capture
+
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertInstanceOf
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import kotlin.math.roundToLong
+
+class BurstDiagnosticsTest {
+    @Test
+    fun duplicateCallbacksDoNotInflateUniqueTimestampProof() {
+        val timestamps = listOf(timestampNanos(0.0), timestampNanos(8.33), timestampNanos(8.33), timestampNanos(16.66))
+
+        val diagnostics = buildBurstDiagnostics(
+            timestampsNanos = timestamps,
+            callbackCount = 4,
+            requestedDurationMillis = 2_500L,
+            fps = 120,
+            outputPath = "/private/path/burst.mp4",
+            fileBytes = 123L,
+        )
+
+        assertEquals(3, diagnostics.uniqueTimestampCount)
+        assertEquals(4, diagnostics.callbackCount)
+        assertEquals("burst.mp4", diagnostics.displayOutputName)
+        assertEquals(8.33, diagnostics.medianGapMillis!!, 0.01)
+    }
+
+    @Test
+    fun emptySensorTimestampsFailLoud() {
+        val outcome = buildBurstOutcome(
+            timestampsNanos = emptyList(),
+            callbackCount = 0,
+            requestedDurationMillis = 2_500L,
+            fps = 120,
+            outputPath = "burst.mp4",
+            fileBytes = 0L,
+        )
+
+        val failure = assertInstanceOf(BurstOutcome.Failure::class.java, outcome)
+        assertEquals(BurstFailure.NO_SENSOR_TIMESTAMPS, failure.reason)
+    }
+
+    @Test
+    fun expectedUniqueCountAndMinimumArePinnedFor120Fps() {
+        val diagnostics = diagnosticsWithUniqueCount(count = 240, gapMillis = 8.33)
+
+        assertEquals(300, diagnostics.expectedUniqueTimestampCount)
+        assertEquals(240, diagnostics.minimumUniqueTimestampCount)
+        assertTrue(diagnostics.uniqueCountPassesRequestedMinimum)
+    }
+
+    @Test
+    fun uniqueCountBelowMinimumFails() {
+        val diagnostics = diagnosticsWithUniqueCount(count = 239, gapMillis = 8.33)
+
+        assertFalse(diagnostics.uniqueCountPassesRequestedMinimum)
+        assertFalse(diagnostics.captureProofPasses)
+    }
+
+    @Test
+    fun medianGapMustStayInsideRateBand() {
+        val pass = diagnosticsWithUniqueCount(count = 300, gapMillis = 8.33)
+        val fail = diagnosticsWithUniqueCount(count = 300, gapMillis = 10.4)
+
+        assertTrue(pass.medianGapPassesRateBand)
+        assertTrue(pass.captureProofPasses)
+        assertFalse(fail.medianGapPassesRateBand)
+        assertFalse(fail.captureProofPasses)
+    }
+
+    @Test
+    fun captureProofRequiresBothUniqueFloorAndMedianGapBand() {
+        val countPassesGapFails = diagnosticsWithUniqueCount(count = 240, gapMillis = 10.4)
+        val gapPassesCountFails = diagnosticsWithUniqueCount(count = 239, gapMillis = 8.33)
+
+        assertTrue(countPassesGapFails.uniqueCountPassesRequestedMinimum)
+        assertFalse(countPassesGapFails.medianGapPassesRateBand)
+        assertFalse(countPassesGapFails.captureProofPasses)
+        assertFalse(gapPassesCountFails.uniqueCountPassesRequestedMinimum)
+        assertTrue(gapPassesCountFails.medianGapPassesRateBand)
+        assertFalse(gapPassesCountFails.captureProofPasses)
+    }
+
+    @Test
+    fun terminalResolutionPreservesPrimaryFailureOverReleaseFailure() {
+        assertEquals(
+            BurstFailure.CAMERA_DEVICE_ERROR,
+            resolveTerminalFailure(BurstFailure.CAMERA_DEVICE_ERROR, BurstFailure.RESOURCE_RELEASE_FAILED),
+        )
+        assertEquals(BurstFailure.RESOURCE_RELEASE_FAILED, resolveTerminalFailure(null, BurstFailure.RESOURCE_RELEASE_FAILED))
+    }
+
+    @Test
+    fun terminalCompletionGateCanBeClaimedOnlyOnceUntilReset() {
+        val gate = TerminalCompletionGate()
+
+        assertTrue(gate.claim())
+        assertFalse(gate.claim())
+        gate.reset()
+        assertTrue(gate.claim())
+    }
+
+    @Test
+    fun synchronousFailureReasonsArePinned() {
+        val synchronousReasons = BurstFailure.entries.filter(::shouldDeliverSynchronously)
+
+        assertEquals(
+            listOf(
+                BurstFailure.CAMERA_PERMISSION_DENIED,
+                BurstFailure.NO_BACK_CAMERA,
+                BurstFailure.CAMERA_OPEN_FAILED,
+                BurstFailure.RECORDER_PREPARE_FAILED,
+            ),
+            synchronousReasons,
+        )
+        assertFalse(shouldDeliverSynchronously(BurstFailure.CAPTURE_BUSY))
+        assertFalse(shouldDeliverSynchronously(BurstFailure.RECORDING_FAILED))
+    }
+
+    @Test
+    fun durationClampUsesSafeBounds() {
+        assertEquals(DEFAULT_BURST_DURATION_MILLIS, clampBurstDurationMillis(-1L))
+        assertEquals(1_000L, clampBurstDurationMillis(1_000L))
+        assertEquals(MAX_BURST_DURATION_MILLIS, clampBurstDurationMillis(4_000L))
+    }
+
+    private fun diagnosticsWithUniqueCount(count: Int, gapMillis: Double): BurstDiagnostics =
+        buildBurstDiagnostics(
+            timestampsNanos = List(count) { index -> timestampNanos(index * gapMillis) },
+            callbackCount = count,
+            requestedDurationMillis = 2_500L,
+            fps = 120,
+            outputPath = "burst.mp4",
+            fileBytes = 1L,
+        )
+
+    private fun timestampNanos(offsetMillis: Double): Long =
+        1_000_000_000L + (offsetMillis * 1_000_000.0).roundToLong()
+}
