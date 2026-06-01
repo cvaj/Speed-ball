@@ -1,5 +1,8 @@
 package com.speedball.app.capture
 
+import com.speedball.app.decode.buildOrderedTimestampDiagnostics
+import com.speedball.app.decode.buildTimestampDiagnostics
+
 /**
  * Result from one direct-source Camera2 session shape.
  *
@@ -14,6 +17,7 @@ sealed interface DirectSessionProbeOutcome {
         val sensorTimestampsNanos: List<Long>,
         val frames: List<DirectFrameProof>,
         val scratchCleanupStatus: CompanionScratchCleanupStatus = CompanionScratchCleanupStatus.ALREADY_ABSENT,
+        val captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(),
     ) : DirectSessionProbeOutcome {
         init {
             require(requestListSize > 0) { "Request list size must be positive." }
@@ -30,6 +34,7 @@ sealed interface DirectSessionProbeOutcome {
         val sensorTimestampCount: Int = 0,
         val pixelProofCount: Int = 0,
         val scratchCleanupStatus: CompanionScratchCleanupStatus = CompanionScratchCleanupStatus.ALREADY_ABSENT,
+        val captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(),
     ) : DirectSessionProbeOutcome {
         init {
             require(message.isNotBlank()) { "Failure message must not be blank." }
@@ -114,6 +119,8 @@ internal fun buildProofOutcomeFromCompanion(
                 pixelProofCount = companionOutcome.pixelProofCount,
                 sequenceIdentity = null,
                 tokenEligibility = null,
+                finalFailure = companionOutcome.reason,
+                captureDiagnostics = companionOutcome.captureDiagnostics,
             ),
         )
 
@@ -122,14 +129,14 @@ internal fun buildProofOutcomeFromCompanion(
                 return DirectTimingSourceProofOutcome.Failure(
                     reason = DirectTimingSourceFailure.SCRATCH_FILE_CLEANUP_FAILED,
                     message = "Companion scratch file cleanup failed after direct proof capture.",
-                    diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null),
+                    diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null, finalFailure = DirectTimingSourceFailure.SCRATCH_FILE_CLEANUP_FAILED),
                 )
             }
             if (companionOutcome.frames.size < MIN_DIRECT_PROOF_TOKEN_FRAMES) {
                 return DirectTimingSourceProofOutcome.Failure(
                     reason = DirectTimingSourceFailure.INSUFFICIENT_DIRECT_FRAMES,
                     message = "Direct proof requires at least $MIN_DIRECT_PROOF_TOKEN_FRAMES consumed same-update frames before cadence can authorize measurement.",
-                    diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null),
+                    diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null, finalFailure = DirectTimingSourceFailure.INSUFFICIENT_DIRECT_FRAMES),
                 )
             }
             val timestamps = companionOutcome.frames.map { it.timestampNanos }
@@ -143,7 +150,7 @@ internal fun buildProofOutcomeFromCompanion(
                 is DirectFrameTimestampProofOutcome.Failure -> DirectTimingSourceProofOutcome.Failure(
                     reason = timestampProof.reason,
                     message = timestampProof.message,
-                    diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null),
+                    diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null, finalFailure = timestampProof.reason),
                 )
 
                 is DirectFrameTimestampProofOutcome.Success -> {
@@ -157,7 +164,7 @@ internal fun buildProofOutcomeFromCompanion(
                         is DirectPixelProofOutcome.Failure -> DirectTimingSourceProofOutcome.Failure(
                             reason = pixelProof.reason,
                             message = pixelProof.message,
-                            diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null),
+                            diagnostics = companionOutcome.diagnostics(runId, mode, sequenceIdentity = null, tokenEligibility = null, finalFailure = pixelProof.reason),
                         )
 
                         is DirectPixelProofOutcome.Success -> {
@@ -197,17 +204,28 @@ private fun DirectSessionProbeOutcome.Success.diagnostics(
     mode: HighSpeedMode,
     sequenceIdentity: DirectSequenceContentIdentity?,
     tokenEligibility: DirectProofTokenEligibility?,
+    finalFailure: DirectTimingSourceFailure? = null,
 ): DirectTimingSourceDiagnostics =
-    DirectTimingSourceDiagnostics(
-        runId = runId,
-        sessionShape = shape,
-        requestedFps = mode.fps,
-        directTimestampCount = frames.size,
-        sensorTimestampCount = sensorTimestampsNanos.size,
-        pixelProofCount = frames.size,
-        sequenceIdentity = sequenceIdentity,
-        tokenEligibility = tokenEligibility,
-    )
+    run {
+        val directDiagnostics = buildOrderedTimestampDiagnostics(frames.map { it.timestampNanos }, mode.fps)
+        val sensorDiagnostics = buildTimestampDiagnostics(sensorTimestampsNanos, mode.fps)
+        DirectTimingSourceDiagnostics(
+            runId = runId,
+            sessionShape = shape,
+            requestedFps = mode.fps,
+            directTimestampCount = frames.size,
+            sensorTimestampCount = sensorTimestampsNanos.size,
+            pixelProofCount = frames.size,
+            sequenceIdentity = sequenceIdentity,
+            tokenEligibility = tokenEligibility,
+            directMedianGapMillis = directDiagnostics.medianGapMillis,
+            directMaximumGapMillis = directDiagnostics.maximumGapMillis,
+            sensorMedianGapMillis = sensorDiagnostics.medianGapMillis,
+            sensorMaximumGapMillis = sensorDiagnostics.maximumGapMillis,
+            finalFailure = finalFailure,
+            captureDiagnostics = captureDiagnostics,
+        )
+    }
 
 private fun directProofLogLine(
     event: String,
@@ -222,8 +240,8 @@ private fun directProofLogLine(
     outcome: DirectSessionProbeOutcome,
 ): String =
     when (outcome) {
-        is DirectSessionProbeOutcome.Success -> "$event mode=${mode.label.sanitizedDirectLogToken()} shape=${outcome.shape} requestListSize=${outcome.requestListSize} directCount=${outcome.frames.size} sensorCount=${outcome.sensorTimestampsNanos.size} pixelCount=${outcome.frames.size} verdict=CAPTURED"
-        is DirectSessionProbeOutcome.Failure -> "$event mode=${mode.label.sanitizedDirectLogToken()} shape=${outcome.shape} requestListSize=${outcome.requestListSize} directCount=${outcome.directTimestampCount} sensorCount=${outcome.sensorTimestampCount} pixelCount=${outcome.pixelProofCount} verdict=${outcome.reason}"
+        is DirectSessionProbeOutcome.Success -> "$event mode=${mode.label.sanitizedDirectLogToken()} shape=${outcome.shape} requestListSize=${outcome.requestListSize} directCount=${outcome.frames.size} sensorCount=${outcome.sensorTimestampsNanos.size} pixelCount=${outcome.frames.size} ${outcome.captureDiagnostics.logFields()} verdict=CAPTURED"
+        is DirectSessionProbeOutcome.Failure -> "$event mode=${mode.label.sanitizedDirectLogToken()} shape=${outcome.shape} requestListSize=${outcome.requestListSize} directCount=${outcome.directTimestampCount} sensorCount=${outcome.sensorTimestampCount} pixelCount=${outcome.pixelProofCount} ${outcome.captureDiagnostics.logFields()} verdict=${outcome.reason}"
     }
 
 private fun directPreviewLogLine(
@@ -243,10 +261,19 @@ private fun directProofOutcomeLogLine(
     outcome: DirectTimingSourceProofOutcome,
 ): String =
     when (outcome) {
-        is DirectTimingSourceProofOutcome.Success -> "$event mode=${mode.label.sanitizedDirectLogToken()} verdict=TOKEN_ELIGIBLE frames=${outcome.frames.size}"
-        is DirectTimingSourceProofOutcome.Failure -> "$event mode=${mode.label.sanitizedDirectLogToken()} verdict=${outcome.reason}"
+        is DirectTimingSourceProofOutcome.Success -> "$event mode=${mode.label.sanitizedDirectLogToken()} verdict=TOKEN_ELIGIBLE frames=${outcome.frames.size} ${outcome.diagnostics.logFields()}"
+        is DirectTimingSourceProofOutcome.Failure -> "$event mode=${mode.label.sanitizedDirectLogToken()} verdict=${outcome.reason} ${outcome.diagnostics?.logFields().orEmpty()}"
         DirectTimingSourceProofOutcome.Cancelled -> "$event mode=${mode.label.sanitizedDirectLogToken()} verdict=CANCELLED"
     }
+
+private fun DirectCaptureDiagnostics.logFields(): String =
+    "frameCallbacks=$frameAvailableCallbackCount captureCallbacks=$captureResultCallbackCount appended=$appendedDirectFrameCount readbacks=$readbackCount readbackMedianMs=${medianReadbackMillis.formatOrNa()} readbackMaxMs=${maximumReadbackMillis.formatOrNa()} releaseSteps=${releaseStepTimings.size}"
+
+private fun DirectTimingSourceDiagnostics.logFields(): String =
+    "directMedianMs=${directMedianGapMillis.formatOrNa()} directMaxMs=${directMaximumGapMillis.formatOrNa()} sensorMedianMs=${sensorMedianGapMillis.formatOrNa()} sensorMaxMs=${sensorMaximumGapMillis.formatOrNa()} finalGate=${finalFailure ?: "none"} ${captureDiagnostics.logFields()}"
+
+private fun Double?.formatOrNa(): String =
+    this?.let { "%.3f".format(it) } ?: "n/a"
 
 private fun String.sanitizedDirectLogToken(): String =
     replace(Regex("\\s+"), "_")

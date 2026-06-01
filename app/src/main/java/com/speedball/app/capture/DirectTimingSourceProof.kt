@@ -52,6 +52,43 @@ enum class DirectTimingSourceFailure {
  */
 const val MIN_DIRECT_PROOF_TOKEN_FRAMES: Int = 12
 
+/** Timing for one bounded direct-capture release step. */
+data class DirectReleaseStepTiming(
+    val name: String,
+    val elapsedMillis: Double,
+    val failed: Boolean,
+) {
+    init {
+        require(name.isNotBlank()) { "Release step name must not be blank." }
+        require(!name.contains("/") && !name.contains("\\")) { "Release step name must not be path-like." }
+        require(elapsedMillis >= 0.0) { "Release elapsed time must be non-negative." }
+    }
+}
+
+/** Bounded root-cause diagnostics for direct readback capture. */
+data class DirectCaptureDiagnostics(
+    val frameAvailableCallbackCount: Int = 0,
+    val captureResultCallbackCount: Int = 0,
+    val appendedDirectFrameCount: Int = 0,
+    val readbackCount: Int = 0,
+    val medianReadbackMillis: Double? = null,
+    val maximumReadbackMillis: Double? = null,
+    val releaseStepTimings: List<DirectReleaseStepTiming> = emptyList(),
+) {
+    init {
+        require(frameAvailableCallbackCount >= 0) { "Frame callback count must be non-negative." }
+        require(captureResultCallbackCount >= 0) { "Capture callback count must be non-negative." }
+        require(appendedDirectFrameCount >= 0) { "Appended direct frame count must be non-negative." }
+        require(readbackCount >= 0) { "Readback count must be non-negative." }
+        require(medianReadbackMillis == null || medianReadbackMillis >= 0.0) {
+            "Median readback time must be non-negative."
+        }
+        require(maximumReadbackMillis == null || maximumReadbackMillis >= 0.0) {
+            "Maximum readback time must be non-negative."
+        }
+    }
+}
+
 /** Opaque identity for a single direct-source proof run. */
 @JvmInline
 value class DirectProofRunId(val value: String) {
@@ -182,6 +219,12 @@ data class DirectTimingSourceDiagnostics(
     val pixelProofCount: Int,
     val sequenceIdentity: DirectSequenceContentIdentity?,
     val tokenEligibility: DirectProofTokenEligibility?,
+    val directMedianGapMillis: Double? = null,
+    val directMaximumGapMillis: Double? = null,
+    val sensorMedianGapMillis: Double? = null,
+    val sensorMaximumGapMillis: Double? = null,
+    val finalFailure: DirectTimingSourceFailure? = null,
+    val captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(),
 ) {
     init {
         require(requestedFps > 0) { "Requested fps must be positive." }

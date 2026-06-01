@@ -65,6 +65,17 @@ class DirectFrameTimestampProofTest {
     }
 
     @Test
+    fun degradedTwentyFourFrameStreamRejectsAsWholeInsteadOfFilteringToTwelve() {
+        val degraded = timestamps(count = 24).toMutableList().apply {
+            this[12] = this[11] + 1L
+        }
+        val failure = proveDirectFrameTimestamps(degraded, degraded, fps = 120).asFailure()
+
+        assertEquals(DirectTimingSourceFailure.DIRECT_TIMESTAMP_NEAR_DUPLICATE, failure.reason)
+        assertEquals(24, failure.diagnostics.rawDirectTimestampCount)
+    }
+
+    @Test
     fun duplicateDirectTimestampRejects() {
         val timestamps = listOf(ts(0.0), ts(8.333333), ts(8.333333), ts(16.666666))
         val failure = proveDirectFrameTimestamps(timestamps, timestamps, fps = 120).asFailure()

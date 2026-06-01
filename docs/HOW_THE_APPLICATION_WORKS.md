@@ -31,8 +31,12 @@ Phase 10 adds the user-facing workflow foundation around that boundary:
 calibration readiness, color-sample readiness, Phase 9 source-proof readiness,
 capture route state, and result presentation all flow through typed pure JVM
 state. It still adds zero production measurement capability on real hardware.
-Production remains no-read until the next phase proves direct readback can
-produce at least 12 bound frames for the Phase 9 token factory.
+Phase 11 raises the direct readback target above the 12-frame token minimum and
+adds root-cause diagnostics for the S10+ one-frame blocker: frame-available
+callbacks versus appended proof frames, readback timing, release-step timing,
+direct/sensor cadence, maximum gaps, and the final failed gate. Production
+remains no-read unless the consumed direct stream passes the timestamp and pixel
+proof gates as a whole; degraded streams cannot be filtered down to 12 frames.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
@@ -275,8 +279,9 @@ Phase 10 workflow/result behavior:
   trajectory, carry, apex, or hang time.
 - Synthetic timing proof remains in test source only and exists solely for JVM
   fixture coverage.
-- The next product blocker is direct-readback-to-12-frames so a real Phase 9
-  bound direct input can be attempted.
+- Phase 11 is the direct-readback-to-12-frames effort. It targets more than 12
+  raw direct readbacks, but token eligibility still requires at least 12
+  whole-stream-clean frames after timestamp and pixel proof gates.
 
 ## Capture Modes
 
@@ -332,3 +337,9 @@ Phase 10 workflow/result behavior:
   identity therefore cannot produce a speed. Testers can trigger the path with the debug-only
   `autoStartDirectProof120` adb extra; failures still render as no-read
   diagnostics with no path, pixel, speed, angle, or trajectory values.
+- Phase 11 keeps the Phase 9 proof contract and changes the direct capture
+  attempt from a one-frame stopgap to a 24-frame target. It logs bounded
+  readback/release diagnostics and cadence/gap/final-gate data. The timestamp
+  proof remains whole-stream fail-loud: interior near-duplicates, coalescing, or
+  dropped-frame gaps reject the stream instead of being filtered into a passing
+  12-frame subset.

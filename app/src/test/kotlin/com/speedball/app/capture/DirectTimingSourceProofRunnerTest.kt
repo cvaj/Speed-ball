@@ -52,6 +52,8 @@ class DirectTimingSourceProofRunnerTest {
         val failure = assertInstanceOf(DirectTimingSourceProofOutcome.Failure::class.java, result.proofOutcome)
 
         assertEquals(DirectTimingSourceFailure.DIRECT_CADENCE_MISMATCH, failure.reason)
+        assertEquals(null, failure.diagnostics?.tokenEligibility)
+        assertEquals(DirectTimingSourceFailure.DIRECT_CADENCE_MISMATCH, failure.diagnostics?.finalFailure)
         assertTrue(result.previewControl.attempted)
     }
 
@@ -156,7 +158,19 @@ class DirectTimingSourceProofRunnerTest {
     fun runnerLogsBoundedLinesWithoutPathsOrPixelsOrDecoderTerms() {
         val logs = mutableListOf<String>()
         val runner = DirectTimingSourceProofRunner(
-            companionProbe = { companionSuccess() },
+            companionProbe = {
+                companionSuccess(
+                    captureDiagnostics = DirectCaptureDiagnostics(
+                        frameAvailableCallbackCount = 24,
+                        captureResultCallbackCount = 96,
+                        appendedDirectFrameCount = MIN_DIRECT_PROOF_TOKEN_FRAMES,
+                        readbackCount = MIN_DIRECT_PROOF_TOKEN_FRAMES,
+                        medianReadbackMillis = 1.25,
+                        maximumReadbackMillis = 2.5,
+                        releaseStepTimings = listOf(DirectReleaseStepTiming("releaseGl", 0.5, failed = false)),
+                    ),
+                )
+            },
             previewControl = { previewFailure() },
             logger = { logs += it },
         )
@@ -169,6 +183,11 @@ class DirectTimingSourceProofRunnerTest {
 
         assertTrue(logs.any { it.startsWith("DIRECT_PROOF_COMPANION") })
         assertTrue(logs.any { it.startsWith("DIRECT_PROOF_PREVIEW") })
+        assertTrue(logs.any { it.contains("frameCallbacks=24") })
+        assertTrue(logs.any { it.contains("readbackMedianMs=1.250") })
+        assertTrue(logs.any { it.contains("directMedianMs=8.333") })
+        assertTrue(logs.any { it.contains("sensorMedianMs=8.333") })
+        assertTrue(logs.any { it.contains("finalGate=none") })
         logs.forEach { line ->
             assertFalse(line.contains("/"))
             assertFalse(line.contains("mp4", ignoreCase = true))
@@ -190,6 +209,7 @@ class DirectTimingSourceProofRunnerTest {
     private fun companionSuccess(
         timestamps: List<Long> = timestamps(count = MIN_DIRECT_PROOF_TOKEN_FRAMES),
         scratchCleanupStatus: CompanionScratchCleanupStatus = CompanionScratchCleanupStatus.DELETED,
+        captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(),
     ): DirectSessionProbeOutcome.Success =
         DirectSessionProbeOutcome.Success(
             shape = DirectProofSessionShape.COMPANION_ENCODER,
@@ -205,6 +225,7 @@ class DirectTimingSourceProofRunnerTest {
                 )
             },
             scratchCleanupStatus = scratchCleanupStatus,
+            captureDiagnostics = captureDiagnostics,
         )
 
     private fun timestamps(count: Int, gapNanos: Long = 8_333_333L): List<Long> =

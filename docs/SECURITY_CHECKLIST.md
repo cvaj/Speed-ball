@@ -95,3 +95,18 @@ Run this on every code change before review and before commit.
   exists in test source only.
 - Production remains no-read until a future direct-readback-to-12-frames phase
   can mint a Phase 9 bound direct input.
+
+## Phase 11 Notes
+
+- Direct readback diagnostics are bounded counts, timings, cadence/gap values,
+  release-step names, and typed gates only. They must not expose raw pixels,
+  scratch paths, private media paths, mph, angle, trajectory, APKs, keystores,
+  or credentials.
+- The companion MP4 remains app-private cache data only. It is not decoded,
+  imported, path-logged, or measurement-consumed.
+- The direct capture target is above the 12-frame token minimum, but token
+  eligibility still requires whole-stream timestamp and pixel proof. Interior
+  near-duplicates, coalescing, or dropped-frame gaps must reject the stream
+  rather than being filtered into a passing subset.
+- Camera/session/GL/recorder release steps are timed and logged by bounded step
+  name so teardown blockers can be diagnosed without leaking file paths.

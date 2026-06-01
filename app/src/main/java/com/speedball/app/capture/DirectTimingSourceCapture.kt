@@ -48,6 +48,8 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
     private var collector: DirectFrameProofCollector? = null
     private var sensorTimestamps = mutableListOf<Long>()
     private var captureCallbackCount = AtomicInteger(0)
+    private var frameAvailableCallbackCount = AtomicInteger(0)
+    private var readbackElapsedMillis = mutableListOf<Double>()
     private var requestListSize = 0
     private var completion: ((DirectSessionProbeOutcome) -> Unit)? = null
     private var options: BurstOptions? = null
@@ -67,6 +69,8 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
             completion = onComplete
             sensorTimestamps = mutableListOf()
             captureCallbackCount = AtomicInteger(0)
+            frameAvailableCallbackCount = AtomicInteger(0)
+            readbackElapsedMillis = mutableListOf()
             requestListSize = 0
             collector = DirectFrameProofCollector(
                 maxFrames = directProofMaxFrames(options.mode, this.options?.durationMillis ?: options.durationMillis),
@@ -238,11 +242,15 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
     }
 
     private fun onFrameAvailable() {
+        frameAvailableCallbackCount.incrementAndGet()
         val resources = glResources ?: return
         val currentCollector = collector ?: return
         if (!shouldHandleDirectFrame(currentState())) return
         runCatching {
+            val readbackStart = System.nanoTime()
             val signature = resources.updateAndReadSignature()
+            val readbackMillis = elapsedMillis(readbackStart)
+            synchronized(lock) { readbackElapsedMillis.add(readbackMillis) }
             val failure = currentCollector.appendAtomicFrame(
                 state = currentState(),
                 frameIndex = currentCollector.snapshot().size,
@@ -256,7 +264,7 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
             }
             val frameCount = currentCollector.snapshot().size
             if (frameCount == 1 || frameCount % 30 == 0) {
-                Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_FRAME_READBACK count=$frameCount timestamp=${signature.timestampNanos}")
+                Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_FRAME_READBACK count=$frameCount timestamp=${signature.timestampNanos} readbackMs=${readbackMillis.formatMillisForDirectLog()} frameCallbacks=${frameAvailableCallbackCount.get()} captureCallbacks=${captureCallbackCount.get()}")
             }
             if (frameCount >= DIRECT_TARGET_PROOF_FRAMES) {
                 complete(null)
@@ -300,8 +308,8 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
             completion = null
             callback
         }
-        val releaseFailure = releaseResources()
-        val outcome = primaryOutcome ?: buildFinalOutcome(releaseFailure)
+        val releaseResult = releaseResources()
+        val outcome = primaryOutcome?.withFinalCaptureContext(releaseResult) ?: buildFinalOutcome(releaseResult)
         synchronized(lock) {
             state = BurstRecorderState.Idle
             options = null
@@ -309,17 +317,20 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         callbackToRun?.invoke(outcome)
     }
 
-    private fun buildFinalOutcome(releaseFailure: DirectTimingSourceFailure?): DirectSessionProbeOutcome {
+    private fun buildFinalOutcome(releaseResult: DirectReleaseResourcesResult): DirectSessionProbeOutcome {
         val safeOptions = options ?: return directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct proof options were lost before completion.")
         val frameProofs = collector?.snapshot().orEmpty().map { it.frame }
         val sensorCopy = synchronized(lock) { sensorTimestamps.toList() }
-        if (releaseFailure != null) {
+        val captureDiagnostics = buildCaptureDiagnostics(releaseResult, frameProofs.size)
+        if (releaseResult.failure != null) {
             return directFailure(
-                reason = releaseFailure,
+                reason = releaseResult.failure,
                 message = "Direct proof stopped, but a resource release step failed.",
                 directTimestampCount = frameProofs.size,
                 sensorTimestampCount = sensorCopy.size,
                 pixelProofCount = frameProofs.size,
+                scratchCleanupStatus = releaseResult.scratchCleanupStatus,
+                captureDiagnostics = captureDiagnostics,
             )
         }
         if (frameProofs.isEmpty()) {
@@ -327,6 +338,8 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
                 reason = DirectTimingSourceFailure.MISSING_DIRECT_TIMESTAMPS,
                 message = "No direct SurfaceTexture frames were consumed.",
                 sensorTimestampCount = sensorCopy.size,
+                scratchCleanupStatus = releaseResult.scratchCleanupStatus,
+                captureDiagnostics = captureDiagnostics,
             )
         }
         return DirectSessionProbeOutcome.Success(
@@ -334,56 +347,81 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
             requestListSize = requestListSize.coerceAtLeast(1),
             sensorTimestampsNanos = sensorCopy,
             frames = frameProofs,
-            scratchCleanupStatus = CompanionScratchCleanupStatus.DELETED,
+            scratchCleanupStatus = releaseResult.scratchCleanupStatus,
+            captureDiagnostics = captureDiagnostics,
         )
     }
 
-    private fun releaseResources(): DirectTimingSourceFailure? {
-        var scratchStatus = CompanionScratchCleanupStatus.ALREADY_ABSENT
-        val failure = releaseDirectCaptureResources(
+    private fun releaseResources(): DirectReleaseResourcesResult {
+        val result = releaseDirectCaptureResourcesWithDiagnostics(
             DirectReleaseActions(
                 stopRepeating = {
-                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP stopRepeating")
                     session?.stopRepeating()
                 },
                 closeSession = {
-                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP closeSession")
                     session?.close()
                 },
                 closeCamera = {
-                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP closeCamera")
                     cameraDevice?.close()
                 },
                 releaseGl = {
-                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP releaseGl")
                     glResources?.release()
                 },
                 releaseCompanion = {
-                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP releaseCompanion")
-                    val result = companionScratch?.releaseAndDelete()
+                    companionScratch?.releaseAndDelete()
                         ?: CompanionScratchCleanupResult(CompanionScratchCleanupStatus.ALREADY_ABSENT)
-                    scratchStatus = result.status
-                    result
                 },
                 quitThread = {
-                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP quitThread")
                     handlerThread?.quitSafely()
                 },
             ),
         )
-        Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_DONE failure=$failure scratch=$scratchStatus")
+        result.stepTimings.forEach { timing ->
+            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_STEP name=${timing.name} elapsedMs=${timing.elapsedMillis.formatMillisForDirectLog()} failed=${timing.failed}")
+        }
+        Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_RELEASE_DONE failure=${result.failure} scratch=${result.scratchCleanupStatus} steps=${result.stepTimings.size}")
         session = null
         cameraDevice = null
         glResources = null
         companionScratch = null
         handler = null
         handlerThread = null
-        return when {
-            failure == DirectTimingSourceFailure.SCRATCH_FILE_CLEANUP_FAILED ||
-                scratchStatus == CompanionScratchCleanupStatus.FAILED -> DirectTimingSourceFailure.SCRATCH_FILE_CLEANUP_FAILED
-            failure != null -> failure
-            else -> null
-        }
+        return result
+    }
+
+    private fun DirectSessionProbeOutcome.Failure.withFinalCaptureContext(
+        releaseResult: DirectReleaseResourcesResult,
+    ): DirectSessionProbeOutcome.Failure {
+        val frameProofs = collector?.snapshot().orEmpty().map { it.frame }
+        val sensorCopy = synchronized(lock) { sensorTimestamps.toList() }
+        return copy(
+            requestListSize = if (this@DirectCompanionTimingProofCapture.requestListSize > 0) {
+                this@DirectCompanionTimingProofCapture.requestListSize
+            } else {
+                this.requestListSize
+            },
+            directTimestampCount = directTimestampCount.coerceAtLeast(frameProofs.size),
+            sensorTimestampCount = sensorTimestampCount.coerceAtLeast(sensorCopy.size),
+            pixelProofCount = pixelProofCount.coerceAtLeast(frameProofs.size),
+            scratchCleanupStatus = releaseResult.scratchCleanupStatus,
+            captureDiagnostics = buildCaptureDiagnostics(releaseResult, frameProofs.size),
+        )
+    }
+
+    private fun buildCaptureDiagnostics(
+        releaseResult: DirectReleaseResourcesResult,
+        appendedFrameCount: Int,
+    ): DirectCaptureDiagnostics {
+        val readbacks = synchronized(lock) { readbackElapsedMillis.toList() }
+        return DirectCaptureDiagnostics(
+            frameAvailableCallbackCount = frameAvailableCallbackCount.get(),
+            captureResultCallbackCount = captureCallbackCount.get(),
+            appendedDirectFrameCount = appendedFrameCount,
+            readbackCount = readbacks.size,
+            medianReadbackMillis = readbacks.medianOrNull(),
+            maximumReadbackMillis = readbacks.maxOrNull(),
+            releaseStepTimings = releaseResult.stepTimings,
+        )
     }
 
     private fun createDirectGlResources(mode: HighSpeedMode, handler: Handler): DirectGlReadbackResources? =
@@ -483,6 +521,8 @@ internal fun directFailure(
     directTimestampCount: Int = 0,
     sensorTimestampCount: Int = 0,
     pixelProofCount: Int = 0,
+    scratchCleanupStatus: CompanionScratchCleanupStatus = CompanionScratchCleanupStatus.ALREADY_ABSENT,
+    captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(),
 ): DirectSessionProbeOutcome.Failure =
     DirectSessionProbeOutcome.Failure(
         shape = DirectProofSessionShape.COMPANION_ENCODER,
@@ -492,6 +532,8 @@ internal fun directFailure(
         directTimestampCount = directTimestampCount,
         sensorTimestampCount = sensorTimestampCount,
         pixelProofCount = pixelProofCount,
+        scratchCleanupStatus = scratchCleanupStatus,
+        captureDiagnostics = captureDiagnostics,
     )
 
 private fun directProofMaxFrames(mode: HighSpeedMode, durationMillis: Long): Int =
@@ -510,28 +552,66 @@ internal class DirectReleaseActions(
     val quitThread: () -> Unit = {},
 )
 
-internal fun releaseDirectCaptureResources(actions: DirectReleaseActions): DirectTimingSourceFailure? {
+internal data class DirectReleaseResourcesResult(
+    val failure: DirectTimingSourceFailure?,
+    val scratchCleanupStatus: CompanionScratchCleanupStatus,
+    val stepTimings: List<DirectReleaseStepTiming>,
+)
+
+internal fun releaseDirectCaptureResources(actions: DirectReleaseActions): DirectTimingSourceFailure? =
+    releaseDirectCaptureResourcesWithDiagnostics(actions).failure
+
+internal fun releaseDirectCaptureResourcesWithDiagnostics(actions: DirectReleaseActions): DirectReleaseResourcesResult {
     var releaseFailed = false
     var scratchCleanupFailed = false
-    runCatching { actions.stopRepeating() }.onFailure { releaseFailed = true }
-    runCatching { actions.closeSession() }.onFailure { releaseFailed = true }
-    runCatching { actions.closeCamera() }.onFailure { releaseFailed = true }
-    runCatching { actions.releaseGl() }.onFailure { releaseFailed = true }
+    var scratchCleanupStatus = CompanionScratchCleanupStatus.ALREADY_ABSENT
+    val timings = mutableListOf<DirectReleaseStepTiming>()
+
+    fun runStep(name: String, action: () -> Unit): Boolean {
+        val start = System.nanoTime()
+        var failed = false
+        runCatching { action() }.onFailure {
+            failed = true
+        }
+        timings += DirectReleaseStepTiming(name, elapsedMillis(start), failed)
+        return failed
+    }
+
+    if (runStep("stopRepeating", actions.stopRepeating)) releaseFailed = true
+    if (runStep("closeSession", actions.closeSession)) releaseFailed = true
+    if (runStep("closeCamera", actions.closeCamera)) releaseFailed = true
+    if (runStep("releaseGl", actions.releaseGl)) releaseFailed = true
+    val companionStart = System.nanoTime()
+    var companionFailed = false
     runCatching {
-        scratchCleanupFailed = actions.releaseCompanion().status == CompanionScratchCleanupStatus.FAILED
-    }.onFailure { scratchCleanupFailed = true }
-    runCatching { actions.quitThread() }.onFailure { releaseFailed = true }
-    return when {
+        scratchCleanupStatus = actions.releaseCompanion().status
+        scratchCleanupFailed = scratchCleanupStatus == CompanionScratchCleanupStatus.FAILED
+    }.onFailure {
+        companionFailed = true
+        scratchCleanupFailed = true
+        scratchCleanupStatus = CompanionScratchCleanupStatus.FAILED
+    }
+    timings += DirectReleaseStepTiming("releaseCompanion", elapsedMillis(companionStart), companionFailed || scratchCleanupFailed)
+    if (runStep("quitThread", actions.quitThread)) releaseFailed = true
+
+    val failure = when {
         scratchCleanupFailed -> DirectTimingSourceFailure.SCRATCH_FILE_CLEANUP_FAILED
         releaseFailed -> DirectTimingSourceFailure.RESOURCE_LIMIT_EXCEEDED
         else -> null
     }
+    return DirectReleaseResourcesResult(
+        failure = failure,
+        scratchCleanupStatus = scratchCleanupStatus,
+        stepTimings = timings,
+    )
 }
+
+internal fun directTargetProofFrames(): Int = DIRECT_TARGET_PROOF_FRAMES
 
 private const val DIRECT_READBACK_WIDTH = 2
 private const val DIRECT_READBACK_HEIGHT = 2
 private const val MAX_DIRECT_PROOF_FRAMES = 360
-private const val DIRECT_TARGET_PROOF_FRAMES = 1
+private const val DIRECT_TARGET_PROOF_FRAMES = MIN_DIRECT_PROOF_TOKEN_FRAMES * 2
 private const val DIRECT_CAPTURE_LOG_TAG = "SPEEDBALL_CAPTURE"
 private val DIRECT_CAPTURE_PIXEL_CONFIG = DirectPixelProofConfig(
     maxTotalSamples = DIRECT_READBACK_WIDTH * DIRECT_READBACK_HEIGHT * MAX_DIRECT_PROOF_FRAMES,
@@ -540,6 +620,23 @@ private val DIRECT_CAPTURE_PIXEL_CONFIG = DirectPixelProofConfig(
 
 private fun String.sanitizedDirectCaptureLogToken(): String =
     replace(Regex("\\s+"), "_")
+
+private fun elapsedMillis(startNanos: Long): Double =
+    (System.nanoTime() - startNanos).coerceAtLeast(0L) / 1_000_000.0
+
+private fun Double.formatMillisForDirectLog(): String =
+    "%.3f".format(this)
+
+private fun List<Double>.medianOrNull(): Double? {
+    if (isEmpty()) return null
+    val sorted = sorted()
+    val middle = sorted.size / 2
+    return if (sorted.size % 2 == 0) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
+}
 
 /**
  * GL resources for direct same-`updateTexImage()` readback.

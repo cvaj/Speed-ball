@@ -136,6 +136,12 @@ class DirectTimingSourceCaptureTest {
     }
 
     @Test
+    fun directTargetProofFramesStaysAboveTokenMinimum() {
+        assertEquals(MIN_DIRECT_PROOF_TOKEN_FRAMES * 2, directTargetProofFrames())
+        assertTrue(directTargetProofFrames() > MIN_DIRECT_PROOF_TOKEN_FRAMES)
+    }
+
+    @Test
     fun directReleaseResourcesRunsEveryStepAndPrioritizesScratchFailure() {
         val calls = mutableListOf<String>()
         val failure = releaseDirectCaptureResources(
@@ -190,6 +196,29 @@ class DirectTimingSourceCaptureTest {
 
         assertEquals(null, failure)
         assertEquals(listOf("stop", "session", "camera", "gl", "companion", "thread"), calls)
+    }
+
+    @Test
+    fun directReleaseResourcesWithDiagnosticsReportsEveryStepAndScratchStatus() {
+        val result = releaseDirectCaptureResourcesWithDiagnostics(
+            DirectReleaseActions(
+                stopRepeating = {},
+                closeSession = { error("close failed") },
+                closeCamera = {},
+                releaseGl = {},
+                releaseCompanion = { CompanionScratchCleanupResult(CompanionScratchCleanupStatus.DELETED) },
+                quitThread = {},
+            ),
+        )
+
+        assertEquals(DirectTimingSourceFailure.RESOURCE_LIMIT_EXCEEDED, result.failure)
+        assertEquals(CompanionScratchCleanupStatus.DELETED, result.scratchCleanupStatus)
+        assertEquals(
+            listOf("stopRepeating", "closeSession", "closeCamera", "releaseGl", "releaseCompanion", "quitThread"),
+            result.stepTimings.map { it.name },
+        )
+        assertEquals(listOf(false, true, false, false, false, false), result.stepTimings.map { it.failed })
+        assertTrue(result.stepTimings.all { it.elapsedMillis >= 0.0 })
     }
 
     @Test

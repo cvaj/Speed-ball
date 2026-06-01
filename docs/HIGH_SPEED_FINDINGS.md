@@ -317,3 +317,66 @@ The proof token path remains bound to the vetted direct measurement input, and
 no token is minted from this evidence. The app remains fail-loud no-read on the
 S10+ until the direct path can capture at least 12 consumed same-update frames
 and prove cadence and membership against `SENSOR_TIMESTAMP`.
+
+## Phase 11 direct readback target/diagnostics proof (S10+)
+
+Phase 11 raised the direct readback target above the token minimum and added
+root-cause diagnostics. The companion MP4 remains app-private cache data only;
+it is not decoded, imported, path-logged, or used for proof.
+
+Command shape:
+
+```bash
+ANDROID_HOME=$HOME/Android/Sdk ./gradlew :app:assembleDebug --no-daemon
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell pm grant com.speedball.app android.permission.CAMERA
+adb logcat -c
+adb shell am force-stop com.speedball.app
+adb shell am start -n com.speedball.app/.MainActivity --ez autoStartDirectProof120 true
+sleep 14
+adb logcat -d -s SPEEDBALL_CAPTURE
+adb shell run-as com.speedball.app find cache -maxdepth 3 -type f -o -type d
+```
+
+Observed S10+ result:
+
+```text
+DIRECT_PROOF_START mode=1280x720_@_120_fps shape=COMPANION_ENCODER
+DIRECT_CAPTURE_SCRATCH_PREPARED mode=1280x720_@_120_fps
+DIRECT_CAPTURE_GL_SETUP_READY mode=1280x720_@_120_fps
+DIRECT_CAPTURE_HIGH_SPEED_REQUEST_LIST mode=1280x720_@_120_fps requests=4
+DIRECT_CAPTURE_FRAME_READBACK count=1 timestamp=1085549956763347 readbackMs=4.089 frameCallbacks=1 captureCallbacks=8
+DIRECT_CAPTURE_RELEASE_STEP name=stopRepeating elapsedMs=2.433 failed=false
+DIRECT_CAPTURE_RELEASE_STEP name=closeSession elapsedMs=0.105 failed=false
+DIRECT_CAPTURE_RELEASE_STEP name=closeCamera elapsedMs=3862.540 failed=false
+DIRECT_CAPTURE_RELEASE_STEP name=releaseGl elapsedMs=2.219 failed=false
+DIRECT_CAPTURE_RELEASE_STEP name=releaseCompanion elapsedMs=1328.836 failed=false
+DIRECT_CAPTURE_RELEASE_STEP name=quitThread elapsedMs=0.042 failed=false
+DIRECT_CAPTURE_RELEASE_DONE failure=null scratch=DELETED steps=6
+DIRECT_PROOF_COMPANION mode=1280x720_@_120_fps shape=COMPANION_ENCODER requestListSize=4 directCount=6 sensorCount=48 pixelCount=6 frameCallbacks=6 captureCallbacks=48 appended=6 readbacks=6 readbackMedianMs=0.940 readbackMaxMs=4.089 releaseSteps=6 verdict=CAPTURED
+DIRECT_PROOF_PREVIEW mode=1280x720_@_120_fps shape=PREVIEW_ONLY_CONTROL verdict=PREVIEW_CADENCE_MISMATCH
+DIRECT_PROOF_RESULT mode=1280x720_@_120_fps verdict=INSUFFICIENT_DIRECT_FRAMES directMedianMs=33.378 directMaxMs=33.378 sensorMedianMs=8.333 sensorMaxMs=8.378 finalGate=INSUFFICIENT_DIRECT_FRAMES frameCallbacks=6 captureCallbacks=48 appended=6 readbacks=6 readbackMedianMs=0.940 readbackMaxMs=4.089 releaseSteps=6
+```
+
+App-private cache check after the run showed only:
+
+```text
+cache
+cache/speed-ball-companion
+```
+
+Interpretation:
+
+- The one-frame stopgap is gone; the S10+ consumed six same-update direct
+  readbacks before duration expiry, but token eligibility still requires at
+  least 12 whole-stream-clean frames.
+- The direct `SurfaceTexture` stream is still not consuming at 120 fps in this
+  session shape. Direct median/max gap was `33.378 ms`, while sensor callbacks
+  remained at 120 fps (`8.333 ms` median, `8.378 ms` max).
+- Readback work itself was not the dominant timing cost in this run:
+  median readback was `0.940 ms`, max `4.089 ms`.
+- Teardown diagnostics identify slow release steps: camera close took about
+  `3862.540 ms`, and companion cleanup took about `1328.836 ms`.
+- Scratch cleanup succeeded and no scratch MP4 remained in app-private cache.
+- The result remains fail-loud no-read with `INSUFFICIENT_DIRECT_FRAMES`; no
+  token, mph, angle, trajectory, or production measurement result is claimed.

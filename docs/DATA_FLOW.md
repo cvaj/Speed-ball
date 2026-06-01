@@ -122,12 +122,14 @@ time-spread gates still see gaps.
 
 ```text
 DirectFrameProof list
+  -> capture target is above the 12-frame token minimum
   -> require at least 12 consumed same-update direct frames
   -> direct timestamps checked against SENSOR_TIMESTAMP values
   -> exact membership or reviewed <1,000 ns zero-offset equivalent
-  -> reject wrong-by-k offsets, cadence/drop/duplicate/non-monotonic gaps
+  -> reject wrong-by-k offsets, cadence/drop/duplicate/non-monotonic gaps as a whole stream
   -> same-update tile/ROI pixels consumed into aggregate signatures only
   -> reject blank/stale signatures, count mismatch, and resource overrun
+  -> root-cause diagnostics record callback/appended counts, readback time, release-step time, cadence/gaps, and final failed gate
   -> companion encoder scratch MP4 is app-private cache data only
   -> scratch MP4 deleted on terminal paths and never read as a source
   -> timestamp + dimensions + frame order + aggregate pixel-signature digests
@@ -164,6 +166,13 @@ draws the external OES texture into a bounded pbuffer, and immediately converts
 `glReadPixels` output into the aggregate pixel signature. The frame collector
 stores only one atomic timestamp/signature proof record per callback, rejects
 late callbacks after teardown, and fails loud on frame/sample resource caps.
+Phase 11 targets 24 direct readbacks instead of stopping at one frame, and adds
+bounded diagnostics for frame-available callbacks, capture callbacks, appended
+proof frames, readback latency, release-step latency, direct/sensor median
+cadence, direct/sensor maximum gaps, and the final failed proof gate. The runner
+does not filter interior degraded frames to reach the 12-frame minimum; a stream
+with interior near-duplicates, coalescing, or dropped-frame gaps rejects as a
+whole.
 The companion-first proof runner attempts the companion-encoder session shape
 before the preview-only control. It validates the companion's consumed direct
 timestamps and aggregate pixel signatures before producing token eligibility,
