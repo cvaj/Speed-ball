@@ -41,6 +41,58 @@ class HighSpeedCamera(private val context: Context) {
         return findBackCameraId(manager)
     }
 
+    /** Reads back-camera orientation metadata used to correct the live TextureView preview. */
+    fun readBackCameraPreviewOrientation(displayRotationDegrees: Int): CameraPreviewOrientation? {
+        val manager = context.getSystemService(CameraManager::class.java) ?: return null
+        val cameraId = findBackCameraId(manager) ?: return null
+        val characteristics = runCatching { manager.getCameraCharacteristics(cameraId) }.getOrNull() ?: return null
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: return null
+        return CameraPreviewOrientation(
+            cameraId = cameraId,
+            sensorOrientationDegrees = sensorOrientation,
+            displayRotationDegrees = displayRotationDegrees,
+            textureViewRotationDegrees = backCameraTextureViewRotationDegrees(
+                sensorOrientationDegrees = sensorOrientation,
+                displayRotationDegrees = displayRotationDegrees,
+            ),
+        )
+    }
+
+    fun readBackCameraTimestampSource(): CameraTimestampSourceReadResult {
+        if (context.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            return CameraTimestampSourceReadResult.Failure(
+                BurstFailure.CAMERA_PERMISSION_DENIED,
+                "Camera permission is required.",
+            )
+        }
+
+        val manager = context.getSystemService(CameraManager::class.java)
+            ?: return CameraTimestampSourceReadResult.Failure(
+                BurstFailure.NO_BACK_CAMERA,
+                "Camera service is unavailable.",
+            )
+        val cameraId = findBackCameraId(manager)
+            ?: return CameraTimestampSourceReadResult.Failure(
+                BurstFailure.NO_BACK_CAMERA,
+                "No back camera is available.",
+            )
+        val characteristics = runCatching { manager.getCameraCharacteristics(cameraId) }
+            .getOrElse {
+                return CameraTimestampSourceReadResult.Failure(
+                    BurstFailure.NO_BACK_CAMERA,
+                    "Unable to read back camera characteristics.",
+                )
+            }
+        val source = characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)
+        return CameraTimestampSourceReadResult.Success(
+            buildCameraTimestampSourceReport(
+                cameraRole = "back",
+                cameraId = cameraId,
+                sourceValue = source,
+            ),
+        )
+    }
+
     private fun findBackCameraId(manager: CameraManager): String? =
         manager.cameraIdList.firstOrNull { id ->
             val characteristics = manager.getCameraCharacteristics(id)
@@ -59,3 +111,20 @@ class HighSpeedCamera(private val context: Context) {
             }
         }
 }
+
+/** Camera orientation data used to render the live TextureView without sideways or stretched preview frames. */
+data class CameraPreviewOrientation(
+    val cameraId: String,
+    val sensorOrientationDegrees: Int,
+    val displayRotationDegrees: Int,
+    val textureViewRotationDegrees: Int,
+)
+
+private fun Int.normalizedDegrees(): Int =
+    ((this % 360) + 360) % 360
+
+internal fun backCameraTextureViewRotationDegrees(
+    sensorOrientationDegrees: Int,
+    displayRotationDegrees: Int,
+): Int =
+    displayRotationDegrees.normalizedDegrees()

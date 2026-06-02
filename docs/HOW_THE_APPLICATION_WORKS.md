@@ -4,11 +4,50 @@ Speed-ball measures a hit softball by tracking a neon-colored ball in high-speed
 
 ## Current App State
 
-The visible app opens to a Compose workflow list plus a developer diagnostics
-surface for high-speed capture and decode proof. The app can request camera
-permission, enumerate Camera2 high-speed modes from the device HAL, start a
-bounded 120 fps MediaRecorder burst when a fixed 120 fps range is exposed, and
-run Phase 5 decode/frame-timestamp reconciliation on the exact app-created MP4.
+The visible app opens as a landscape camera-first workflow with a live Camera2
+feed used for field calibration. The feed reads the back camera sensor
+orientation relative to the current display rotation, rotates the `TextureView`
+preview into screen coordinates, and preserves the oriented camera aspect ratio
+instead of stretching raw buffers.
+It overlays two draggable vertical A/B caliper lines directly on the camera
+image, plus a small two-color bottom-right level reference axis driven by the
+phone IMU while setup is live. The cyan segment is true level-horizontal; the
+amber segment is perpendicular level-vertical. The guide compensates for phone
+roll, so tilting the camera rotates the on-screen guide in the opposite visual
+direction needed to stay aligned with world horizontal/vertical. It freezes
+when voice-triggered recording or direct capture starts so that the shot uses
+the last pre-capture reference. The app does not draw a fake screen-horizontal fallback when level is unavailable. The live camera controls are
+hidden by default except for a small translucent Tools handle at the bottom.
+Tapping Tools opens one translucent bottom drawer at a time. The primary drawer
+contains only camera-use actions: target A/B, coarse/fine caliper drag, voice,
+setup, and hide. Setup replaces that drawer instead of stacking
+another panel on the image; it contains distance, permission, mode, manual
+level recapture, ball fallback, color sampling, ROI setup,
+manual estimate, import/recalibration, and recorder diagnostics.
+Both drawer pages print a compact on-screen status row with the current app
+status and active setup target, so actions such as applying distance or
+sampling color have visible confirmation. Hide closes all tools. The A/B
+caliper lines and preview tap/drag calibration remain usable while tools are
+hidden, so field references near the ground are not blocked by the drawer.
+ROI, color sample target, and level/horizon overlays are calibration aids and
+appear only with the summoned operation controls, not as permanent camera
+clutter. The user enters the known distance in feet, slides the two vertical
+lines onto the measured field markers with smooth finger drag, uses the drawer
+toggle for coarse/fine drag precision, samples the ball color from camera
+pixels, and places the ROI around the
+expected hit path before running a live visual estimate or import estimate. The
+app can request camera permission, enumerate Camera2 high-speed modes from the
+device HAL, listen for voice commands, release the setup feed so the
+high-speed recorder can own the camera, start a bounded 120 fps MediaRecorder
+burst when a fixed 120 fps range is exposed, stop on its timer, and
+automatically estimate from the exact app-created MP4 without sending the user
+through the Android picker.
+In the setup drawer, `Record 120` is this MediaRecorder MP4 path. `Est 120` is
+the separate direct live estimate path: it still uses the selected fixed 120 fps
+Camera2 high-speed mode, but it reads direct frames instead of recording an MP4.
+When an estimate succeeds, the camera preview is covered by a black result
+screen with large bold white velocity, launch-angle, and carry-distance text.
+The `CLEAR` button dismisses the result screen and returns to the camera view.
 When exact-count reconciliation fails from near-duplicate sensor timestamps or a
 decoded/sensor count mismatch, Phase 6 can emit logcat-only value-anchor
 diagnostics. Those diagnostics are investigation evidence only; they cannot
@@ -37,27 +76,155 @@ callbacks versus appended proof frames, readback timing, release-step timing,
 direct/sensor cadence, maximum gaps, and the final failed gate. Production
 remains no-read unless the consumed direct stream passes the timestamp and pixel
 proof gates as a whole; degraded streams cannot be filtered down to 12 frames.
+Phase 12 begins the source-route unblock by making direct-source variants
+explicit in code. The Camera2 GL path can now request the baseline
+companion+direct surface order, the direct-first control order, or a direct-only
+GL constrained-high-speed target when the device accepts it. Diagnostics carry
+variant id, consumer model, surface order, direct buffer size, request-list
+size, and producer/capture callback cadence. The ImageReader route now creates
+YUV `ImageReader` targets for constrained and standard Camera2 probes plus a
+constrained `PRIVATE`/video-encode usage target, converts only a bounded tile
+from same acquired YUV images into an aggregate signature, and closes the image.
+The S10+ matrix proves constrained YUV ImageReader is rejected, constrained
+PRIVATE ImageReader is accepted but delivers no image callbacks, and standard
+ImageReader runs below the requested 120 fps producer band. The developer adb
+entry point can select a route with
+`--es directProofVariant <variant-id>`. The next route, `pbo-gl-readback`, is
+now code-wired as a separate GLES3 PBO-backed GL consumer model: it does not
+reuse the inline consumer label, and it maps the previous pixel-pack buffer on
+the next callback instead of blocking the current callback on CPU readback. On
+the S10+ it is accepted by constrained high speed, but still consumes about
+30 fps and fails loud with `DIRECT_CADENCE_MISMATCH`, so no terminal no-go is
+claimed without review.
+Phase 12 also adds a developer-only timestamp-source characteristic read for
+the remaining record-then-decode source decision. On the measured S10+ back
+camera, `SENSOR_INFO_TIMESTAMP_SOURCE` is `REALTIME`. A follow-up
+count-independent PTS-to-sensor value-match still fails to produce a
+measurement-safe binding: `matched=248/257`, `ambiguous=62`, and
+`longestCleanRun=3`. Combined with Phase 6 decoded `268`, exact distinct sensor
+timestamps `325`, and post-collapse `260`, the S10+ `1280x720 @ 120`
+record-then-decode route is a scoped production no-go and stays no-read.
+Phase 13 begins the adaptable visual estimate path for the user's
+personal-estimate product. It is separate from strict proof-token-backed
+measurement: estimate success is a distinct type, cannot satisfy
+`MeasurementRunOutcome.Success`, and does not carry `MeasurementTimingProof`.
+The estimate path uses app-owned ordered frames. The direct live adapter reads
+bounded ARGB frames from the same `SurfaceTexture.updateTexImage()` source,
+not from a decoder. When real per-frame timestamps exist, they anchor timing.
+When timestamps are missing or unusable, the app may use visual frame-delta
+inference from centroid displacement plus a known per-frame interval. When both
+signals exist, centroid displacement validates skipped/coalesced intervals;
+disagreement no-reads as an ambiguous track. Estimate output is labeled,
+carries the timing basis, confidence, residual, timestamp/frame-gap
+diagnostics, scale basis, and discloses the calibrated-image-plane assumption.
+When distance calibration is missing, estimate mode may self-calibrate from a
+known ball diameter and detected apparent short-axis ball diameter; that scale
+basis is reported separately and discloses that the entered ball type must match
+the real ball and that motion blur can bias scale. For this ball-diameter
+self-calibration estimate path, strong apparent size change can continue only
+as LOW confidence with a warning rather than as a strict measurement claim.
+Visual frame-delta estimates also disclose that the smallest observed frame gap
+is assumed to be one native interval; uniformly dropped frames would bias speed
+high. The S10+ decoder route remains closed for this mode.
+Level is captured by the app at setup time with the phone's IMU, not recovered
+from the MP4. The app samples `TYPE_GRAVITY` when available, falls back to the
+accelerometer, uses the gyroscope to reject a moving phone, stores one static
+roll reference, and assumes the tripod is not moved before capture. The preview
+shows a level/horizon overlay from that snapshot. Estimate speed is unchanged
+by image rotation, but launch angle is corrected by subtracting the captured
+roll so it is reported against true horizontal. That sign convention is
+documented in `LevelReference.kt` and remains provisional until the physical
+gate `S10_IMU_LEVEL_SIGN_VALIDATION_PENDING` verifies a known phone roll against
+a true horizon and known-horizontal motion. Estimates without a captured level
+state that launch angle is not corrected for camera tilt.
+Phase 15 adds estimate-only video processing. The normal field-test path is
+hands-free: the user taps Voice once, then says "shoot" to run the
+readiness-gated ready/beep sequence before the direct 120 fps visual estimate
+path. Explicit "record" variants and the `Record 120` button remain a
+diagnostic app-owned 120 fps MP4 path; they are not the S10+ field-test
+`shoot` path because that route depends on recording then decoding a file. The
+recorded file is fed directly into the same import estimate pipeline. The
+high-speed recorder
+requests a fast 1/1000s shutter through Camera2 manual exposure when the device
+and constrained high-speed session allow it; if that manual request is rejected,
+recording falls back to the device's auto-exposure path rather than failing the
+capture. Manual document-picker import remains available for saved clips and
+debugging. Picker imports validate a `content://` URI;
+recorded estimates use the app-private file directly and do not store a media
+URI or raw path in saved evidence. The app deletes the app-owned recorded MP4
+after frame extraction/estimate processing. The app reads redacted metadata,
+probes monotonic presentation timestamps as estimate evidence only for
+user-selected imports, decodes a bounded set of frames, scales them to the
+existing readback size, and runs the same color detector, calibration state, and
+visual estimate pipeline used by live estimates. The Android import adapter
+prefers indexed frame extraction and falls back to timestamp extraction when the
+platform cannot return frames by index. Estimate-mode import can use a known
+capture frame interval for slow-motion files whose playback PTS has been
+rewritten; app-owned recordings use a distinct recorded-capture frame-interval
+timing basis from the requested capture FPS. Recorded estimates are saved and
+exported as `RECORDED_ESTIMATE` with a LOW-confidence MediaRecorder
+frame-drop/coalescing caveat rather than import-only re-encode/VFR caveats.
+Import uses the sampled
+ball point to define the HSV color band, but does not force the track to start
+at that point; it skips leading frames before the ball enters the ROI, filters
+tiny color speckles, and uses RANSAC-style straight-line consensus to select a
+short high-velocity one-directional yellow-ball window. The accepted window
+must have enough inliers, low line residual, low slope change, and hit-like
+speed so a struck ball is distinguished from a slower toss/pitch arc. The
+window includes the frame immediately before fast motion when present, and the
+final estimate no-reads if the calibrated speed is below the hit-ball
+threshold. Import cannot produce
+strict `MeasurementRunOutcome.Success`,
+even for clean container timestamps, because container PTS is not proof of
+original capture cadence. Final import
+diagnostics use source-specific timing-basis labels, carry confidence from the
+timing reconciler, and disclose provenance risks such as re-encode, VFR remux,
+editor rewrite, transcode, user-declared interval, uniform-loss blindness, or
+recorded MediaRecorder frame drop/coalescing where applicable. Import and
+recorded results/no-reads can be saved as app-private redacted summaries and
+exported as text evidence containing source kind, timing basis, frame/detection
+counts, speed only for
+successful estimates, no-read reason, and assumptions. Raw media URIs, paths,
+videos, pixels, device endpoints, and pairing codes are not saved or exported.
 
 The implemented `:core` module contains calibration, unit conversion, velocity
 measurement, and trajectory physics. The `:app` module owns the Camera2 capture
 foundation, timestamp diagnostics, Phase 5 decode proof, Phase 6 value-anchor
-investigation logging, Phase 7 preview timestamp proof, and Phase 8 pure
-measurement pipeline foundation. It must still not display a sample speed,
-trajectory, or placeholder result value for any production source. Camera mode,
-timestamp, frame-count, raw decode, preview proof, anchor diagnostics, and
-no-read result reasons may be shown only after real HAL enumeration, a real
-capture/proof run, a typed failure, or bounded logcat diagnostics.
+investigation logging, Phase 7 preview timestamp proof, Phase 8 pure
+measurement pipeline foundation, visual estimate flow, and import estimate
+history/export flow. It must still not display a sample speed,
+trajectory, or placeholder result value for a strict production measurement
+source. A Phase 13 visual speed may be shown only as a labeled estimate with
+confidence, timing-basis diagnostics, and no-read gates. Camera mode,
+timestamp, frame-count, raw decode, preview proof, anchor diagnostics, estimate
+diagnostics, import evidence, and no-read result reasons may be shown only
+after real HAL enumeration, a real capture/proof run, a user-selected import,
+a typed failure, or bounded logcat diagnostics.
 
 ## User Flow
 
 1. The user selects a supported camera mode, such as 720p at 120 fps.
-2. The user calibrates distance by marking a known distance in the ball's plane.
-3. The user taps the neon ball to sample its color.
-4. The app records a short high-speed burst.
-5. The app detects the ball center in each frame.
-6. The app fits a straight-line velocity over valid detections.
-7. The app converts pixels per second to mph using the distance calibration.
-8. The app reports speed, launch angle, confidence, and a drag-based trajectory.
+2. The user calibrates distance by entering the measured feet value and sliding
+   the two vertical A/B caliper lines onto the matching field markers in the
+   ball's plane, or selects the reviewed
+   ball-diameter fallback.
+3. The user taps the live feed at the hanging ball/start reference so the app
+   samples the actual camera pixels for the HSV color band, then sets the ROI
+   around the expected ball path.
+4. The app captures a still-phone IMU level snapshot and shows the horizon
+   overlay; voice recording captures this automatically if it is missing.
+5. For live estimate mode, the app listens for the selected voice command,
+   records a bounded high-speed window, and stops automatically; the user
+   should not manage a recording lifecycle.
+6. For import mode, the user selects a video and the app processes it
+   end-to-end without a manual start/stop recording step.
+7. The app detects the ball center in each accepted frame.
+8. The app uses RANSAC-style straight-line consensus to reject non-hit motion
+   and fits velocity over the accepted detections.
+9. The app converts pixels per second to mph using the distance calibration or
+   the reviewed ball-diameter estimate fallback.
+10. The app reports speed, level-corrected launch angle, confidence, and evidence for estimates,
+   or a typed no-read with no speed values.
 
 ## Measurement Rules
 
@@ -116,6 +283,8 @@ The app must show "No read" rather than a wrong speed when:
 - a capture burst is already active;
 - Camera2 open, disconnect, device error, session configuration, recorder setup,
   or recording fails;
+- the camera/session rejects fast-shutter control and the fallback recording
+  path also fails;
 - no positive `SENSOR_TIMESTAMP` values are collected;
 - the 120 fps capture proof fails either the unique-count floor or median-gap
   band;
@@ -133,6 +302,10 @@ The app must show "No read" rather than a wrong speed when:
 - value-anchor diagnostics are rejected, ambiguous, unavailable, or only
   investigation-proven; Phase 6 never turns them into `DecodeOutcome.Success`
   or measurement timestamps;
+- record-then-decode source decision evidence cannot identify which captured
+  `SENSOR_TIMESTAMP` values survived encoding, or the count-independent
+  PTS-to-sensor value-match is ambiguous/incomplete even when the camera
+  timestamp source reports `REALTIME`;
 - decoder-free preview proof lacks positive `SurfaceTexture` timestamps, lacks
   positive `SENSOR_TIMESTAMP` callbacks, has duplicate/non-monotonic/near-duplicate
   preview timestamps, has preview cadence outside the requested fps band, contains
@@ -143,7 +316,21 @@ The app must show "No read" rather than a wrong speed when:
 - fewer than three valid detections exist;
 - timestamps are missing, duplicate, non-monotonic, or unpaired;
 - timestamps are too close together to produce a meaningful fit;
-- calibration is missing or invalid;
+- visual-estimate samples have neither usable timestamps nor a known visual
+  frame-delta interval, have fewer than four usable detections, have incoherent
+  timestamp-gap-vs-centroid-displacement ratios, lack positive centroid motion
+  for visual frame-delta timing, reject too many visual outliers, exceed the
+  estimate residual threshold, or show strong apparent ball-size change that
+  violates the calibrated-plane assumption outside the reviewed
+  ball-diameter self-calibration warning path;
+- imported media is not selected through Android content URI APIs, has invalid
+  or unsupported metadata, exceeds decode/frame/pixel caps, lacks strictly
+  increasing presentation timestamps for the current Android import adapter,
+  cannot be decoded safely, lacks required calibration/color/ROI setup, cannot
+  form a coherent seeded or high-velocity one-directional yellow-ball motion
+  window, or cannot run through the existing visual estimate pipeline;
+- calibration is missing or invalid, unless estimate mode has a reviewed known
+  ball-diameter self-calibration input and enough valid apparent diameters;
 - the fit is non-finite or residuals are too large;
 - trajectory launch, ball, air, or numeric options are invalid;
 - trajectory integration becomes non-finite or does not cross ground within the
@@ -153,6 +340,10 @@ The app must show "No read" rather than a wrong speed when:
   threshold-passing pixels, connected-component count, or per-frame operations;
 - Phase 9 direct source proof rejects the session, timestamps, pixel signature,
   sequence identity, resource bounds, or proof-token eligibility;
+- Phase 12 direct-source variant setup is rejected by Camera2/HAL, has
+  below-band producer cadence where a standard-session consumer ratio would be
+  interpreted, reaches an ImageReader timestamp/pixel conversion failure, or
+  reaches a GL/PBO readback setup or mapping failure;
 - Phase 10 workflow state is missing calibration, color sample, or bound Phase 9
   source proof;
 - a production source attempts to measure without a Phase 9 timing proof.
@@ -277,6 +468,43 @@ Phase 10 workflow/result behavior:
 - Result formatting accepts only `MeasurementRunOutcome`. No calibration,
   color, preview, or readiness formatter can synthesize mph, launch angle,
   trajectory, carry, apex, or hang time.
+- Phase 13 visual-estimate result formatting accepts only `VisualEstimateOutcome`.
+  Estimate success lines are labeled `result=estimate`, include confidence,
+  frame/detection counts, the timing basis (`REAL_PER_FRAME_TIMESTAMPS`,
+  `VISUAL_FRAME_DELTA_INFERENCE`, or an `IMPORT_*` estimate timing basis),
+  scale basis (`DISTANCE_CALIBRATION` or `BALL_DIAMETER_SELF_CALIBRATION`),
+  residual, gap summary, and the calibrated-plane assumption. Ball-diameter
+  self-calibrated estimates also disclose the apparent-diameter scale
+  assumption. Imported estimates add import provenance assumptions. Estimate
+  no-read lines never include mph, angle, trajectory, carry, apex, or hang time.
+- Phase 14 adds a phone-operable estimate setup reducer. User setup selections
+  are stored as normalized frame coordinates, invalidated when mode/readback/
+  preview geometry changes, and transformed into active detection/readback
+  space before calibration, ROI, color, and detector centroids are compared.
+  Known-distance calibration is primary and uses the user-entered feet value
+  plus two visible vertical A/B caliper lines. Known-ball-diameter
+  self-calibration is a secondary fallback and displays setup-time
+  ball-type/motion-blur assumptions before capture. Phase 16 adds the
+  user-facing overlay and controls for this reducer: landscape live Camera2
+  setup feed, display-rotation `TextureView` preview transform with an explicit
+  aspect-preserving layout, draggable vertical caliper lines, a live-updating
+  two-color bottom-right IMU-compensated level reference axis that freezes at capture start,
+  hidden translucent bottom drawer, drawer-controlled coarse/fine line drag
+  that draws from a local active-drag override and commits the final fraction
+  at gesture end, editable distance in feet on the setup drawer page,
+  on-screen drawer status for applied setup actions,
+  tap-to-sample live ball color from preview pixels, ROI rectangle only while
+  setup controls are visible, and full tool hiding while caliper drag remains
+  active on the camera image. Failed live color sampling
+  leaves color not-ready instead of using a hidden yellow default.
+  The `shoot` voice command checks readiness, prints `Ready to shoot`, speaks
+  `Ready`, plays three beeps, and then starts the direct 120 fps visual
+  estimate path only when the setup readiness gate passes.
+  Successful estimates cover the preview with a black full-screen result
+  overlay showing velocity, angle, and carry distance in large bold white text
+  until the user taps `CLEAR`. The overlay is gated to current successful
+  estimate-complete statuses, so `Ready to shoot` and no-read outcomes leave
+  the camera visible with status/no-read text.
 - Synthetic timing proof remains in test source only and exists solely for JVM
   fixture coverage.
 - Phase 11 is the direct-readback-to-12-frames effort. It targets more than 12
@@ -285,7 +513,9 @@ Phase 10 workflow/result behavior:
 
 ## Capture Modes
 
-- 120 fps on S10+ uses record-then-decode because it records cleanly.
+- 120 fps on S10+ records cleanly enough for record-then-decode investigation,
+  but Phase 5/6 evidence keeps that route no-read for measurement until decoded
+  frames can be paired to `SENSOR_TIMESTAMP` safely.
 - 240 fps on S10+ requires GPU/preview detection because MediaRecorder drops frames.
 - Device capabilities must come from Camera2 HAL enumeration, not hardcoded assumptions.
 - Phase 4 records only fixed-range 120 fps modes. It enumerates 240 fps modes
@@ -307,6 +537,12 @@ Phase 10 workflow/result behavior:
   distinct sensor timestamps `325`, and hypothetical post-collapse sensor count
   `260`. That is evidence against using the record-then-decode path as a
   measurement-ready pairing source.
+- Phase 12 record-then-decode source decision reads the back camera
+  `SENSOR_INFO_TIMESTAMP_SOURCE` through a developer-only adb entry point. The
+  S10+ reports `REALTIME`; a fresh count-independent value-match diagnostic
+  then reports `AMBIGUOUS_MATCH`, `matched=248/257`, `ambiguous=62`, and
+  `longestCleanRun=3`. The measured `1280x720 @ 120` route is a scoped no-go
+  for production measurement.
 - Phase 7 preview proof uses a debug-only `autoStartPreview120` developer entry
   point and a Camera2 constrained-high-speed `SurfaceTexture` target. It logs
   bounded `PREVIEW_*` diagnostics and runs the pure Kotlin preview pairer. The

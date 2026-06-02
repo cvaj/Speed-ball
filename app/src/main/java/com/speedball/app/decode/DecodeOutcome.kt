@@ -35,6 +35,30 @@ enum class PresentationClockAssessment {
     SYNTHETIC_UNIFORM_CANDIDATE,
 }
 
+enum class PtsSensorValueMatchVerdict {
+    NOT_EVALUATED,
+    NO_MATCH,
+    PARTIAL_MATCH,
+    AMBIGUOUS_MATCH,
+    UNIQUE_MATCH,
+}
+
+/** Count-independent PTS-to-SENSOR_TIMESTAMP value-match diagnostic. */
+data class PtsSensorValueMatchDiagnostics(
+    val verdict: PtsSensorValueMatchVerdict,
+    val decodedFrameCount: Int,
+    val uniqueSensorTimestampCount: Int,
+    val evaluatedOffsetCount: Int,
+    val toleranceMicros: Long,
+    val bestOffsetMicros: Long?,
+    val matchedFrameCount: Int,
+    val unambiguousFrameCount: Int,
+    val ambiguousFrameCount: Int,
+    val longestContiguousUnambiguousRun: Int,
+    val maximumResidualMicros: Long?,
+    val medianResidualMicros: Long?,
+)
+
 data class DecodedFrameSample(
     val frameIndex: Int,
     val width: Int,
@@ -60,6 +84,7 @@ data class ReconciliationDiagnostics(
     val nearDuplicateGapMillis: Double?,
     val ptsToSensorOffsetSummary: OffsetSummary?,
     val ptsToSensorOffsetMicros: List<Long> = emptyList(),
+    val ptsSensorValueMatch: PtsSensorValueMatchDiagnostics? = null,
     val presentationClockAssessment: PresentationClockAssessment,
     val sampledFrames: List<DecodedFrameSample> = emptyList(),
 )

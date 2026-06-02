@@ -10,7 +10,34 @@ import java.security.MessageDigest
  */
 enum class DirectProofSessionShape {
     COMPANION_ENCODER,
+    COMPANION_ENCODER_REVERSED,
+    DIRECT_ONLY,
+    CONSTRAINED_IMAGE_READER,
+    CONSTRAINED_PRIVATE_IMAGE_READER,
+    STANDARD_IMAGE_READER,
     PREVIEW_ONLY_CONTROL,
+}
+
+/** Camera consumer model used by one direct-source proof variant. */
+enum class DirectProofConsumerModel {
+    SINGLE_SURFACE_TEXTURE,
+    PBO_GL_READBACK,
+    CONSTRAINED_IMAGE_READER,
+    CONSTRAINED_PRIVATE_IMAGE_READER,
+    STANDARD_IMAGE_READER,
+}
+
+/** Bounded role names for the Camera2 surfaces in a direct-source proof variant. */
+enum class DirectProofSurfaceRole {
+    COMPANION_ENCODER,
+    DIRECT_GL_READBACK,
+    IMAGE_READER,
+}
+
+/** Capture request template requested by a direct-source proof variant. */
+enum class DirectProofRequestTemplate {
+    RECORD,
+    PREVIEW,
 }
 
 /**
@@ -67,24 +94,51 @@ data class DirectReleaseStepTiming(
 
 /** Bounded root-cause diagnostics for direct readback capture. */
 data class DirectCaptureDiagnostics(
+    val variantId: String = BASELINE_DIRECT_PROOF_VARIANT_ID,
+    val consumerModel: DirectProofConsumerModel = DirectProofConsumerModel.SINGLE_SURFACE_TEXTURE,
+    val surfaceOrder: List<DirectProofSurfaceRole> = listOf(
+        DirectProofSurfaceRole.COMPANION_ENCODER,
+        DirectProofSurfaceRole.DIRECT_GL_READBACK,
+    ),
+    val requestTemplate: DirectProofRequestTemplate = DirectProofRequestTemplate.RECORD,
+    val directBufferWidth: Int? = null,
+    val directBufferHeight: Int? = null,
+    val requestListSize: Int? = null,
     val frameAvailableCallbackCount: Int = 0,
     val captureResultCallbackCount: Int = 0,
     val appendedDirectFrameCount: Int = 0,
     val readbackCount: Int = 0,
     val medianReadbackMillis: Double? = null,
     val maximumReadbackMillis: Double? = null,
+    val producerMedianGapMillis: Double? = null,
+    val producerMaximumGapMillis: Double? = null,
+    val producerInRequestedFpsBand: Boolean? = null,
+    val consumerRatioInterpretable: Boolean? = null,
+    val imageAcquireNullCount: Int = 0,
     val releaseStepTimings: List<DirectReleaseStepTiming> = emptyList(),
 ) {
     init {
+        require(variantId.isNotBlank()) { "Variant id must not be blank." }
+        require(surfaceOrder.isNotEmpty()) { "Surface order must not be empty." }
+        require(directBufferWidth == null || directBufferWidth > 0) { "Direct buffer width must be positive." }
+        require(directBufferHeight == null || directBufferHeight > 0) { "Direct buffer height must be positive." }
+        require(requestListSize == null || requestListSize > 0) { "Request list size must be positive." }
         require(frameAvailableCallbackCount >= 0) { "Frame callback count must be non-negative." }
         require(captureResultCallbackCount >= 0) { "Capture callback count must be non-negative." }
         require(appendedDirectFrameCount >= 0) { "Appended direct frame count must be non-negative." }
         require(readbackCount >= 0) { "Readback count must be non-negative." }
+        require(imageAcquireNullCount >= 0) { "Image acquire-null count must be non-negative." }
         require(medianReadbackMillis == null || medianReadbackMillis >= 0.0) {
             "Median readback time must be non-negative."
         }
         require(maximumReadbackMillis == null || maximumReadbackMillis >= 0.0) {
             "Maximum readback time must be non-negative."
+        }
+        require(producerMedianGapMillis == null || producerMedianGapMillis >= 0.0) {
+            "Producer median gap must be non-negative."
+        }
+        require(producerMaximumGapMillis == null || producerMaximumGapMillis >= 0.0) {
+            "Producer maximum gap must be non-negative."
         }
     }
 }

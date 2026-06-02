@@ -3,6 +3,14 @@ package com.speedball.app.ui
 import com.speedball.app.measurement.MeasurementRunFailure
 import com.speedball.app.measurement.MeasurementRunOutcome
 import com.speedball.app.measurement.MeasurementTimingProof
+import com.speedball.app.measurement.EstimateScaleBasis
+import com.speedball.app.measurement.EstimateTimingBasis
+import com.speedball.app.measurement.TimestampGapSummary
+import com.speedball.app.measurement.VisualEstimateConfidence
+import com.speedball.app.measurement.VisualEstimateDiagnostics
+import com.speedball.app.measurement.VisualEstimateNoReadReason
+import com.speedball.app.measurement.VisualEstimateOutcome
+import com.speedball.app.measurement.VisualEstimateResultFactory
 import com.speedball.core.measurement.VelocityMeasurement
 import com.speedball.core.physics.TrajectoryResult
 import com.speedball.core.physics.TrajectorySample
@@ -44,6 +52,120 @@ class MeasurementResultUiStateTest {
         assertTrue(joined.contains("carryFt=328.1"))
         assertTrue(joined.contains("apexFt=39.4"))
         assertTrue(joined.contains("hangSec=3.00"))
+    }
+
+    @Test
+    fun estimateSuccessIsLabeledWithConfidenceDiagnosticsAndPlaneAssumption() {
+        val outcome = VisualEstimateResultFactory.successOrNoRead(
+            milesPerHour = 68.18182,
+            launchAngleDegrees = 0.0,
+            diagnostics = VisualEstimateDiagnostics(
+                frameCount = 4,
+                detectionCount = 4,
+                timingBasis = EstimateTimingBasis.REAL_PER_FRAME_TIMESTAMPS,
+                timestampGapSummary = TimestampGapSummary(
+                    intervalCount = 3,
+                    minGapSeconds = 0.1,
+                    medianGapSeconds = 0.1,
+                    maxGapSeconds = 0.2,
+                ),
+                fitResidualPx = 1.25,
+                confidence = VisualEstimateConfidence.LOW,
+            ),
+        )
+        val joined = visualEstimateOutcomeUiLines(outcome).joinToString("\n")
+
+        assertTrue(joined.contains("result=estimate"))
+        assertTrue(joined.contains("confidence=LOW"))
+        assertTrue(joined.contains("frames=4"))
+        assertTrue(joined.contains("detections=4"))
+        assertTrue(joined.contains("timing=REAL_PER_FRAME_TIMESTAMPS"))
+        assertTrue(joined.contains("scale=DISTANCE_CALIBRATION"))
+        assertTrue(joined.contains("speed-estimate mph=68.2"))
+        assertTrue(joined.contains("angleScope=in-image-plane-estimate"))
+        assertTrue(joined.contains("distance-estimate carryFt=0.0"))
+        assertTrue(joined.contains("timestampGapMaxToMedian=2.00"))
+        assertTrue(joined.contains("residualPx=1.25"))
+        assertTrue(joined.contains("calibrated image plane"))
+        assertFalse(joined.contains("certified", ignoreCase = true))
+    }
+
+    @Test
+    fun estimateSuccessSurfacesBallDiameterScaleBasisAndAssumption() {
+        val outcome = VisualEstimateResultFactory.successOrNoRead(
+            milesPerHour = 68.18182,
+            launchAngleDegrees = 0.0,
+            diagnostics = VisualEstimateDiagnostics(
+                frameCount = 4,
+                detectionCount = 4,
+                timingBasis = EstimateTimingBasis.REAL_PER_FRAME_TIMESTAMPS,
+                timestampGapSummary = TimestampGapSummary(
+                    intervalCount = 3,
+                    minGapSeconds = 0.1,
+                    medianGapSeconds = 0.1,
+                    maxGapSeconds = 0.2,
+                ),
+                fitResidualPx = 1.25,
+                confidence = VisualEstimateConfidence.LOW,
+                scaleBasis = EstimateScaleBasis.BALL_DIAMETER_SELF_CALIBRATION,
+                assumptions = listOf(
+                    VisualEstimateDiagnostics.PLANAR_MOTION_ASSUMPTION,
+                    VisualEstimateDiagnostics.BALL_DIAMETER_SCALE_ASSUMPTION,
+                ),
+            ),
+        )
+        val joined = visualEstimateOutcomeUiLines(outcome).joinToString("\n")
+
+        assertTrue(joined.contains("scale=BALL_DIAMETER_SELF_CALIBRATION"))
+        assertTrue(joined.contains("entered ball diameter"))
+        assertTrue(joined.contains("apparent short-axis diameter"))
+        assertTrue(joined.contains("wrong ball type"))
+        assertTrue(joined.contains("motion blur"))
+    }
+
+    @Test
+    fun visualFrameDeltaEstimateSurfacesAbsoluteScaleAssumption() {
+        val outcome = VisualEstimateResultFactory.successOrNoRead(
+            milesPerHour = 68.18182,
+            launchAngleDegrees = 0.0,
+            diagnostics = VisualEstimateDiagnostics(
+                frameCount = 4,
+                detectionCount = 4,
+                timingBasis = EstimateTimingBasis.VISUAL_FRAME_DELTA_INFERENCE,
+                timestampGapSummary = TimestampGapSummary(
+                    intervalCount = 3,
+                    minGapSeconds = 0.1,
+                    medianGapSeconds = 0.1,
+                    maxGapSeconds = 0.2,
+                ),
+                fitResidualPx = 1.25,
+                confidence = VisualEstimateConfidence.LOW,
+                assumptions = listOf(
+                    VisualEstimateDiagnostics.PLANAR_MOTION_ASSUMPTION,
+                    VisualEstimateDiagnostics.VISUAL_FRAME_DELTA_ASSUMPTION,
+                ),
+            ),
+        )
+        val joined = visualEstimateOutcomeUiLines(outcome).joinToString("\n")
+
+        assertTrue(joined.contains("timing=VISUAL_FRAME_DELTA_INFERENCE"))
+        assertTrue(joined.contains("smallest observed frame gap"))
+        assertTrue(joined.contains("bias speed high"))
+    }
+
+    @Test
+    fun estimateNoReadNeverDisplaysSpeedOrAngleValues() {
+        val joined = visualEstimateOutcomeUiLines(
+            VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.PLANAR_ASSUMPTION_VIOLATED,
+                message = "Depth motion violates the calibrated-plane estimate assumption.",
+            ),
+        ).joinToString("\n")
+
+        assertTrue(joined.contains("result=estimate-no-read"))
+        assertTrue(joined.contains("reason=PLANAR_ASSUMPTION_VIOLATED"))
+        assertTrue(joined.contains("action=keep-ball-across-calibrated-plane"))
+        assertNoResultValues(joined)
     }
 
     @Test

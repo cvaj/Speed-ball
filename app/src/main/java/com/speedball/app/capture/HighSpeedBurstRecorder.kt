@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
@@ -96,7 +97,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(device: CameraDevice) {
                         cameraDevice = device
-                        configureSession(device, previewSurface, recorderSurface, options.mode)
+                        configureSession(device, previewSurface, recorderSurface, options.mode, manager, cameraId)
                     }
 
                     override fun onDisconnected(device: CameraDevice) {
@@ -136,6 +137,8 @@ class HighSpeedBurstRecorder(private val context: Context) {
         previewSurface: Surface,
         recorderSurface: Surface,
         mode: HighSpeedMode,
+        manager: CameraManager,
+        cameraId: String,
     ) {
         val backgroundHandler = handler ?: return
         synchronized(lock) { state = BurstRecorderState.Configuring }
@@ -146,7 +149,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
                     override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
                         val highSpeedSession = cameraCaptureSession as CameraConstrainedHighSpeedCaptureSession
                         session = highSpeedSession
-                        startRepeatingBurst(device, highSpeedSession, previewSurface, recorderSurface, mode)
+                        startRepeatingBurst(device, highSpeedSession, previewSurface, recorderSurface, mode, manager, cameraId)
                     }
 
                     override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) {
@@ -172,15 +175,18 @@ class HighSpeedBurstRecorder(private val context: Context) {
         previewSurface: Surface,
         recorderSurface: Surface,
         mode: HighSpeedMode,
+        manager: CameraManager,
+        cameraId: String,
     ) {
         val backgroundHandler = handler ?: return
         try {
-            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                addTarget(previewSurface)
-                addTarget(recorderSurface)
-                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(mode.aeTargetFpsLower, mode.aeTargetFpsUpper))
-            }
-            val burst = highSpeedSession.createHighSpeedRequestList(request.build())
+            val baseRequest = buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = null)
+            val preferredExposureNanos = options?.preferredExposureTimeNanos
+            val manualRequest = resolveManualExposureTimeNanos(manager, cameraId, preferredExposureNanos)
+                ?.let { exposureNanos ->
+                    buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = exposureNanos)
+                }
+            val burst = createHighSpeedRequestListWithFallback(highSpeedSession, manualRequest, baseRequest)
             val captureCallback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(
                     session: CameraCaptureSession,
@@ -204,6 +210,60 @@ class HighSpeedBurstRecorder(private val context: Context) {
                 stopRecorder = recorderStarted,
             )
         }
+    }
+
+    private fun buildRecordingRequest(
+        device: CameraDevice,
+        previewSurface: Surface,
+        recorderSurface: Surface,
+        mode: HighSpeedMode,
+        exposureTimeNanos: Long?,
+    ): CaptureRequest =
+        device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+            addTarget(previewSurface)
+            addTarget(recorderSurface)
+            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(mode.aeTargetFpsLower, mode.aeTargetFpsUpper))
+            if (exposureTimeNanos != null) {
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureTimeNanos)
+            }
+        }.build()
+
+    private fun createHighSpeedRequestListWithFallback(
+        highSpeedSession: CameraConstrainedHighSpeedCaptureSession,
+        manualRequest: CaptureRequest?,
+        fallbackRequest: CaptureRequest,
+    ): List<CaptureRequest> =
+        if (manualRequest == null) {
+            highSpeedSession.createHighSpeedRequestList(fallbackRequest)
+        } else {
+            try {
+                highSpeedSession.createHighSpeedRequestList(manualRequest)
+            } catch (_: RuntimeException) {
+                highSpeedSession.createHighSpeedRequestList(fallbackRequest)
+            }
+        }
+
+    private fun resolveManualExposureTimeNanos(
+        manager: CameraManager,
+        cameraId: String,
+        preferredExposureNanos: Long?,
+    ): Long? {
+        val requested = preferredExposureNanos ?: return null
+        if (!requested.isFinitePositiveExposure()) return null
+        val characteristics = try {
+            manager.getCameraCharacteristics(cameraId)
+        } catch (_: RuntimeException) {
+            return null
+        }
+        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?: return null
+        if (CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR !in capabilities) {
+            return null
+        }
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?: return null
+        return exposureRange.clamp(requested)
     }
 
     private fun createRecorder(mode: HighSpeedMode): MediaRecorder? {
@@ -323,3 +383,5 @@ class HighSpeedBurstRecorder(private val context: Context) {
         return if (releaseFailed) BurstFailure.RESOURCE_RELEASE_FAILED else null
     }
 }
+
+private fun Long.isFinitePositiveExposure(): Boolean = this > 0L

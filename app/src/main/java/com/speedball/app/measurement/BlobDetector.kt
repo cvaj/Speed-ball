@@ -48,17 +48,51 @@ enum class BlobDetectionFailureKind {
     RESOURCE_LIMIT,
 }
 
+/** All threshold-matching blob candidates for paths that resolve ambiguity at the track level. */
+sealed interface BlobCandidateDetectionOutcome {
+    data class Success(val blobs: List<Blob>) : BlobCandidateDetectionOutcome
+    data class Failure(
+        val reason: MeasurementRunFailure,
+        val message: String,
+        val kind: BlobDetectionFailureKind,
+    ) : BlobCandidateDetectionOutcome
+}
+
 /** Pure Kotlin connected-components detector for a single thresholded frame. */
 object BlobDetector {
-    fun detect(frame: RgbFrame, config: BlobDetectionConfig): BlobDetectionOutcome {
+    /** Returns a single unambiguous blob or fails loud when none or many blobs match. */
+    fun detect(frame: RgbFrame, config: BlobDetectionConfig): BlobDetectionOutcome =
+        when (val candidates = detectCandidates(frame, config)) {
+            is BlobCandidateDetectionOutcome.Failure -> BlobDetectionOutcome.Failure(
+                reason = candidates.reason,
+                message = candidates.message,
+                kind = candidates.kind,
+            )
+            is BlobCandidateDetectionOutcome.Success -> when (candidates.blobs.size) {
+                0 -> BlobDetectionOutcome.Failure(
+                    MeasurementRunFailure.DETECTION_FAILED,
+                    "No single ball blob was detected.",
+                    BlobDetectionFailureKind.NO_BLOB,
+                )
+                1 -> BlobDetectionOutcome.Success(candidates.blobs.single())
+                else -> BlobDetectionOutcome.Failure(
+                    MeasurementRunFailure.DETECTION_FAILED,
+                    "Multiple ball-like blobs were detected.",
+                    BlobDetectionFailureKind.AMBIGUOUS_BLOBS,
+                )
+            }
+        }
+
+    /** Returns every size/shape-gated blob candidate without applying single-blob ambiguity rejection. */
+    fun detectCandidates(frame: RgbFrame, config: BlobDetectionConfig): BlobCandidateDetectionOutcome {
         validateDetectorInput(frame, config)?.let {
-            return BlobDetectionOutcome.Failure(it.reason, it.message, it.toBlobFailureKind())
+            return BlobCandidateDetectionOutcome.Failure(it.reason, it.message, it.toBlobFailureKind())
         }
 
         val width = frame.width
         val height = frame.height
         val roi = config.roi.clippedTo(width, height)
-            ?: return BlobDetectionOutcome.Failure(
+            ?: return BlobCandidateDetectionOutcome.Failure(
                 MeasurementRunFailure.DETECTION_FAILED,
                 "ROI does not overlap the frame.",
                 BlobDetectionFailureKind.INVALID_INPUT,
@@ -72,7 +106,7 @@ object BlobDetector {
             for (x in roi.left until roi.rightExclusive) {
                 operations += 1
                 if (operations > config.bounds.maxOperationsPerFrame) {
-                    return BlobDetectionOutcome.Failure(
+                    return BlobCandidateDetectionOutcome.Failure(
                         MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
                         "Per-frame operation budget was exceeded.",
                         BlobDetectionFailureKind.RESOURCE_LIMIT,
@@ -83,7 +117,7 @@ object BlobDetector {
                     thresholdMask[index] = true
                     thresholdPixels += 1
                     if (thresholdPixels > config.bounds.maxThresholdPixels) {
-                        return BlobDetectionOutcome.Failure(
+                        return BlobCandidateDetectionOutcome.Failure(
                             MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
                             "Too many threshold-passing pixels in one frame.",
                             BlobDetectionFailureKind.RESOURCE_LIMIT,
@@ -106,7 +140,7 @@ object BlobDetector {
                 }
                 componentCount += 1
                 if (componentCount > config.bounds.maxComponentsPerFrame) {
-                    return BlobDetectionOutcome.Failure(
+                    return BlobCandidateDetectionOutcome.Failure(
                         MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
                         "Too many connected components in one frame.",
                         BlobDetectionFailureKind.RESOURCE_LIMIT,
@@ -115,7 +149,7 @@ object BlobDetector {
 
                 operations += 1
                 if (operations > config.bounds.maxOperationsPerFrame) {
-                    return BlobDetectionOutcome.Failure(
+                    return BlobCandidateDetectionOutcome.Failure(
                         MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
                         "Per-frame operation budget was exceeded.",
                         BlobDetectionFailureKind.RESOURCE_LIMIT,
@@ -134,7 +168,7 @@ object BlobDetector {
                 )
                 operations = blob.operations
                 if (blob.resourceFailure) {
-                    return BlobDetectionOutcome.Failure(
+                    return BlobCandidateDetectionOutcome.Failure(
                         MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
                         "Per-frame operation budget was exceeded.",
                         BlobDetectionFailureKind.RESOURCE_LIMIT,
@@ -144,19 +178,7 @@ object BlobDetector {
             }
         }
 
-        return when (candidates.size) {
-            0 -> BlobDetectionOutcome.Failure(
-                MeasurementRunFailure.DETECTION_FAILED,
-                "No single ball blob was detected.",
-                BlobDetectionFailureKind.NO_BLOB,
-            )
-            1 -> BlobDetectionOutcome.Success(candidates.single())
-            else -> BlobDetectionOutcome.Failure(
-                MeasurementRunFailure.DETECTION_FAILED,
-                "Multiple ball-like blobs were detected.",
-                BlobDetectionFailureKind.AMBIGUOUS_BLOBS,
-            )
-        }
+        return BlobCandidateDetectionOutcome.Success(candidates)
     }
 }
 

@@ -17,15 +17,33 @@ import com.speedball.app.decode.DecodeOutcome
 import com.speedball.app.decode.OffsetSummary
 import com.speedball.app.decode.PresentationClockAssessment
 import com.speedball.app.decode.ReconciliationDiagnostics
+import com.speedball.app.importing.ImportEvidenceSummary
+import com.speedball.app.importing.ImportNoReadReason
+import com.speedball.app.importing.ImportResultSourceKind
+import com.speedball.app.importing.ImportTimingBasis
+import com.speedball.app.importing.ImportWorkflowEvent
+import com.speedball.app.importing.ImportWorkflowState
+import com.speedball.app.importing.SavedResultSummary
 import com.speedball.app.measurement.CalibrationWorkflowState
 import com.speedball.app.measurement.ColorWorkflowState
 import com.speedball.app.measurement.HsvColor
 import com.speedball.app.measurement.HsvTolerance
+import com.speedball.app.measurement.LevelReferenceCalculator
+import com.speedball.app.measurement.LevelReferenceDisplayRotation
+import com.speedball.app.measurement.LevelReferenceSnapshot
+import com.speedball.app.measurement.LevelReferenceSource
 import com.speedball.app.measurement.MeasurementRunFailure
 import com.speedball.app.measurement.MeasurementRunOutcome
 import com.speedball.app.measurement.MeasurementTimingProof
 import com.speedball.app.measurement.MeasurementWorkflowEvent
 import com.speedball.app.measurement.MeasurementWorkflowState
+import com.speedball.app.measurement.NormalizedFramePoint
+import com.speedball.app.measurement.NormalizedFrameRect
+import com.speedball.app.measurement.Phase14CaptureState
+import com.speedball.app.measurement.Phase14Geometry
+import com.speedball.app.measurement.Phase14SetupMode
+import com.speedball.app.measurement.Phase14WorkflowEvent
+import com.speedball.app.measurement.Phase14WorkflowState
 import com.speedball.app.measurement.RegionOfInterest
 import com.speedball.core.model.ImagePoint
 import com.speedball.core.measurement.VelocityMeasurement
@@ -316,6 +334,112 @@ class SpeedBallShellStateTest {
     }
 
     @Test
+    fun phase14KnownDistanceReadinessTextDoesNotDisplayEstimateValues() {
+        val state = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Visual estimate armed",
+            modeLines = emptyList(),
+            selectedModeLine = "1280x720 @ 120 fps",
+            diagnosticLines = emptyList(),
+            failureLine = null,
+            phase14State = phase14ReadyState(),
+        )
+        val joined = state.visibleText.joinToString("\n")
+
+        assertTrue(joined.contains("setup=known-distance status=ready"))
+        assertTrue(joined.contains("phase14Color=ready"))
+        assertTrue(joined.contains("phase14Source=ready readback=160x90"))
+        assertTrue(joined.contains("phase14Level=ready"))
+        assertTrue(joined.contains("phase14Capture=idle canArm=true"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
+    fun phase14SetupAdjustmentTargetIsVisibleWithoutEstimateValues() {
+        val state = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Setup target ROI",
+            modeLines = emptyList(),
+            selectedModeLine = "1280x720 @ 120 fps",
+            diagnosticLines = emptyList(),
+            failureLine = null,
+            phase14State = phase14ReadyState(),
+            setupAdjustmentTargetLabel = "ROI",
+        )
+        val joined = state.visibleText.joinToString("\n")
+
+        assertTrue(joined.contains("setupTarget=ROI"))
+        assertTrue(joined.contains("phase14Color=ready"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
+    fun phase14FallbackShowsSetupAssumptionBeforeCapture() {
+        val state = phase14ReadyState()
+            .reduce(Phase14WorkflowEvent.SetupModeSelected(Phase14SetupMode.BallDiameterFallback))
+            .reduce(Phase14WorkflowEvent.KnownBallDiameterChanged(0.25))
+        val joined = phase14WorkflowUiLines(state).joinToString("\n")
+
+        assertTrue(joined.contains("setup=ball-diameter-fallback status=ready"))
+        assertTrue(joined.contains("assumption=entered-ball-type-and-motion-blur-bias"))
+        assertFalse(joined.contains("certified", ignoreCase = true))
+        assertFalse(joined.contains("m" + "ph", ignoreCase = true))
+    }
+
+    @Test
+    fun phase14NoReadResultSuppressesSpeedValues() {
+        val state = phase14ReadyState().copy(capture = Phase14CaptureState.Complete).reduce(
+            Phase14WorkflowEvent.CaptureCompleted(
+                com.speedball.app.measurement.VisualEstimateOutcome.NoRead(
+                    reason = com.speedball.app.measurement.VisualEstimateNoReadReason.DETECTION_FAILED,
+                    message = "No single ball blob was detected.",
+                ),
+            ),
+        )
+        val joined = phase14WorkflowUiLines(state).joinToString("\n")
+
+        assertTrue(joined.contains("result=estimate-no-read"))
+        assertTrue(joined.contains("DETECTION_FAILED"))
+        assertFalse(joined.contains("m" + "ph", ignoreCase = true))
+        assertFalse(joined.contains("ang" + "le", ignoreCase = true))
+        assertFalse(joined.contains("tra" + "jectory", ignoreCase = true))
+    }
+
+    @Test
+    fun importWorkflowNoReadUsesEstimateLabelAndSuppressesValues() {
+        val importState = ImportWorkflowState().reduce(
+            ImportWorkflowEvent.ImportFailed(
+                reason = ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+                message = "Imported video did not expose trusted timing.",
+            ),
+        )
+        val joined = importWorkflowUiLines(importState).joinToString("\n")
+
+        assertTrue(joined.contains("import=estimate-only"))
+        assertTrue(joined.contains("strict=false"))
+        assertTrue(joined.contains("NO_TRUSTWORTHY_TIMING"))
+        assertFalse(joined.contains("m" + "ph", ignoreCase = true))
+        assertFalse(joined.contains("ang" + "le", ignoreCase = true))
+        assertFalse(joined.contains("content://"))
+    }
+
+    @Test
+    fun savedAndExportLinesAreRedactedImportEvidence() {
+        val summary = savedImportSummary(speed = 70.4)
+        val joined = (
+            savedResultHistoryUiLines(listOf(summary)) +
+                exportEvidenceUiLines("source=IMPORT_ESTIMATE\nspeedMph=70.4\nassumption=Estimate only.")
+            ).joinToString("\n")
+
+        assertTrue(joined.contains("savedResults=1"))
+        assertTrue(joined.contains("source=IMPORT_ESTIMATE"))
+        assertTrue(joined.contains("speedMph=70.4"))
+        assertFalse(joined.contains("content://"))
+        assertFalse(joined.contains("/storage"))
+        assertFalse(joined.contains("pixel", ignoreCase = true))
+    }
+
+    @Test
     fun sourceUnprovenShellContainsNoResultValues() {
         val workflowState = MeasurementWorkflowState()
             .reduce(MeasurementWorkflowEvent.CalibrationSelected)
@@ -422,6 +546,47 @@ class SpeedBallShellStateTest {
         assertFalse(text.contains("hang", ignoreCase = true))
     }
 
+    private fun phase14ReadyState(): Phase14WorkflowState =
+        Phase14WorkflowState()
+            .reduce(Phase14WorkflowEvent.PermissionChanged(true))
+            .reduce(
+                Phase14WorkflowEvent.GeometryChanged(
+                    Phase14Geometry(
+                        modeId = "1280x720@120",
+                        previewTransformId = "fit",
+                        source = com.speedball.app.measurement.FrameDimensions(1280, 720),
+                        readback = com.speedball.app.measurement.FrameDimensions(160, 90),
+                    ),
+                ),
+            )
+            .reduce(
+                Phase14WorkflowEvent.KnownDistanceSelected(
+                    pointA = NormalizedFramePoint(0.2, 0.5),
+                    pointB = NormalizedFramePoint(0.8, 0.5),
+                    knownDistanceFeet = 8.0,
+                ),
+            )
+            .reduce(
+                Phase14WorkflowEvent.ColorSampleSelected(
+                    point = NormalizedFramePoint(0.5, 0.5),
+                    sample = HsvColor(42.0, 0.8, 0.8),
+                    tolerance = HsvTolerance(12.0, 0.2, 0.2),
+                ),
+            )
+            .reduce(Phase14WorkflowEvent.RegionOfInterestSelected(NormalizedFrameRect(0.1, 0.1, 0.9, 0.9)))
+            .reduce(Phase14WorkflowEvent.LevelReferenceCaptured(levelSnapshot()))
+
+    private fun levelSnapshot(): LevelReferenceSnapshot =
+        LevelReferenceSnapshot(
+            rollDegrees = 0.0,
+            pitchDegrees = 0.0,
+            sampleCount = LevelReferenceCalculator.MIN_SAMPLE_COUNT,
+            source = LevelReferenceSource.GRAVITY_SENSOR,
+            displayRotation = LevelReferenceDisplayRotation.ROTATION_0,
+            maxGyroMagnitudeRadPerSecond = 0.0,
+            capturedAtEpochMillis = 1L,
+        )
+
     private fun successMeasurementOutcome(): MeasurementRunOutcome.Success =
         MeasurementRunOutcome.Success(
             measurement = VelocityMeasurement(
@@ -452,5 +617,22 @@ class SpeedBallShellStateTest {
             timingProof = object : MeasurementTimingProof {
                 override val evidenceLabel: String = "ui-test"
             },
+        )
+
+    private fun savedImportSummary(speed: Double?): SavedResultSummary =
+        SavedResultSummary(
+            id = "result-1",
+            createdAtEpochMillis = 1_000L,
+            sourceKind = ImportResultSourceKind.IMPORT_ESTIMATE,
+            evidence = ImportEvidenceSummary(
+                sourceKind = ImportResultSourceKind.IMPORT_ESTIMATE,
+                timingBasis = ImportTimingBasis.CONTAINER_PRESENTATION_TIMESTAMPS,
+                frameCount = 4,
+                detectionCount = 4,
+                assumptions = listOf("Estimate only."),
+            ),
+            speedMilesPerHour = speed,
+            launchAngleDegrees = null,
+            noReadReason = null,
         )
 }

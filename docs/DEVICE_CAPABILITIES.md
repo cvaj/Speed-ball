@@ -69,7 +69,11 @@ true high-speed preview frames.
 both 720p and 1080p; slow-mo tagging did not help — frames arrive in real time and the
 encoder drops them). Therefore:
 
-- **120 fps records cleanly end-to-end** → simple record-then-decode pipeline works.
+- **120 fps persists near 120 fps** → record-then-decode is the first recording
+  route, but Phase 5/6/12 app evidence makes the measured S10+
+  `1280x720 @ 120` record-then-decode route a scoped no-go for production
+  measurement because decoded samples cannot be bound to surviving
+  `SENSOR_TIMESTAMP` values.
 - **240 fps frames exist but cannot be saved via MediaRecorder** → the 240 path must read
   frames off the **GPU/preview (SurfaceTexture)** surface, not the encoder.
 
@@ -121,25 +125,84 @@ actual HAL configs (only show combos the device reports). Suggested defaults:
 
 | Device | Default | Notes |
 |---|---|---|
-| S10+ | **720p @ 120** | Capture proof is clean and coolest, but measurement remains no-read until frame/timestamp pairing and detection are proven. Preview-only Phase 7 proof currently fails loud at ~30 fps. 1080p remains selectable. |
+| S10+ | **720p @ 120** | Capture proof is clean and coolest, but measurement remains no-read until a measurement-ready source route is proven. Record-then-decode Phase 5/6/12 is scoped no-go on measured `1280x720 @ 120` evidence: timestamp source is `REALTIME`, but count-independent PTS-to-sensor value-match is ambiguous/incomplete (`matched=248/257`, `ambiguous=62`, `longestCleanRun=3`). Preview/direct SurfaceTexture proof currently fails loud at about 30 fps consumed cadence. 1080p remains selectable. |
 | S22+ | 720p @ 240 (pending verify) | Stronger encoder likely persists 240 directly. |
 
 ---
 
 ## 6. Practical capture constraints (Camera2 high-speed)
 
-- A constrained-high-speed session allows **at most 2 output surfaces**, which must be a
-  **preview surface and/or a video-encoder surface** — **no `ImageReader` (CPU) output.** So
-  raw per-frame CPU access is not available directly; frames come via preview (GPU) or the
-  encoder.
+- A constrained-high-speed session is treated by the current architecture as allowing
+  **at most 2 output surfaces**, which must be a **preview surface and/or a
+  video-encoder surface**. Phase 12 records separate constrained `ImageReader`
+  evidence for CPU-readable YUV and `PRIVATE`/video-encode usage surfaces before
+  any source-route no-go; raw per-frame CPU access is not available directly in
+  the accepted high-speed source shapes.
 - **3A (auto-exposure/focus) is limited/locked** in high-speed mode → we set a **short, fixed
   shutter** to freeze the ball (also reduces motion blur) and fixed focus on the swing plane.
 - Per-frame `SENSOR_TIMESTAMP` is available from the capture callback and is the source of
   truth for inter-frame Δt (proven accurate in the prototype).
 
+## 7. Phase 12 No-Go Evidence Requirement
+
+### Record-then-decode route
+
+The S10+ `1280x720 @ 120` MediaRecorder record-then-decode route has a scoped
+source no-go for production measurement. Phase 6 measured decoded `268`, exact
+distinct sensor timestamps `325`, and hypothetical post-collapse sensor
+timestamps `260`. Phase 12 measured
+`SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME` (`value=1`) and then ran a
+count-independent PTS-to-sensor value-match against a fresh device burst. The
+best measured offset was still not measurement-safe:
+`verdict=AMBIGUOUS_MATCH`, `matched=248/257`, `ambiguous=62`, and
+`longestCleanRun=3`. The app must keep this route no-read for production
+measurement.
+
+### Live GL/ImageReader source routes
+
+A Phase 12 S10+ source-route no-go is valid only with a measured variant matrix
+in this document and `docs/HIGH_SPEED_FINDINGS.md`.
+
+Required rows:
+
+| Variant | Consumer model | Session/API result | Producer cadence | captureCallbacks : frameAvailableCallbacks : consumedFrames | Direct cadence | Sensor cadence | Final gate | Interpretation |
+|---|---|---|---|---|---|---|---|---|
+| `companion-gl` | Single `SurfaceTexture` GL readback + companion encoder | Constrained high-speed accepted; request list `4` | `8.333 ms` median, in band | `48 : 6 : 6` | `33.378 ms` median | `8.333 ms` median | `INSUFFICIENT_DIRECT_FRAMES` | Producer is true 120 fps, but direct consumer still receives about 30 fps and only 6 frames. |
+| `direct-gl-first` | Single `SurfaceTexture` GL readback + companion encoder, direct surface first | Constrained high-speed accepted; request list `4` | `8.333 ms` median, in band | `192 : 24 : 24` | `33.378 ms` median | `8.333 ms` median | `DIRECT_CADENCE_MISMATCH` | Reversing surface order reaches 24 frames but still about 30 fps consumed cadence. |
+| `pbo-gl-readback` | GLES3 PBO-backed GL readback + companion encoder, direct surface first | Constrained high-speed accepted; request list `4` | `8.333 ms` median, in band | `200 : 25 : 24` | `33.378 ms` median | `8.333 ms` median | `DIRECT_CADENCE_MISMATCH` | PBO readback is accepted and producer cadence remains true 120 fps, but the direct consumer still consumes about 30 fps. |
+| `direct-gl-only` | Single `SurfaceTexture` GL readback | Constrained high-speed accepted; request list `4` | `33.378 ms` median, below requested band | `24 : 24 : 24` | `33.378 ms` median | `33.378 ms` median | `DIRECT_CADENCE_MISMATCH` | Direct-only GL changes producer/session cadence to about 30 fps, so it is not a 120 fps source. |
+| `constrained-image-reader` | `ImageReader` YUV same-image proof | Constrained high-speed rejected during session configuration | Not available | `0 : 0 : 0` | Not available | Not available | `SESSION_CONFIGURATION_FAILED` | HAL/API rejection is recorded; no ImageReader frames delivered in constrained high-speed. |
+| `constrained-private-image-reader` | `ImageReader` `PRIVATE` with `USAGE_VIDEO_ENCODE` | Constrained high-speed accepted; request list `4` | `16.667 ms` median, below requested band | `12 : 0 : 0` | Not available | `16.667 ms` median | `MISSING_DIRECT_TIMESTAMPS` | The preview/encoder-like buffered surface is accepted, but no `ImageReader` callbacks or proof frames are delivered, so it is not a measurement-ready 120 fps source. |
+| `standard-image-reader` | Standard Camera2 `ImageReader` YUV same-image proof | Standard Camera2 session accepted; request list `1` | `33.283 ms` median, below requested band | `24 : 24 : 24` | `33.283 ms` median | `33.283 ms` median | `DIRECT_CADENCE_MISMATCH` | Consumer-buffering path works, but producer cadence is below requested 120 fps, so its ratio cannot be used as constrained-route no-go evidence. |
+
+The matrix must include consumer-buffering evidence. If `ImageReader` is
+rejected by constrained high-speed session rules, accepted but callback-empty, or
+accepted below producer band, record that result rather than assuming a generic
+`ImageReader` outcome. If a standard Camera2 `ImageReader` or decoupled
+GL/readback probe is used as the consumer-model check, record that route
+separately from the constrained high-speed proof route. Standard-session
+consumer probes cannot support a source-route no-go unless their producer
+cadence is in the requested fps band.
+
+Current Phase 12 code status: the app now has explicit source-route variant
+identities, GL surface-order controls, a distinct `pbo-gl-readback` consumer
+model, variant diagnostics, producer-cadence gating, and an ImageReader
+same-snapshot pixel-proof contract. The measured S10+ rows above are device
+evidence for those routes: constrained YUV ImageReader is rejected by session
+configuration, constrained PRIVATE/video-encode ImageReader is accepted but
+delivers no image callbacks and below-band producer cadence, standard ImageReader
+is accepted but runs below the requested 120 fps producer band, and PBO-backed GL
+remains accepted but still consumes about 30 fps.
+
+This matrix is not a terminal source-route no-go. The remaining evidence-led
+route is a reviewed equivalent non-coalescing constrained-session consumer, or
+a reviewer-approved conclusion that the tested GL/ImageReader routes exhaust
+the supported live-source options. The code must not label any current inline
+`SurfaceTexture`/`glReadPixels` path as PBO or decoupled GL evidence.
+
 ---
 
-## 7. Reproduce on any device
+## 8. Reproduce on any device
 
 ```bash
 cd prototype/hs-probe

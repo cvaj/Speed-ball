@@ -100,6 +100,10 @@ fun buildReconciliationDiagnostics(
     sampledFrames: List<DecodedFrameSample>,
 ): ReconciliationDiagnostics {
     val offsets = ptsToSensorOffsetSummary(metadata, sensorDiagnostics.uniqueTimestampsNanos)
+    val valueMatch = analyzePtsSensorValueMatch(
+        presentationTimeMicros = metadata.presentationTimeMicros,
+        uniqueSensorTimestampsNanos = sensorDiagnostics.uniqueTimestampsNanos,
+    )
     return ReconciliationDiagnostics(
         decodedFrameCount = metadata.frameCount,
         uniqueSensorTimestampCount = sensorDiagnostics.uniqueCount,
@@ -117,6 +121,7 @@ fun buildReconciliationDiagnostics(
         nearDuplicateGapMillis = nearDuplicateGapMillis,
         ptsToSensorOffsetSummary = offsets,
         ptsToSensorOffsetMicros = ptsToSensorOffsetSeries(metadata, sensorDiagnostics.uniqueTimestampsNanos),
+        ptsSensorValueMatch = valueMatch,
         presentationClockAssessment = assessPresentationClock(metadata),
         sampledFrames = sampledFrames,
     )

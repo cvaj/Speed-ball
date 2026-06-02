@@ -251,6 +251,23 @@ file in full before acting.
 
 The broker archives requests/responses and records queue/session transitions.
 
+## Broker Closeout Shapes
+
+`close-review` must verify mutual exhaustion against the archived artifacts, not
+only against one mailbox pointer.
+
+Two closure shapes are valid:
+
+- Review-request shape: latest request verdict `APPROVED` and latest response
+  verdict `APPROVED`.
+- Implementer-led shape: latest implementation request verdict `IMPLEMENTED`,
+  plus reciprocal archived response artifacts for the same sequence/task where
+  implementer -> reviewer and reviewer -> implementer both end in `APPROVED`.
+
+The implementer-led shape is the normal path when Codex implements and Claude
+reviews: the original request records the implementation as `IMPLEMENTED`, then
+mutual exhaustion is proven by the final reciprocal `APPROVED` responses.
+
 ## Session Names
 
 The primary tmux sessions are:

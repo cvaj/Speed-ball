@@ -27,6 +27,7 @@ data class RawHighSpeedRange(
 data class BurstOptions(
     val mode: HighSpeedMode,
     val durationMillis: Long = DEFAULT_BURST_DURATION_MILLIS,
+    val preferredExposureTimeNanos: Long? = DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS,
 )
 
 /** Fail-loud reasons for every Phase 4 capture terminal path. */
@@ -95,6 +96,7 @@ class TerminalCompletionGate {
 
 const val DEFAULT_BURST_DURATION_MILLIS: Long = 2_500L
 const val MAX_BURST_DURATION_MILLIS: Long = 3_000L
+const val DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS: Long = 1_000_000L
 
 fun clampBurstDurationMillis(durationMillis: Long): Long =
     when {

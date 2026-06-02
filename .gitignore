@@ -14,7 +14,22 @@ captures/
 # Captured media / large binaries (kept out of git)
 *.mp4
 *.mov
+*.m4v
+*.avi
+*.mkv
+*.webm
+*.3gp
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.webp
+*.gif
+*:Zone.Identifier
 samples/*.mp4
+
+# Text files (ignore all)
+*.txt
 
 # OS
 .DS_Store
@@ -29,6 +44,9 @@ node_modules/
 .interagent/codex_request.md
 .interagent/codex_response.md
 .interagent/codex_handoff.md
+.interagent/codex-tmux-handoff-*.md
+.handoffs/
+.handoffs/handoff-*.md
 .interagent/session.json
 .interagent/implementation_queue.json
 .interagent/tmp/

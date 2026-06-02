@@ -142,6 +142,35 @@ class DirectTimingSourceCaptureTest {
     }
 
     @Test
+    fun glVariantSurfaceOrderControlsCamera2SurfaceList() {
+        assertEquals(
+            listOf(
+                DirectProofSurfaceRole.COMPANION_ENCODER,
+                DirectProofSurfaceRole.DIRECT_GL_READBACK,
+            ),
+            buildGlVariantSurfaceRoles(companionGlBaselineVariant()),
+        )
+        assertEquals(
+            listOf(
+                DirectProofSurfaceRole.DIRECT_GL_READBACK,
+                DirectProofSurfaceRole.COMPANION_ENCODER,
+            ),
+            buildGlVariantSurfaceRoles(companionGlDirectFirstVariant()),
+        )
+        assertEquals(
+            listOf(DirectProofSurfaceRole.DIRECT_GL_READBACK),
+            buildGlVariantSurfaceRoles(directOnlyGlVariant()),
+        )
+    }
+
+    @Test
+    fun imageReaderVariantsPassValidationForDeviceExercise() {
+        assertEquals(null, validateDirectProofVariant(constrainedImageReaderVariant()))
+        assertEquals(null, validateDirectProofVariant(constrainedPrivateImageReaderVariant()))
+        assertEquals(null, validateDirectProofVariant(standardImageReaderVariant()))
+    }
+
+    @Test
     fun directReleaseResourcesRunsEveryStepAndPrioritizesScratchFailure() {
         val calls = mutableListOf<String>()
         val failure = releaseDirectCaptureResources(
@@ -228,9 +257,16 @@ class DirectTimingSourceCaptureTest {
         assertTrue(source.contains("surfaceTexture.updateTexImage()"))
         assertTrue(source.contains("surfaceTexture.timestamp"))
         assertTrue(source.contains("GLES20.glReadPixels"))
+        assertTrue(source.contains("GLES30.glReadPixels"))
+        assertTrue(source.contains("GLES30.glMapBufferRange"))
         assertTrue(source.contains("buildDirectPixelProofSignature"))
+        assertTrue(source.contains("ImageReader.newInstance"))
+        assertTrue(source.contains("ImageFormat.PRIVATE"))
+        assertTrue(source.contains("HardwareBuffer.USAGE_VIDEO_ENCODE"))
+        assertTrue(source.contains("buildDirectImageReaderPixelProofSignature"))
         assertTrue(source.contains("DirectAtomicFrameProof(frame)"))
-        assertTrue(source.contains("listOf(companionSurface, directSurface)"))
+        assertTrue(source.contains("buildDirectVariantSurfaceList"))
+        assertTrue(source.contains("buildGlVariantSurfaceRoles"))
         assertTrue(source.contains("prepareCompanionEncoderScratch"))
         assertFalse(source.contains("MediaExtractor"))
         assertFalse(source.contains("MediaMetadataRetriever"))

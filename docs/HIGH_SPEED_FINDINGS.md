@@ -194,6 +194,59 @@ Interpretation:
 - Record-then-decode remains no-read on the S10+ for measurement because decoded
   frames still cannot be paired to sensor timestamps safely.
 
+## Phase 12 record-then-decode source decision (S10+)
+
+After Gate 2 approval for the record-then-decode source decision, we added a
+developer-only timestamp-source characteristic read and ran it on the connected
+S10+ (`SM-G975U`, Android 12).
+
+Command shape:
+
+```bash
+ANDROID_HOME=$HOME/Android/Sdk ./gradlew :app:installDebug
+adb shell pm grant com.speedball.app android.permission.CAMERA
+adb logcat -c
+adb shell am start -n com.speedball.app/.MainActivity --ez autoLogTimestampSource true
+adb logcat -d -s SPEEDBALL_CAPTURE
+```
+
+Observed result:
+
+```text
+CAMERA_TIMESTAMP_SOURCE camera=back cameraIdClass=numeric-1chars source=REALTIME value=1 sharedClockCandidate=true
+```
+
+After Claude's implementation review correctly flagged that the legacy
+`DECODE_PTS_SENSOR_OFFSETS_US count=0` line was count-gated and index-zipped, we
+added a count-independent value-match diagnostic and reran the S10+ 120 fps
+record-then-decode proof.
+
+Observed value-match result:
+
+```text
+BURST_SUCCESS callbacks=496 uniqueTs=310 expected=300 min=240 medianGapMs=8.33 band=7.08..9.58 medianPass=true proof=true file=speed_ball_1280x720_120_1780290458149.mp4 bytes=6417935
+TIMESTAMP_ANCHOR_DIAGNOSTIC file=speed_ball_1280x720_120_1780290458149.mp4 verdict=REJECTED reason=SENSOR_NEAR_DUPLICATE decoded=257 rawPositiveSensorTs=496 exactDistinctSensorTs=310 hypotheticalPostCollapseSensorTs=248 postCollapse=postCollapseStillMismatched nearDuplicateGroups=62 evaluatedCandidates=0 survivingMappings=0 maxResidualUs=n/a medianResidualUs=n/a presentationHoles=0 sensorHoles=0 holeAgreement=NO_HOLES failures=none
+DECODE_PTS_SENSOR_VALUE_MATCH verdict=AMBIGUOUS_MATCH decoded=257 uniqueTs=310 evaluatedOffsets=8487 toleranceUs=750 matched=248 unambiguous=186 ambiguous=62 longestCleanRun=3 maxResidualUs=6 medianResidualUs=3 offsetUs=1102031621721
+```
+
+Interpretation:
+
+- The back camera reports `SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME`, so shared
+  clock analysis is supported for surfaces that expose their frame timestamps.
+- A count-independent value-match was measured against the full exact sensor
+  timestamp set. It does not rescue the route: the best offset matched only
+  `248` of `257` decoded samples, `62` matched frames were ambiguous because of
+  near-duplicate sensor timestamps, and the longest contiguous unambiguous run
+  was `3` frames.
+- Encoder-frame loss is unrecoverable through the tested public MediaRecorder
+  route because no per-frame accepted-vs-emitted identity is exposed and the
+  measured `REALTIME` value-match did not recover one.
+- Sensor-callback duplication does not rescue the route because the deterministic
+  exact-distinct and post-collapse counts both mismatch decoded sample count.
+- The S10+ `1280x720 @ 120 fps` record-then-decode route is therefore a scoped
+  no-go for production measurement. It remains no-read and emits no token, mph,
+  angle, or trajectory.
+
 ## Phase 7 preview timestamp proof (S10+)
 
 After adding the decoder-free `SurfaceTexture` preview timestamp proof and pure
@@ -246,13 +299,18 @@ Interpretation:
 - ✅ The sensor delivers **true ~242 fps at 1080p** to our app.
 - ❌ MediaRecorder/H.264 **cannot persist** more than ~120 fps on the Exynos 9820 (encoder
   ceiling) — so the 240 path needs GPU/preview frame access, not the encoder.
-- ✅ 120 fps records cleanly end-to-end → a simple record-then-decode pipeline is viable now.
+- ✅ 120 fps persists near 120 fps through MediaRecorder, so
+  record-then-decode remains the first recording route to evaluate.
 - ❌ The current Phase 5 exact-count record-then-decode path does **not** yet
   produce a verified decoded-frame-to-sensor-timestamp pairing on S10+; it fails
   loud on near-duplicate sensor gaps and decoded/sensor count mismatch.
 - ❌ Phase 6 value-anchor S10+ device evidence is captured and rejects fail-loud:
   near-duplicate callbacks remain, post-collapse sensor count still mismatches
   decoded frames, and no measurement-ready pairing is produced.
+- ❌ Phase 12 record-then-decode source decision is scoped no-go on S10+
+  `1280x720 @ 120`: timestamp source is `REALTIME`, but the measured
+  count-independent PTS-to-sensor value-match is ambiguous/incomplete
+  (`matched=248/257`, `ambiguous=62`, `longestCleanRun=3`).
 - ✅ Phase 7 proves `SurfaceTexture.timestamp == SENSOR_TIMESTAMP` for consumed
   preview frames on the S10+.
 - ❌ Phase 7 preview-only `SurfaceTexture` delivery on the S10+ is not 120 fps in
@@ -262,11 +320,14 @@ Interpretation:
 
 - Verify the same on the **S22+** (expected: true 240, likely persistable via its stronger encoder).
 - Build the **GPU (SurfaceTexture + GLSL) frame path** for true 240 on the S10+.
-- Find a verified per-frame timestamp pairing strategy for record-then-decode,
-  or keep this path no-read and use the preview/GPU path for measurement.
+- Continue the reviewed preview/direct source route or test another device. The
+  S10+ record-then-decode route is scoped no-go for measurement on the measured
+  `1280x720 @ 120` path.
 - Investigate whether the S10+ requires a companion encoder surface, vendor
   camera constraints, or a different session shape before a preview/GPU path can
   consume true high-speed frames.
+- Phase 12 live-source no-go evidence remains separate from the
+  record-then-decode source no-go and must stay scoped to measured routes.
 
 ## Phase 9 direct companion proof (S10+)
 
@@ -380,3 +441,72 @@ Interpretation:
 - Scratch cleanup succeeded and no scratch MP4 remained in app-private cache.
 - The result remains fail-loud no-read with `INSUFFICIENT_DIRECT_FRAMES`; no
   token, mph, angle, trajectory, or production measurement result is claimed.
+
+## Phase 12 source-route unblock implementation status
+
+Phase 12 now has code-level variant scaffolding plus S10+ device proof for the
+implemented variant matrix. The following S10+ run was captured after wiring
+variant selection and ImageReader probes:
+
+```bash
+adb shell am start -n com.speedball.app/.MainActivity \
+  --ez autoStartDirectProof120 true \
+  --es directProofVariant <variant-id>
+```
+
+- Implemented variants: baseline companion+GL, direct-first companion+GL,
+  PBO-backed companion+GL, direct-only GL, constrained YUV ImageReader,
+  constrained PRIVATE/video-encode ImageReader, and standard ImageReader.
+- The GL Camera2 path now uses the selected ordered surface roles when creating
+  the constrained high-speed session and request targets.
+- The PBO-backed GL route is a real separate consumer model (`pbo-gl-readback`):
+  it creates a GLES3 context, issues `glReadPixels` into a pixel-pack buffer,
+  and maps the previous callback's PBO on the next callback. It is not an alias
+  for the inline `SurfaceTexture`/`glReadPixels` path.
+- The debug entry point accepts `--es directProofVariant <id>` with ids from
+  `plannedDirectProofVariants()`, so adb can exercise each route independently.
+- Diagnostics now include variant id, consumer model, surface order, buffer
+  size, request-list size, producer/capture callback cadence, and whether
+  producer cadence is in the requested fps band.
+- The ImageReader pixel-proof contract is implemented as a same-acquired-image
+  snapshot path feeding the shared aggregate signature builder, with fail-loud
+  timestamp/conversion handling and close-after-signature behavior.
+- The Camera2 ImageReader session path is wired for constrained high-speed YUV,
+  constrained high-speed PRIVATE/video-encode usage, and standard Camera2 probes;
+  all routes were device-exercised in the matrix below.
+
+Measured S10+ variant matrix:
+
+| Variant | Session result | Producer cadence | Ratio | Final gate |
+|---|---|---|---|---|
+| `companion-gl` | constrained high-speed accepted, request list `4` | `8.333 ms` median, in band | `48 : 6 : 6` | `INSUFFICIENT_DIRECT_FRAMES` |
+| `direct-gl-first` | constrained high-speed accepted, request list `4` | `8.333 ms` median, in band | `192 : 24 : 24` | `DIRECT_CADENCE_MISMATCH` |
+| `pbo-gl-readback` | constrained high-speed accepted, request list `4` | `8.333 ms` median, in band | `200 : 25 : 24` | `DIRECT_CADENCE_MISMATCH` |
+| `direct-gl-only` | constrained high-speed accepted, request list `4` | `33.378 ms` median, below band | `24 : 24 : 24` | `DIRECT_CADENCE_MISMATCH` |
+| `constrained-image-reader` | constrained high-speed session rejected | Not available | `0 : 0 : 0` | `SESSION_CONFIGURATION_FAILED` |
+| `constrained-private-image-reader` | constrained high-speed accepted, request list `4` | `16.667 ms` median, below band | `12 : 0 : 0` | `MISSING_DIRECT_TIMESTAMPS` |
+| `standard-image-reader` | standard Camera2 session accepted, request list `1` | `33.283 ms` median, below band | `24 : 24 : 24` | `DIRECT_CADENCE_MISMATCH` |
+
+Interpretation:
+
+- The companion-backed GL variants prove the producer can run at 120 fps, but
+  the direct consumer still receives about 30 fps.
+- The PBO-backed GL variant is accepted by the same constrained 120 fps session
+  and keeps producer cadence in band, but it still consumes about 30 fps
+  (`DIRECT_CADENCE_MISMATCH`), so PBO readback did not unblock the source on
+  this S10+ run.
+- Direct-only GL and standard ImageReader both produce about 30 fps, so they
+  cannot prove a 120 fps source route.
+- The constrained high-speed YUV ImageReader target was device-exercised and
+  rejected during session configuration.
+- The constrained high-speed PRIVATE/video-encode ImageReader target was
+  device-exercised and accepted, but delivered zero `ImageReader` callbacks and
+  zero direct proof frames while producer callbacks were below the requested
+  120 fps band.
+- The standard ImageReader consumer-buffering route is device-exercised and
+  functional, but because producer cadence is below the requested band, its
+  consumer ratio cannot satisfy source-route no-go evidence by itself.
+- The remaining decision is review-bound: either identify another equivalent
+  non-coalescing constrained-session consumer to test, or conclude by reviewed
+  evidence that the tested GL/ImageReader live-source routes do not provide a
+  120 fps measurement-ready source on this S10+.

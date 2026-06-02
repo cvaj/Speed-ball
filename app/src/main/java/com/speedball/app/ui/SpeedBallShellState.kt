@@ -5,11 +5,17 @@ import com.speedball.app.capture.DirectSessionProbeOutcome
 import com.speedball.app.capture.DirectTimingSourceProofOutcome
 import com.speedball.app.capture.DirectTimingSourceProofRunResult
 import com.speedball.app.capture.PreviewFrameOutcome
+import com.speedball.app.importing.ImportWorkflowStage
+import com.speedball.app.importing.ImportWorkflowState
+import com.speedball.app.importing.SavedResultSummary
 import com.speedball.app.measurement.CalibrationWorkflowReadiness
 import com.speedball.app.measurement.CalibrationWorkflowState
 import com.speedball.app.measurement.ColorWorkflowReadiness
 import com.speedball.app.measurement.ColorWorkflowState
 import com.speedball.app.measurement.MeasurementWorkflowState
+import com.speedball.app.measurement.Phase14CaptureState
+import com.speedball.app.measurement.Phase14SetupMode
+import com.speedball.app.measurement.Phase14WorkflowState
 import com.speedball.app.measurement.WorkflowCaptureState
 import com.speedball.app.measurement.WorkflowSourceProofState
 
@@ -36,7 +42,14 @@ data class SpeedBallShellState(
     val selectedModeLine: String? = null,
     val resultLines: List<String> = emptyList(),
     val diagnosticLines: List<String> = emptyList(),
+    val importLines: List<String> = emptyList(),
+    val savedResultLines: List<String> = emptyList(),
+    val exportLines: List<String> = emptyList(),
     val failureLine: String? = null,
+    val phase14State: Phase14WorkflowState = Phase14WorkflowState(),
+    val setupAdjustmentTargetLabel: String = "A",
+    val knownDistanceFeetText: String = "",
+    val previewRotationDegrees: Int = 0,
 ) {
     /** User-visible strings exposed by the placeholder shell. */
     val visibleText: List<String>
@@ -48,7 +61,13 @@ data class SpeedBallShellState(
             addAll(modeLines)
             addAll(resultLines)
             addAll(diagnosticLines)
+            addAll(importLines)
+            addAll(savedResultLines)
+            addAll(exportLines)
             failureLine?.let(::add)
+            add("setupTarget=$setupAdjustmentTargetLabel")
+            add("knownDistanceFeetInput=$knownDistanceFeetText")
+            add("previewRotationDegrees=$previewRotationDegrees")
             sections.forEach { section ->
                 add(section.title)
                 add(section.status.name)
@@ -82,6 +101,13 @@ fun speedBallCaptureState(
     calibrationState: CalibrationWorkflowState = CalibrationWorkflowState(),
     colorState: ColorWorkflowState = ColorWorkflowState(),
     workflowState: MeasurementWorkflowState = MeasurementWorkflowState(),
+    phase14State: Phase14WorkflowState = Phase14WorkflowState(),
+    importWorkflowState: ImportWorkflowState = ImportWorkflowState(),
+    savedResultSummaries: List<SavedResultSummary> = emptyList(),
+    exportEvidenceText: String? = null,
+    setupAdjustmentTargetLabel: String = "A",
+    knownDistanceFeetText: String = "",
+    previewRotationDegrees: Int = 0,
     workflowFrameWidth: Int = 0,
     workflowFrameHeight: Int = 0,
 ): SpeedBallShellState =
@@ -94,18 +120,26 @@ fun speedBallCaptureState(
             calibrationState = calibrationState,
             colorState = colorState,
             workflowState = workflowState,
+            phase14State = phase14State,
             frameWidth = workflowFrameWidth,
             frameHeight = workflowFrameHeight,
         ),
         diagnosticLines = diagnosticLines,
+        importLines = importWorkflowUiLines(importWorkflowState),
+        savedResultLines = savedResultHistoryUiLines(savedResultSummaries),
+        exportLines = exportEvidenceUiLines(exportEvidenceText),
         failureLine = failureLine,
+        phase14State = phase14State,
+        setupAdjustmentTargetLabel = setupAdjustmentTargetLabel,
+        knownDistanceFeetText = knownDistanceFeetText,
+        previewRotationDegrees = previewRotationDegrees,
         sections = listOf(
             WorkflowSection("Mode", PlaceholderStatus.Pending, "Modes are loaded from the device HAL."),
             WorkflowSection("Calibrate", PlaceholderStatus.Pending, calibrationWorkflowUiLines(calibrationState).single()),
             WorkflowSection("Sample Color", PlaceholderStatus.Pending, colorWorkflowUiLines(colorState, workflowFrameWidth, workflowFrameHeight).first()),
             WorkflowSection("Capture", PlaceholderStatus.Pending, "Developer burst diagnostics are available."),
-            WorkflowSection("Import", PlaceholderStatus.Unavailable, "Video import is not implemented in this phase."),
-            WorkflowSection("Results", PlaceholderStatus.Unavailable, measurementOutcomeUiLines(workflowState.result).first()),
+            WorkflowSection("Import", PlaceholderStatus.Pending, importWorkflowUiLines(importWorkflowState).first()),
+            WorkflowSection("Results", PlaceholderStatus.Pending, measurementOutcomeUiLines(workflowState.result).first()),
         ),
     )
 
@@ -113,14 +147,107 @@ fun workflowGuidanceUiLines(
     calibrationState: CalibrationWorkflowState,
     colorState: ColorWorkflowState,
     workflowState: MeasurementWorkflowState,
+    phase14State: Phase14WorkflowState = Phase14WorkflowState(),
     frameWidth: Int,
     frameHeight: Int,
 ): List<String> =
     calibrationWorkflowUiLines(calibrationState) +
         colorWorkflowUiLines(colorState, frameWidth, frameHeight) +
+        phase14WorkflowUiLines(phase14State) +
         sourceProofUiLine(workflowState.sourceProof) +
         captureWorkflowUiLine(workflowState.capture) +
         measurementOutcomeUiLines(workflowState.result)
+
+fun importWorkflowUiLines(state: ImportWorkflowState): List<String> =
+    buildList {
+        add("import=estimate-only stage=${state.stage.name.lowercase()} strict=false")
+        state.metadata?.let { metadata ->
+            add(
+                "importMetadata=${metadata.width}x${metadata.height} durationSec=${metadata.durationSeconds.format(2)} " +
+                    "ptsMonotonic=${metadata.hasMonotonicPresentationTimestamps}",
+            )
+        }
+        state.frames?.let { frames ->
+            add("importFrames=${frames.frames.size} timing=${state.timing?.basis ?: "pending"}")
+        }
+        state.timing?.let { timing ->
+            add("importTiming=${timing.basis} confidence=${timing.confidence} assumptions=${timing.assumptions.size}")
+        }
+        state.outcome?.let { outcome ->
+            add("importResult=estimate-only")
+            addAll(measurementResultUiLines(MeasurementResultUiState.EstimateOutcome(outcome)))
+        }
+        if (state.stage == ImportWorkflowStage.NO_READ && state.outcome == null) {
+            add("importNoRead=${state.noReadReason ?: "UNKNOWN"} message=${state.message?.compactForImportLine() ?: "No imported estimate."}")
+        }
+    }
+
+fun savedResultHistoryUiLines(summaries: List<SavedResultSummary>): List<String> =
+    buildList {
+        add("savedResults=${summaries.size}")
+        summaries.take(MAX_VISIBLE_SAVED_RESULTS).forEach { summary ->
+            val outcome = if (summary.noReadReason == null) "success" else "no-read"
+            val value = summary.speedMilesPerHour?.let { " speedMph=${it.format(1)}" }.orEmpty()
+            add(
+                "savedResult id=${summary.id.compactForImportLine()} source=${summary.sourceKind} outcome=$outcome" +
+                    " timing=${summary.evidence.timingBasis} frames=${summary.evidence.frameCount}" +
+                    " detections=${summary.evidence.detectionCount}$value",
+            )
+        }
+    }
+
+fun exportEvidenceUiLines(exportEvidenceText: String?): List<String> =
+    exportEvidenceText
+        ?.lines()
+        ?.filter { it.isNotBlank() }
+        ?.take(MAX_VISIBLE_EXPORT_LINES)
+        ?.map { "exportEvidence ${it.compactForImportLine()}" }
+        ?: emptyList()
+
+fun phase14WorkflowUiLines(state: Phase14WorkflowState): List<String> {
+    val setup = when (state.setupMode) {
+        Phase14SetupMode.KnownDistance -> {
+            val ready = state.calibrationPointA != null &&
+                state.calibrationPointB != null &&
+                state.knownDistanceFeet?.let { it.isFinite() && it > 0.0 } == true
+            if (ready) {
+                "setup=known-distance status=ready"
+            } else {
+                "setup=known-distance status=not-ready action=set-two-points-and-known-length"
+            }
+        }
+        Phase14SetupMode.BallDiameterFallback -> {
+            val ready = state.knownBallDiameterFeet?.let { it.isFinite() && it > 0.0 } == true
+            if (ready) {
+                "setup=ball-diameter-fallback status=ready assumption=entered-ball-type-and-motion-blur-bias"
+            } else {
+                "setup=ball-diameter-fallback status=not-ready action=enter-ball-diameter assumption=secondary-fallback"
+            }
+        }
+    }
+    val color = if (state.colorSample != null && state.colorSamplePoint != null && state.regionOfInterest != null) {
+        "phase14Color=ready roi=normalized"
+    } else {
+        "phase14Color=not-ready action=sample-color-and-set-roi"
+    }
+    val source = if (state.permissionReady && state.geometry != null) {
+        "phase14Source=ready readback=${state.geometry.readback.width}x${state.geometry.readback.height}"
+    } else {
+        "phase14Source=not-ready action=grant-permission-and-load-mode"
+    }
+    val level = state.levelReference?.let {
+        "phase14Level=ready rollDeg=${it.rollDegrees.format(1)} source=${it.source} samples=${it.sampleCount}"
+    } ?: "phase14Level=not-ready action=capture-still-phone-level"
+    val capture = when (state.capture) {
+        Phase14CaptureState.Idle -> "phase14Capture=idle canArm=${state.canArm()}"
+        Phase14CaptureState.NotReady -> "phase14Capture=not-ready canArm=false"
+        Phase14CaptureState.Armed -> "phase14Capture=armed"
+        Phase14CaptureState.Running -> "phase14Capture=running"
+        Phase14CaptureState.Complete -> "phase14Capture=complete"
+    }
+    val result = state.result?.let(::visualEstimateOutcomeUiLines).orEmpty()
+    return listOf(setup, color, source, level, capture) + result
+}
 
 private fun sourceProofUiLine(sourceProof: WorkflowSourceProofState): List<String> =
     when (sourceProof) {
@@ -248,3 +375,10 @@ private fun Double?.formatOrNa(): String =
 
 private fun Double.format(decimals: Int): String =
     "%.${decimals}f".format(this)
+
+private fun String.compactForImportLine(): String =
+    trim().replace(Regex("\\s+"), " ").take(MAX_IMPORT_LINE_CHARS)
+
+private const val MAX_VISIBLE_SAVED_RESULTS = 5
+private const val MAX_VISIBLE_EXPORT_LINES = 12
+private const val MAX_IMPORT_LINE_CHARS = 160

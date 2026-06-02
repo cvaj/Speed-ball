@@ -5,16 +5,23 @@ Run this on every code change before review and before commit.
 ## Secrets And Local Files
 
 - [ ] No `.env`, `local.properties`, keystores, API keys, tokens, credentials, APKs, AABs, or private videos are committed.
-- [ ] Logs do not expose private media paths except in developer-only diagnostics.
-- [ ] Imported files are accessed through validated Android URI/content APIs.
+- [ ] Logs do not expose private media paths except redacted display names in developer-only diagnostics.
+- [ ] User-selected imported files are accessed through validated Android URI/content APIs.
+- [ ] App-owned recorded clips stay app-private and saved/exported evidence does not store raw file paths.
+- [ ] App-owned recorded clips are deleted after estimate processing or no-read completion.
 
 ## Camera And Permissions
 
 - [ ] Camera permission is requested only when needed and denied gracefully.
+- [ ] Microphone permission is requested only for the hands-free voice trigger and denied gracefully.
+- [ ] IMU level capture stores only a bounded still-phone snapshot, not raw sensor streams.
 - [ ] Capture does not continue after lifecycle stop/pause without explicit intent.
 - [ ] Burst duration and high-speed duty cycle are bounded.
+- [ ] Fast-shutter Camera2 control is best-effort and falls back without extending capture duration.
 - [ ] CameraDevice disconnect/error callbacks release all owned resources and
       complete with typed failure.
+- [ ] The live setup feed releases its CameraDevice before recording/proof
+      paths take ownership and on pause/stop/destroy.
 
 ## Input Validation
 
@@ -110,3 +117,61 @@ Run this on every code change before review and before commit.
   rather than being filtered into a passing subset.
 - Camera/session/GL/recorder release steps are timed and logged by bounded step
   name so teardown blockers can be diagnosed without leaking file paths.
+
+## Phase 14 Notes
+
+- Phase 14 estimate setup remains in-memory reducer state. Normalized
+  calibration points, color sample points, ROI, fallback ball diameter, and the
+  single IMU level snapshot are not persisted or exported.
+- Phase 16 calibration overlay controls write only normalized reducer state for
+  vertical A/B caliper line positions, the user-entered distance in feet, the
+  color point, sampled HSV value, and ROI movement. The overlay does not store
+  preview screenshots, raw pixels, media identifiers, or device paths.
+- The live camera overlay separates camera-use actions from application
+  settings. The translucent bottom drawer writes only transient setup/capture
+  state; permission, mode, distance, manual level, import, fallback, and
+  recorder diagnostics live on the setup drawer page and still do not persist
+  raw media, paths, endpoints, or device identifiers. Hiding the drawer leaves
+  calibration gestures active without exposing additional data.
+- Live color sampling copies only a small bounded patch from the setup feed,
+  averages it immediately to HSV, recycles the bitmap, and leaves color
+  not-ready if `PixelCopy` fails or the feed is unavailable. A failed sample
+  must not silently fall back to a hidden default color.
+- Level capture prefers `TYPE_GRAVITY`, falls back to accelerometer, uses
+  gyroscope movement to reject a bumped phone, and stores only roll/pitch,
+  source, sample count, and capture time.
+- Level-corrected launch angle remains disclosed as provisional until
+  `S10_IMU_LEVEL_SIGN_VALIDATION_PENDING` physically verifies the correction
+  sign. Estimates without level must disclose that angle is not tilt-corrected.
+- Geometry changes clear known-distance calibration, color/ROI setup, and level
+  before capture can arm, so stale setup cannot silently produce a plausible
+  speed.
+- Known-ball-diameter setup is labeled as a secondary estimate fallback and must
+  disclose ball-type and motion-blur scale assumptions during setup.
+- Estimate no-read UI remains value-free. Mph, angle, trajectory, carry, apex,
+  and hang time are displayed only by `VisualEstimateOutcome.Success`.
+- Detector/setup diagnostics must stay bounded and must not log raw pixels,
+  private paths, device IPs, pairing ports, media files, APKs, keystores, or
+  credentials.
+- `scripts/security-check.sh` uses `scripts/secret-text.patterns` to reject
+  repo-local wireless-debugging endpoints and pairing codes in tracked or
+  nonignored untracked files.
+
+## Phase 15 Notes
+
+- Imported media must enter through Android's user-selected content URI picker;
+  raw filesystem paths and unsupported schemes are rejected.
+- The app does not persist imported content URIs in saved summaries or exports.
+  Phase 15 takes no long-lived URI grant in the production import flow; grant
+  lifecycle logic still releases retained grants on result/session deletion.
+- Imported frame extraction is bounded by frame count, dimensions, and total
+  pixels; the Android frame source releases retriever/extractor resources on
+  success and no-read paths.
+- Imported clips are estimate-only. Clean monotonic container PTS is not strict
+  timing proof, and import code must not construct
+  `MeasurementRunOutcome.Success`.
+- Saved summaries and export text contain redacted evidence only: source kind,
+  timing basis, frame/detection counts, assumptions, optional estimate speed for
+  successful estimates, and no-read reason. They must not contain raw pixels,
+  raw video, private paths, content URIs, ADB endpoints, pairing codes, APKs,
+  keystores, or credentials.

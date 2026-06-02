@@ -11,13 +11,20 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
+import android.media.Image
+import android.media.ImageReader
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
+import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLES30
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -34,6 +41,36 @@ data class DirectAtomicFrameProof(
     val frame: DirectFrameProof,
 )
 
+/** Bounded app-owned ARGB frame read from a direct live `SurfaceTexture` frame. */
+data class DirectArgbFrame(
+    val width: Int,
+    val height: Int,
+    val timestampNanos: Long,
+    val argbPixels: IntArray,
+) {
+    init {
+        require(width > 0 && height > 0) { "Direct ARGB frame dimensions must be positive." }
+        require(timestampNanos > 0L) { "Direct ARGB frame timestamp must be positive." }
+        require(argbPixels.size == width * height) { "Direct ARGB pixel count must match dimensions." }
+    }
+
+    override fun equals(other: Any?): Boolean =
+        this === other ||
+            other is DirectArgbFrame &&
+            width == other.width &&
+            height == other.height &&
+            timestampNanos == other.timestampNanos &&
+            argbPixels.contentEquals(other.argbPixels)
+
+    override fun hashCode(): Int {
+        var result = width
+        result = 31 * result + height
+        result = 31 * result + timestampNanos.hashCode()
+        result = 31 * result + argbPixels.contentHashCode()
+        return result
+    }
+}
+
 /** Camera2 owner for the companion-encoder direct timing proof session. */
 class DirectCompanionTimingProofCapture(private val context: Context) {
     private val lock = Any()
@@ -42,17 +79,20 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
     private var cameraDevice: CameraDevice? = null
-    private var session: CameraConstrainedHighSpeedCaptureSession? = null
+    private var session: CameraCaptureSession? = null
     private var glResources: DirectGlReadbackResources? = null
+    private var imageReader: ImageReader? = null
     private var companionScratch: CompanionEncoderScratch? = null
     private var collector: DirectFrameProofCollector? = null
     private var sensorTimestamps = mutableListOf<Long>()
     private var captureCallbackCount = AtomicInteger(0)
     private var frameAvailableCallbackCount = AtomicInteger(0)
+    private var imageAcquireNullCount = AtomicInteger(0)
     private var readbackElapsedMillis = mutableListOf<Double>()
     private var requestListSize = 0
     private var completion: ((DirectSessionProbeOutcome) -> Unit)? = null
     private var options: BurstOptions? = null
+    private var activeVariant: DirectProofVariant = companionGlBaselineVariant()
 
     fun currentState(): BurstRecorderState = synchronized(lock) { state }
 
@@ -60,16 +100,20 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
     fun start(
         options: BurstOptions,
         availableModes: List<HighSpeedMode>,
+        variant: DirectProofVariant = companionGlBaselineVariant(),
         onComplete: (DirectSessionProbeOutcome) -> Unit,
     ): DirectSessionProbeOutcome.Failure? {
         synchronized(lock) {
             validateDirectProofStart(options.mode, availableModes, state)?.let { return it }
+            validateDirectProofVariant(variant)?.let { return it }
             state = BurstRecorderState.Opening
             this.options = options.copy(durationMillis = clampBurstDurationMillis(options.durationMillis))
+            activeVariant = variant
             completion = onComplete
             sensorTimestamps = mutableListOf()
             captureCallbackCount = AtomicInteger(0)
             frameAvailableCallbackCount = AtomicInteger(0)
+            imageAcquireNullCount = AtomicInteger(0)
             readbackElapsedMillis = mutableListOf()
             requestListSize = 0
             collector = DirectFrameProofCollector(
@@ -92,14 +136,20 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         }
 
         val safeOptions = this.options ?: options
-        val scratch = prepareCompanionEncoderScratch(context, safeOptions.mode, safeOptions.durationMillis)
-        if (scratch == null) {
+        val scratch = if (variant.requiresCompanionScratch) {
+            prepareCompanionEncoderScratch(context, safeOptions.mode, safeOptions.durationMillis)
+        } else {
+            null
+        }
+        if (variant.requiresCompanionScratch && scratch == null) {
             val failure = directFailure(DirectTimingSourceFailure.COMPANION_RECORDER_SETUP_FAILED, "Unable to prepare companion encoder scratch recorder.")
             finishSynchronously(failure)
             return failure
         }
         companionScratch = scratch
-        Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_SCRATCH_PREPARED mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()}")
+        if (scratch != null) {
+            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_SCRATCH_PREPARED mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id}")
+        }
 
         val thread = HandlerThread("speed-ball-direct-proof").also { it.start() }
         val backgroundHandler = Handler(thread.looper)
@@ -107,20 +157,40 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         handler = backgroundHandler
         backgroundHandler.post {
             if (!shouldHandleDirectFrame(currentState())) return@post
-            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_GL_SETUP_START mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()}")
-            val resources = createDirectGlResources(safeOptions.mode, backgroundHandler)
-            if (resources == null) {
-                Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_GL_SETUP_FAILED mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()}")
-                complete(directFailure(DirectTimingSourceFailure.PIXEL_READBACK_FAILED, "Unable to create direct GL readback resources."))
-                return@post
+            when (variant.consumerModel) {
+                DirectProofConsumerModel.SINGLE_SURFACE_TEXTURE,
+                DirectProofConsumerModel.PBO_GL_READBACK,
+                -> {
+                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_GL_SETUP_START mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id}")
+                    val resources = createDirectGlResources(safeOptions.mode, backgroundHandler, variant)
+                    if (resources == null) {
+                        Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_GL_SETUP_FAILED mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id}")
+                        complete(directFailure(DirectTimingSourceFailure.PIXEL_READBACK_FAILED, "Unable to create direct GL readback resources."))
+                        return@post
+                    }
+                    if (!shouldHandleDirectFrame(currentState())) {
+                        runCatching { resources.release() }
+                        return@post
+                    }
+                    glResources = resources
+                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_GL_SETUP_READY mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id}")
+                    openCamera(cameraId, safeOptions.mode, backgroundHandler, variant, scratch?.surface, resources.surface, null)
+                }
+
+                DirectProofConsumerModel.CONSTRAINED_IMAGE_READER,
+                DirectProofConsumerModel.CONSTRAINED_PRIVATE_IMAGE_READER,
+                DirectProofConsumerModel.STANDARD_IMAGE_READER,
+                -> {
+                    val reader = createDirectImageReader(safeOptions.mode, variant, backgroundHandler)
+                    if (reader == null) {
+                        complete(directFailure(DirectTimingSourceFailure.PIXEL_READBACK_FAILED, "Unable to create direct ImageReader resources."))
+                        return@post
+                    }
+                    imageReader = reader
+                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_IMAGE_READER_READY mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id} maxImages=${variant.imageReaderMaxImages}")
+                    openCamera(cameraId, safeOptions.mode, backgroundHandler, variant, scratch?.surface, null, reader.surface)
+                }
             }
-            if (!shouldHandleDirectFrame(currentState())) {
-                runCatching { resources.release() }
-                return@post
-            }
-            glResources = resources
-            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_GL_SETUP_READY mode=${safeOptions.mode.label.sanitizedDirectCaptureLogToken()}")
-            openCamera(cameraId, safeOptions.mode, backgroundHandler, scratch.surface, resources.surface)
         }
         return null
     }
@@ -135,8 +205,10 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         cameraId: String,
         mode: HighSpeedMode,
         backgroundHandler: Handler,
-        companionSurface: Surface,
-        directSurface: Surface,
+        variant: DirectProofVariant,
+        companionSurface: Surface?,
+        directSurface: Surface?,
+        imageReaderSurface: Surface?,
     ) {
         if (!shouldHandleDirectFrame(currentState())) return
         val manager = context.getSystemService(CameraManager::class.java)
@@ -152,7 +224,7 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
                     override fun onOpened(device: CameraDevice) {
                         Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_CAMERA_OPENED mode=${mode.label.sanitizedDirectCaptureLogToken()}")
                         cameraDevice = device
-                        configureSession(device, mode, backgroundHandler, companionSurface, directSurface)
+                        configureSession(device, mode, backgroundHandler, variant, companionSurface, directSurface, imageReaderSurface)
                     }
 
                     override fun onDisconnected(device: CameraDevice) {
@@ -176,101 +248,183 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         device: CameraDevice,
         mode: HighSpeedMode,
         backgroundHandler: Handler,
-        companionSurface: Surface,
-        directSurface: Surface,
+        variant: DirectProofVariant,
+        companionSurface: Surface?,
+        directSurface: Surface?,
+        imageReaderSurface: Surface?,
     ) {
         synchronized(lock) { state = BurstRecorderState.Configuring }
         try {
-            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_CONFIGURE_START mode=${mode.label.sanitizedDirectCaptureLogToken()} surfaces=companion,direct")
-            device.createConstrainedHighSpeedCaptureSession(
-                listOf(companionSurface, directSurface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
-                        Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_CONFIGURED mode=${mode.label.sanitizedDirectCaptureLogToken()}")
-                        val highSpeedSession = cameraCaptureSession as CameraConstrainedHighSpeedCaptureSession
-                        session = highSpeedSession
-                        startRepeatingDirect(device, highSpeedSession, mode, backgroundHandler, companionSurface, directSurface)
+            val surfaces = buildDirectVariantSurfaceList(variant, companionSurface, directSurface, imageReaderSurface)
+            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_CONFIGURE_START mode=${mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id} surfaces=${variant.surfaceOrder.joinToString(separator = ",")}")
+            val callback = object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
+                    Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_CONFIGURED mode=${mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id}")
+                    session = cameraCaptureSession
+                    if (variant.constrainedHighSpeed) {
+                        startRepeatingHighSpeedDirect(
+                            device = device,
+                            highSpeedSession = cameraCaptureSession as CameraConstrainedHighSpeedCaptureSession,
+                            mode = mode,
+                            backgroundHandler = backgroundHandler,
+                            variant = variant,
+                            surfaces = surfaces,
+                        )
+                    } else {
+                        startRepeatingStandardDirect(
+                            device = device,
+                            cameraCaptureSession = cameraCaptureSession,
+                            mode = mode,
+                            backgroundHandler = backgroundHandler,
+                            variant = variant,
+                            surfaces = surfaces,
+                        )
                     }
+                }
 
-                    override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) {
-                        complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct companion high-speed session configuration failed."))
-                    }
-                },
-                backgroundHandler,
-            )
+                override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) {
+                    complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct session configuration failed for ${variant.id}."))
+                }
+            }
+            if (variant.constrainedHighSpeed) {
+                device.createConstrainedHighSpeedCaptureSession(surfaces, callback, backgroundHandler)
+            } else {
+                device.createCaptureSession(surfaces, callback, backgroundHandler)
+            }
         } catch (exception: Exception) {
-            complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct companion high-speed session failed: ${exception.message ?: exception.javaClass.simpleName}."))
+            complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct session failed for ${variant.id}: ${exception.message ?: exception.javaClass.simpleName}."))
         }
     }
 
-    private fun startRepeatingDirect(
+    private fun startRepeatingHighSpeedDirect(
         device: CameraDevice,
         highSpeedSession: CameraConstrainedHighSpeedCaptureSession,
         mode: HighSpeedMode,
         backgroundHandler: Handler,
-        companionSurface: Surface,
-        directSurface: Surface,
+        variant: DirectProofVariant,
+        surfaces: List<Surface>,
     ) {
         try {
             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                addTarget(companionSurface)
-                addTarget(directSurface)
+                surfaces.forEach(::addTarget)
                 set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(mode.aeTargetFpsLower, mode.aeTargetFpsUpper))
             }
             val burst = highSpeedSession.createHighSpeedRequestList(request.build())
             requestListSize = burst.size
-            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_HIGH_SPEED_REQUEST_LIST mode=${mode.label.sanitizedDirectCaptureLogToken()} requests=${burst.size}")
+            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_HIGH_SPEED_REQUEST_LIST mode=${mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id} requests=${burst.size}")
             companionScratch?.start()
-            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult,
-                ) {
-                    captureCallbackCount.incrementAndGet()
-                    result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { timestamp ->
-                        synchronized(lock) { sensorTimestamps.add(timestamp) }
-                    }
-                }
-            }
-            highSpeedSession.setRepeatingBurst(burst, captureCallback, backgroundHandler)
+            highSpeedSession.setRepeatingBurst(burst, directCaptureCallback(), backgroundHandler)
             synchronized(lock) { state = BurstRecorderState.Recording }
             backgroundHandler.postDelayed({ complete(null) }, options?.durationMillis ?: DEFAULT_BURST_DURATION_MILLIS)
         } catch (exception: Exception) {
-            complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct repeating request failed: ${exception.message ?: exception.javaClass.simpleName}."))
+            complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct repeating request failed for ${variant.id}: ${exception.message ?: exception.javaClass.simpleName}."))
         }
     }
+
+    private fun startRepeatingStandardDirect(
+        device: CameraDevice,
+        cameraCaptureSession: CameraCaptureSession,
+        mode: HighSpeedMode,
+        backgroundHandler: Handler,
+        variant: DirectProofVariant,
+        surfaces: List<Surface>,
+    ) {
+        try {
+            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                surfaces.forEach(::addTarget)
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(mode.aeTargetFpsLower, mode.aeTargetFpsUpper))
+            }.build()
+            requestListSize = 1
+            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_STANDARD_REQUEST mode=${mode.label.sanitizedDirectCaptureLogToken()} variant=${variant.id} requests=1")
+            val captureCallback = directCaptureCallback()
+            cameraCaptureSession.setRepeatingRequest(request, captureCallback, backgroundHandler)
+            synchronized(lock) { state = BurstRecorderState.Recording }
+            backgroundHandler.postDelayed({ complete(null) }, options?.durationMillis ?: DEFAULT_BURST_DURATION_MILLIS)
+        } catch (exception: Exception) {
+            complete(directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct standard request failed for ${variant.id}: ${exception.message ?: exception.javaClass.simpleName}."))
+        }
+    }
+
+    private fun directCaptureCallback(): CameraCaptureSession.CaptureCallback =
+        object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult,
+            ) {
+                captureCallbackCount.incrementAndGet()
+                result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { timestamp ->
+                    synchronized(lock) { sensorTimestamps.add(timestamp) }
+                }
+            }
+        }
 
     private fun onFrameAvailable() {
         frameAvailableCallbackCount.incrementAndGet()
         val resources = glResources ?: return
-        val currentCollector = collector ?: return
         if (!shouldHandleDirectFrame(currentState())) return
         runCatching {
             val readbackStart = System.nanoTime()
-            val signature = resources.updateAndReadSignature()
+            val signatures = resources.updateAndReadSignatures()
             val readbackMillis = elapsedMillis(readbackStart)
-            synchronized(lock) { readbackElapsedMillis.add(readbackMillis) }
-            val failure = currentCollector.appendAtomicFrame(
-                state = currentState(),
-                frameIndex = currentCollector.snapshot().size,
-                timestampNanos = signature.timestampNanos,
-                width = signature.frameWidth,
-                height = signature.frameHeight,
-                signature = signature,
-            )
-            if (failure != null) {
-                complete(directFailure(failure, "Direct frame proof callback failed with $failure."))
-            }
-            val frameCount = currentCollector.snapshot().size
-            if (frameCount == 1 || frameCount % 30 == 0) {
-                Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_FRAME_READBACK count=$frameCount timestamp=${signature.timestampNanos} readbackMs=${readbackMillis.formatMillisForDirectLog()} frameCallbacks=${frameAvailableCallbackCount.get()} captureCallbacks=${captureCallbackCount.get()}")
-            }
-            if (frameCount >= DIRECT_TARGET_PROOF_FRAMES) {
-                complete(null)
+            signatures.forEach { signature ->
+                appendDirectSignature(signature, readbackMillis, source = resources.readbackSourceLabel)
             }
         }.onFailure {
             complete(directFailure(DirectTimingSourceFailure.PIXEL_READBACK_FAILED, "Direct frame readback failed: ${it.message ?: it.javaClass.simpleName}."))
+        }
+    }
+
+    private fun onImageAvailable(reader: ImageReader) {
+        frameAvailableCallbackCount.incrementAndGet()
+        if (!shouldHandleDirectFrame(currentState())) return
+        val image = runCatching { reader.acquireNextImage() }.getOrNull()
+        if (image == null) {
+            imageAcquireNullCount.incrementAndGet()
+            return
+        }
+        val readbackStart = System.nanoTime()
+        when (
+            val outcome = buildDirectImageReaderPixelProofSignature(
+                snapshot = AndroidImageReaderSnapshot(image),
+                tileLeft = 0,
+                tileTop = 0,
+                tileWidth = DIRECT_READBACK_WIDTH,
+                tileHeight = DIRECT_READBACK_HEIGHT,
+            )
+        ) {
+            is DirectImageReaderPixelProofOutcome.Success ->
+                appendDirectSignature(outcome.signature, elapsedMillis(readbackStart), source = "ImageReader")
+
+            is DirectImageReaderPixelProofOutcome.Failure ->
+                complete(directFailure(outcome.reason, outcome.message))
+        }
+    }
+
+    private fun appendDirectSignature(
+        signature: DirectPixelProofSignature,
+        readbackMillis: Double,
+        source: String,
+    ) {
+        val currentCollector = collector ?: return
+        synchronized(lock) { readbackElapsedMillis.add(readbackMillis) }
+        val failure = currentCollector.appendAtomicFrame(
+            state = currentState(),
+            frameIndex = currentCollector.snapshot().size,
+            timestampNanos = signature.timestampNanos,
+            width = signature.frameWidth,
+            height = signature.frameHeight,
+            signature = signature,
+        )
+        if (failure != null) {
+            complete(directFailure(failure, "Direct frame proof callback failed with $failure."))
+        }
+        val frameCount = currentCollector.snapshot().size
+        if (frameCount == 1 || frameCount % 30 == 0) {
+            Log.i(DIRECT_CAPTURE_LOG_TAG, "DIRECT_CAPTURE_FRAME_READBACK source=$source count=$frameCount timestamp=${signature.timestampNanos} readbackMs=${readbackMillis.formatMillisForDirectLog()} frameCallbacks=${frameAvailableCallbackCount.get()} captureCallbacks=${captureCallbackCount.get()}")
+        }
+        if (frameCount >= DIRECT_TARGET_PROOF_FRAMES) {
+            complete(null)
         }
     }
 
@@ -321,7 +475,7 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         val safeOptions = options ?: return directFailure(DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED, "Direct proof options were lost before completion.")
         val frameProofs = collector?.snapshot().orEmpty().map { it.frame }
         val sensorCopy = synchronized(lock) { sensorTimestamps.toList() }
-        val captureDiagnostics = buildCaptureDiagnostics(releaseResult, frameProofs.size)
+        val captureDiagnostics = buildCaptureDiagnostics(releaseResult, frameProofs.size, sensorCopy)
         if (releaseResult.failure != null) {
             return directFailure(
                 reason = releaseResult.failure,
@@ -336,14 +490,14 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         if (frameProofs.isEmpty()) {
             return directFailure(
                 reason = DirectTimingSourceFailure.MISSING_DIRECT_TIMESTAMPS,
-                message = "No direct SurfaceTexture frames were consumed.",
+                message = "No direct source frames were consumed.",
                 sensorTimestampCount = sensorCopy.size,
                 scratchCleanupStatus = releaseResult.scratchCleanupStatus,
                 captureDiagnostics = captureDiagnostics,
             )
         }
         return DirectSessionProbeOutcome.Success(
-            shape = DirectProofSessionShape.COMPANION_ENCODER,
+            shape = activeVariant.sessionShape,
             requestListSize = requestListSize.coerceAtLeast(1),
             sensorTimestampsNanos = sensorCopy,
             frames = frameProofs,
@@ -366,6 +520,7 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
                 },
                 releaseGl = {
                     glResources?.release()
+                    imageReader?.close()
                 },
                 releaseCompanion = {
                     companionScratch?.releaseAndDelete()
@@ -383,6 +538,7 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
         session = null
         cameraDevice = null
         glResources = null
+        imageReader = null
         companionScratch = null
         handler = null
         handlerThread = null
@@ -404,37 +560,222 @@ class DirectCompanionTimingProofCapture(private val context: Context) {
             sensorTimestampCount = sensorTimestampCount.coerceAtLeast(sensorCopy.size),
             pixelProofCount = pixelProofCount.coerceAtLeast(frameProofs.size),
             scratchCleanupStatus = releaseResult.scratchCleanupStatus,
-            captureDiagnostics = buildCaptureDiagnostics(releaseResult, frameProofs.size),
+            captureDiagnostics = buildCaptureDiagnostics(releaseResult, frameProofs.size, sensorCopy),
         )
     }
 
     private fun buildCaptureDiagnostics(
         releaseResult: DirectReleaseResourcesResult,
         appendedFrameCount: Int,
+        sensorTimestampsNanos: List<Long>,
     ): DirectCaptureDiagnostics {
         val readbacks = synchronized(lock) { readbackElapsedMillis.toList() }
+        val safeOptions = options
+        val producerGaps = sensorTimestampsNanos.orderedGapMillis()
+        val producerGate = if (safeOptions != null) {
+            evaluateProducerCadenceGate(
+                requestedFps = safeOptions.mode.fps,
+                medianGapMillis = producerGaps.medianOrNull(),
+                maximumGapMillis = producerGaps.maxOrNull(),
+            )
+        } else {
+            null
+        }
         return DirectCaptureDiagnostics(
+            variantId = activeVariant.id,
+            consumerModel = activeVariant.consumerModel,
+            surfaceOrder = activeVariant.surfaceOrder,
+            requestTemplate = activeVariant.requestTemplate,
+            directBufferWidth = safeOptions?.mode?.width,
+            directBufferHeight = safeOptions?.mode?.height,
+            requestListSize = requestListSize.takeIf { it > 0 },
             frameAvailableCallbackCount = frameAvailableCallbackCount.get(),
             captureResultCallbackCount = captureCallbackCount.get(),
             appendedDirectFrameCount = appendedFrameCount,
             readbackCount = readbacks.size,
             medianReadbackMillis = readbacks.medianOrNull(),
             maximumReadbackMillis = readbacks.maxOrNull(),
+            producerMedianGapMillis = producerGate?.medianGapMillis,
+            producerMaximumGapMillis = producerGate?.maximumGapMillis,
+            producerInRequestedFpsBand = producerGate?.inRequestedFpsBand,
+            consumerRatioInterpretable = producerGate?.let { canInterpretConsumerRatio(activeVariant, it) },
+            imageAcquireNullCount = imageAcquireNullCount.get(),
             releaseStepTimings = releaseResult.stepTimings,
         )
     }
 
-    private fun createDirectGlResources(mode: HighSpeedMode, handler: Handler): DirectGlReadbackResources? =
+    private fun createDirectGlResources(
+        mode: HighSpeedMode,
+        handler: Handler,
+        variant: DirectProofVariant,
+    ): DirectGlReadbackResources? =
         runCatching {
             DirectGlReadbackResources.create(
                 frameWidth = mode.width,
                 frameHeight = mode.height,
                 readbackWidth = DIRECT_READBACK_WIDTH,
                 readbackHeight = DIRECT_READBACK_HEIGHT,
+                readbackMode = directGlReadbackModeFor(variant),
             ) {
                 handler.post { onFrameAvailable() }
             }
         }.getOrNull()
+
+    @Suppress("NewApi")
+    private fun createDirectImageReader(
+        mode: HighSpeedMode,
+        variant: DirectProofVariant,
+        handler: Handler,
+    ): ImageReader? =
+        runCatching {
+            val maxImages = variant.imageReaderMaxImages ?: DEFAULT_IMAGE_READER_MAX_IMAGES
+            val reader = when (variant.consumerModel) {
+                DirectProofConsumerModel.CONSTRAINED_PRIVATE_IMAGE_READER -> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        error("PRIVATE ImageReader usage flags require Android 10 or newer.")
+                    }
+                    ImageReader.newInstance(
+                        mode.width,
+                        mode.height,
+                        ImageFormat.PRIVATE,
+                        maxImages,
+                        HardwareBuffer.USAGE_VIDEO_ENCODE,
+                    )
+                }
+
+                DirectProofConsumerModel.CONSTRAINED_IMAGE_READER,
+                DirectProofConsumerModel.STANDARD_IMAGE_READER,
+                -> ImageReader.newInstance(
+                    mode.width,
+                    mode.height,
+                    ImageFormat.YUV_420_888,
+                    maxImages,
+                )
+
+                DirectProofConsumerModel.SINGLE_SURFACE_TEXTURE,
+                DirectProofConsumerModel.PBO_GL_READBACK,
+                -> error("Variant ${variant.id} does not use an ImageReader surface.")
+            }
+            reader.also { it.setOnImageAvailableListener({ onImageAvailable(it) }, handler) }
+        }.getOrNull()
+
+    private fun directFailure(
+        reason: DirectTimingSourceFailure,
+        message: String,
+        requestListSize: Int = 0,
+        directTimestampCount: Int = 0,
+        sensorTimestampCount: Int = 0,
+        pixelProofCount: Int = 0,
+        scratchCleanupStatus: CompanionScratchCleanupStatus = CompanionScratchCleanupStatus.ALREADY_ABSENT,
+        captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(
+            variantId = activeVariant.id,
+            consumerModel = activeVariant.consumerModel,
+            surfaceOrder = activeVariant.surfaceOrder,
+            requestTemplate = activeVariant.requestTemplate,
+        ),
+    ): DirectSessionProbeOutcome.Failure =
+        com.speedball.app.capture.directFailure(
+            reason = reason,
+            message = message,
+            shape = activeVariant.sessionShape,
+            requestListSize = requestListSize,
+            directTimestampCount = directTimestampCount,
+            sensorTimestampCount = sensorTimestampCount,
+            pixelProofCount = pixelProofCount,
+            scratchCleanupStatus = scratchCleanupStatus,
+            captureDiagnostics = captureDiagnostics,
+        )
+}
+
+internal fun validateDirectProofVariant(variant: DirectProofVariant): DirectSessionProbeOutcome.Failure? =
+    if (variant.surfaceOrder.any { it == DirectProofSurfaceRole.IMAGE_READER } && variant.imageReaderMaxImages == null) {
+        DirectSessionProbeOutcome.Failure(
+            shape = variant.sessionShape,
+            reason = DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED,
+            message = "ImageReader variant ${variant.id} requires maxImages evidence.",
+            captureDiagnostics = DirectCaptureDiagnostics(
+                variantId = variant.id,
+                consumerModel = variant.consumerModel,
+                surfaceOrder = variant.surfaceOrder,
+                requestTemplate = variant.requestTemplate,
+            ),
+        )
+    } else {
+        null
+    }
+
+internal fun buildDirectVariantSurfaceList(
+    variant: DirectProofVariant,
+    companionSurface: Surface?,
+    directSurface: Surface?,
+    imageReaderSurface: Surface?,
+): List<Surface> =
+    variant.surfaceOrder.map { role ->
+        when (role) {
+            DirectProofSurfaceRole.COMPANION_ENCODER ->
+                companionSurface ?: error("Variant ${variant.id} requires a companion encoder surface.")
+            DirectProofSurfaceRole.DIRECT_GL_READBACK ->
+                directSurface ?: error("Variant ${variant.id} requires a direct GL surface.")
+            DirectProofSurfaceRole.IMAGE_READER ->
+                imageReaderSurface ?: error("Variant ${variant.id} requires an ImageReader surface.")
+        }
+    }
+
+internal fun buildGlVariantSurfaceList(
+    variant: DirectProofVariant,
+    companionSurface: Surface?,
+    directSurface: Surface,
+): List<Surface> =
+    buildDirectVariantSurfaceList(variant, companionSurface, directSurface, null)
+
+internal fun buildGlVariantSurfaceRoles(variant: DirectProofVariant): List<DirectProofSurfaceRole> =
+    variant.surfaceOrder.onEach { role ->
+        require(role != DirectProofSurfaceRole.IMAGE_READER) {
+            "Variant ${variant.id} requires ImageReader surface wiring."
+        }
+    }
+
+private class AndroidImageReaderSnapshot(
+    private val image: Image,
+) : DirectImageReaderSnapshot {
+    override val timestampNanos: Long
+        get() = image.timestamp
+
+    override val width: Int
+        get() = image.width
+
+    override val height: Int
+        get() = image.height
+
+    override fun readArgbTile(
+        left: Int,
+        top: Int,
+        width: Int,
+        height: Int,
+    ): IntArray {
+        require(image.format == ImageFormat.YUV_420_888) { "Unsupported ImageReader format ${image.format}." }
+        require(left >= 0 && top >= 0 && width > 0 && height > 0) { "Tile bounds must be positive." }
+        require(left + width <= image.width && top + height <= image.height) { "Tile must fit in acquired image." }
+        val yPlane = image.planes.firstOrNull() ?: error("ImageReader image had no Y plane.")
+        val rowStride = yPlane.rowStride
+        val pixelStride = yPlane.pixelStride
+        require(rowStride > 0 && pixelStride > 0) { "ImageReader Y plane strides must be positive." }
+        val buffer = yPlane.buffer.duplicate()
+        val argb = IntArray(width * height)
+        for (tileY in 0 until height) {
+            for (tileX in 0 until width) {
+                val sourceIndex = (top + tileY) * rowStride + (left + tileX) * pixelStride
+                require(sourceIndex < buffer.limit()) { "ImageReader Y plane stride exceeded buffer limit." }
+                val luma = buffer.get(sourceIndex).toInt() and 0xff
+                argb[tileY * width + tileX] = (0xff shl 24) or (luma shl 16) or (luma shl 8) or luma
+            }
+        }
+        return argb
+    }
+
+    override fun close() {
+        image.close()
+    }
 }
 
 /**
@@ -517,6 +858,7 @@ fun validateDirectProofStart(
 internal fun directFailure(
     reason: DirectTimingSourceFailure,
     message: String,
+    shape: DirectProofSessionShape = DirectProofSessionShape.COMPANION_ENCODER,
     requestListSize: Int = 0,
     directTimestampCount: Int = 0,
     sensorTimestampCount: Int = 0,
@@ -525,7 +867,7 @@ internal fun directFailure(
     captureDiagnostics: DirectCaptureDiagnostics = DirectCaptureDiagnostics(),
 ): DirectSessionProbeOutcome.Failure =
     DirectSessionProbeOutcome.Failure(
-        shape = DirectProofSessionShape.COMPANION_ENCODER,
+        shape = shape,
         reason = reason,
         message = message,
         requestListSize = requestListSize,
@@ -608,8 +950,29 @@ internal fun releaseDirectCaptureResourcesWithDiagnostics(actions: DirectRelease
 
 internal fun directTargetProofFrames(): Int = DIRECT_TARGET_PROOF_FRAMES
 
+internal enum class DirectGlReadbackMode {
+    INLINE_READ_PIXELS,
+    PBO_ASYNC_READBACK,
+}
+
+private data class PendingPboReadback(
+    val slot: Int,
+    val timestampNanos: Long,
+)
+
+internal fun directGlReadbackModeFor(variant: DirectProofVariant): DirectGlReadbackMode =
+    when (variant.consumerModel) {
+        DirectProofConsumerModel.PBO_GL_READBACK -> DirectGlReadbackMode.PBO_ASYNC_READBACK
+        DirectProofConsumerModel.SINGLE_SURFACE_TEXTURE -> DirectGlReadbackMode.INLINE_READ_PIXELS
+        DirectProofConsumerModel.CONSTRAINED_IMAGE_READER,
+        DirectProofConsumerModel.CONSTRAINED_PRIVATE_IMAGE_READER,
+        DirectProofConsumerModel.STANDARD_IMAGE_READER,
+        -> error("Variant ${variant.id} does not use a GL readback surface.")
+    }
+
 private const val DIRECT_READBACK_WIDTH = 2
 private const val DIRECT_READBACK_HEIGHT = 2
+private const val DEFAULT_IMAGE_READER_MAX_IMAGES = 3
 private const val MAX_DIRECT_PROOF_FRAMES = 360
 private const val DIRECT_TARGET_PROOF_FRAMES = MIN_DIRECT_PROOF_TOKEN_FRAMES * 2
 private const val DIRECT_CAPTURE_LOG_TAG = "SPEEDBALL_CAPTURE"
@@ -638,12 +1001,21 @@ private fun List<Double>.medianOrNull(): Double? {
     }
 }
 
+private fun List<Long>.orderedGapMillis(): List<Double> =
+    asSequence()
+        .filter { it > 0L }
+        .distinct()
+        .sorted()
+        .toList()
+        .zipWithNext { left, right -> (right - left).coerceAtLeast(0L) / 1_000_000.0 }
+
 /**
  * GL resources for direct same-`updateTexImage()` readback.
  *
- * `updateAndReadSignature()` calls `updateTexImage()` once, captures that
- * timestamp, renders the external OES texture into a small pbuffer, and reads a
- * bounded RGBA aggregate signature before any later frame consumption.
+ * Inline mode reads a bounded RGBA aggregate immediately after one
+ * `updateTexImage()` call. PBO mode issues an asynchronous pixel-pack read and
+ * maps the previous frame's PBO on the next callback so CPU readback is not
+ * serialized before the BufferQueue can advance.
  */
 internal class DirectGlReadbackResources private constructor(
     private val eglDisplay: EGLDisplay,
@@ -657,17 +1029,54 @@ internal class DirectGlReadbackResources private constructor(
     private val readbackHeight: Int,
     private val frameWidth: Int,
     private val frameHeight: Int,
+    private val readbackMode: DirectGlReadbackMode,
+    private val pboIds: IntArray,
     val surfaceTexture: SurfaceTexture,
     val surface: Surface,
 ) {
+    private var nextPboSlot = 0
+    private var pendingPbo: PendingPboReadback? = null
+    val readbackSourceLabel: String =
+        when (readbackMode) {
+            DirectGlReadbackMode.INLINE_READ_PIXELS -> "GL"
+            DirectGlReadbackMode.PBO_ASYNC_READBACK -> "PBO_GL"
+        }
+
     fun makeCurrent() {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
     }
 
-    fun updateAndReadSignature(): DirectPixelProofSignature {
+    fun updateAndReadSignatures(): List<DirectPixelProofSignature> {
+        makeCurrent()
+        val readySignature = if (readbackMode == DirectGlReadbackMode.PBO_ASYNC_READBACK) {
+            consumePendingPboFrame()?.toPixelProofSignature()
+        } else {
+            null
+        }
+        surfaceTexture.updateTexImage()
+        val timestamp = surfaceTexture.timestamp
+        drawCurrentFrame()
+        return when (readbackMode) {
+            DirectGlReadbackMode.INLINE_READ_PIXELS -> listOf(readInlineArgbFrame(timestamp).toPixelProofSignature())
+            DirectGlReadbackMode.PBO_ASYNC_READBACK -> {
+                issuePboReadback(timestamp)
+                listOfNotNull(readySignature)
+            }
+        }
+    }
+
+    fun updateAndReadArgbFrames(): List<DirectArgbFrame> {
+        check(readbackMode == DirectGlReadbackMode.INLINE_READ_PIXELS) {
+            "Direct ARGB estimate frames require inline readback."
+        }
         makeCurrent()
         surfaceTexture.updateTexImage()
         val timestamp = surfaceTexture.timestamp
+        drawCurrentFrame()
+        return listOf(readInlineArgbFrame(timestamp))
+    }
+
+    private fun drawCurrentFrame() {
         GLES20.glViewport(0, 0, readbackWidth, readbackHeight)
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -680,9 +1089,68 @@ internal class DirectGlReadbackResources private constructor(
         GLES20.glEnableVertexAttribArray(texCoordLocation)
         GLES20.glVertexAttribPointer(texCoordLocation, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun readInlineRgbaBuffer(): ByteBuffer {
         val buffer = ByteBuffer.allocateDirect(readbackWidth * readbackHeight * 4).order(ByteOrder.nativeOrder())
         GLES20.glReadPixels(0, 0, readbackWidth, readbackHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
         buffer.rewind()
+        return buffer
+    }
+
+    private fun issuePboReadback(timestamp: Long) {
+        val ids = pboIds
+        check(ids.isNotEmpty()) { "PBO readback resources are unavailable." }
+        val slot = nextPboSlot
+        val pboId = ids[slot]
+        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pboId)
+        GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER, readbackWidth * readbackHeight * 4, null, GLES30.GL_STREAM_READ)
+        GLES30.glReadPixels(0, 0, readbackWidth, readbackHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, 0)
+        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+        pendingPbo = PendingPboReadback(slot = slot, timestampNanos = timestamp)
+        nextPboSlot = (slot + 1) % ids.size
+    }
+
+    private fun consumePendingPboFrame(): DirectArgbFrame? {
+        val pending = pendingPbo ?: return null
+        val pboId = pboIds[pending.slot]
+        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pboId)
+        val mapped = GLES30.glMapBufferRange(
+            GLES30.GL_PIXEL_PACK_BUFFER,
+            0,
+            readbackWidth * readbackHeight * 4,
+            GLES30.GL_MAP_READ_BIT,
+        ) as? ByteBuffer ?: error("PBO readback map failed.")
+        val copy = ByteBuffer.allocateDirect(readbackWidth * readbackHeight * 4).order(ByteOrder.nativeOrder())
+        mapped.limit(readbackWidth * readbackHeight * 4)
+        mapped.position(0)
+        copy.put(mapped)
+        copy.rewind()
+        check(GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER)) { "PBO readback unmap failed." }
+        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+        pendingPbo = null
+        return buildFrameFromRgba(pending.timestampNanos, copy)
+    }
+
+    private fun readInlineArgbFrame(timestamp: Long): DirectArgbFrame =
+        buildFrameFromRgba(timestamp, readInlineRgbaBuffer())
+
+    private fun DirectArgbFrame.toPixelProofSignature(): DirectPixelProofSignature =
+        buildDirectPixelProofSignature(
+            timestampNanos = timestampNanos,
+            frameWidth = frameWidth,
+            frameHeight = frameHeight,
+            tileLeft = 0,
+            tileTop = 0,
+            tileWidth = width,
+            tileHeight = height,
+            argbPixels = argbPixels,
+        )
+
+    private fun buildFrameFromRgba(
+        timestamp: Long,
+        buffer: ByteBuffer,
+    ): DirectArgbFrame {
         val argb = IntArray(readbackWidth * readbackHeight)
         for (index in argb.indices) {
             val red = buffer.get().toInt() and 0xff
@@ -691,14 +1159,10 @@ internal class DirectGlReadbackResources private constructor(
             val alpha = buffer.get().toInt() and 0xff
             argb[index] = (alpha shl 24) or (red shl 16) or (green shl 8) or blue
         }
-        return buildDirectPixelProofSignature(
+        return DirectArgbFrame(
             timestampNanos = timestamp,
-            frameWidth = frameWidth,
-            frameHeight = frameHeight,
-            tileLeft = 0,
-            tileTop = 0,
-            tileWidth = readbackWidth,
-            tileHeight = readbackHeight,
+            width = readbackWidth,
+            height = readbackHeight,
             argbPixels = argb,
         )
     }
@@ -706,6 +1170,9 @@ internal class DirectGlReadbackResources private constructor(
     fun release() {
         runCatching { surface.release() }
         runCatching { surfaceTexture.release() }
+        if (pboIds.isNotEmpty()) {
+            runCatching { GLES30.glDeleteBuffers(pboIds.size, pboIds, 0) }
+        }
         runCatching { GLES20.glDeleteProgram(program) }
         runCatching { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) }
         runCatching { EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT) }
@@ -720,6 +1187,7 @@ internal class DirectGlReadbackResources private constructor(
             frameHeight: Int,
             readbackWidth: Int,
             readbackHeight: Int,
+            readbackMode: DirectGlReadbackMode,
             onFrameAvailable: () -> Unit,
         ): DirectGlReadbackResources {
             require(frameWidth > 0 && frameHeight > 0) { "Frame dimensions must be positive." }
@@ -731,7 +1199,11 @@ internal class DirectGlReadbackResources private constructor(
             val configCount = IntArray(1)
             val attributes = intArrayOf(
                 EGL14.EGL_RENDERABLE_TYPE,
-                EGL14.EGL_OPENGL_ES2_BIT,
+                if (readbackMode == DirectGlReadbackMode.PBO_ASYNC_READBACK) {
+                    EGLExt.EGL_OPENGL_ES3_BIT_KHR
+                } else {
+                    EGL14.EGL_OPENGL_ES2_BIT
+                },
                 EGL14.EGL_SURFACE_TYPE,
                 EGL14.EGL_PBUFFER_BIT,
                 EGL14.EGL_RED_SIZE,
@@ -750,7 +1222,11 @@ internal class DirectGlReadbackResources private constructor(
                 eglDisplay,
                 config,
                 EGL14.EGL_NO_CONTEXT,
-                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+                intArrayOf(
+                    EGL14.EGL_CONTEXT_CLIENT_VERSION,
+                    if (readbackMode == DirectGlReadbackMode.PBO_ASYNC_READBACK) 3 else 2,
+                    EGL14.EGL_NONE,
+                ),
                 0,
             )
             check(context != EGL14.EGL_NO_CONTEXT) { "EGL context creation failed." }
@@ -771,6 +1247,7 @@ internal class DirectGlReadbackResources private constructor(
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            val pboIds = createPboIds(readbackMode)
             val surfaceTexture = SurfaceTexture(textureId)
             surfaceTexture.setDefaultBufferSize(frameWidth, frameHeight)
             surfaceTexture.setOnFrameAvailableListener { onFrameAvailable() }
@@ -786,9 +1263,19 @@ internal class DirectGlReadbackResources private constructor(
                 readbackHeight = readbackHeight,
                 frameWidth = frameWidth,
                 frameHeight = frameHeight,
+                readbackMode = readbackMode,
+                pboIds = pboIds,
                 surfaceTexture = surfaceTexture,
                 surface = Surface(surfaceTexture),
             )
+        }
+
+        private fun createPboIds(readbackMode: DirectGlReadbackMode): IntArray {
+            if (readbackMode != DirectGlReadbackMode.PBO_ASYNC_READBACK) return IntArray(0)
+            val ids = IntArray(2)
+            GLES30.glGenBuffers(ids.size, ids, 0)
+            check(ids.all { it != 0 }) { "PBO buffer creation failed." }
+            return ids
         }
     }
 }

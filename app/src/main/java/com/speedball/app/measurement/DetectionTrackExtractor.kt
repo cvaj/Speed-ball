@@ -1,12 +1,24 @@
 package com.speedball.app.measurement
 
 import com.speedball.core.model.Detection
+import com.speedball.core.model.ImagePoint
 
-/** Gates for turning per-frame blobs into a timestamped detection track. */
+/**
+ * Gates for turning per-frame blobs into a timestamped detection track.
+ *
+ * Directional candidate selection is opt-in because the strict measurement
+ * path must fail on ambiguous blobs. Estimate-only import/live paths may enable
+ * it when the expected ball path is one-directional and disclosed as an
+ * estimate assumption.
+ */
 data class TrackExtractionConfig(
     val detectorConfig: BlobDetectionConfig,
     val maxFrameToFrameJumpPx: Double,
     val maxInteriorMisses: Int = 0,
+    val allowDirectionalCandidateSelection: Boolean = false,
+    val seedPoint: ImagePoint? = null,
+    val seedSearchRadiusPx: Double? = null,
+    val allowStationaryPrefix: Boolean = false,
 )
 
 sealed interface TrackExtractionOutcome {

@@ -959,6 +959,71 @@ function readArchivedArtifact(relativePath, description) {
   };
 }
 
+function archivedArtifactExists(relativePath) {
+  if (!relativePath) {
+    return false;
+  }
+  return fs.existsSync(path.join(INTERAGENT_DIR, relativePath));
+}
+
+function responseArtifactRelativePath(sequence, from, to, taskId) {
+  return `responses/${responseArtifactName(sequence, from, to, taskId)}`;
+}
+
+function sameTaskArtifact(artifact, taskId) {
+  const taskSlug = `-${slugify(taskId)}.md`;
+  return artifact.relativePath.endsWith(taskSlug);
+}
+
+function resolveCloseReviewApprovalArtifacts(session, taskId, latestRequest, latestResponse) {
+  if (latestRequest.verdict === "APPROVED" && latestResponse.verdict === "APPROVED") {
+    return {
+      mode: "approved-request-response",
+      approvalArtifacts: [latestRequest, latestResponse],
+    };
+  }
+
+  if (latestRequest.verdict !== "IMPLEMENTED" || latestResponse.verdict !== "APPROVED") {
+    fail(
+      `Refusing close-review: latest request/response must be APPROVED/APPROVED, `
+      + `or IMPLEMENTED plus reciprocal APPROVED responses for implementer-led work `
+      + `(got request=${latestRequest.verdict}, response=${latestResponse.verdict})`,
+    );
+  }
+  if (!sameTaskArtifact(latestResponse, taskId)) {
+    fail(`Refusing close-review: latest response artifact does not target task '${taskId}'`);
+  }
+
+  const sequence = latestSequenceFromSession(session);
+  if (sequence === null) {
+    fail("Refusing close-review: cannot resolve sequence for implementer-led mutual-exhaustion artifacts");
+  }
+
+  const implementerResponsePath = responseArtifactRelativePath(sequence, session.implementer, session.reviewer, taskId);
+  const reviewerResponsePath = responseArtifactRelativePath(sequence, session.reviewer, session.implementer, taskId);
+
+  if (!archivedArtifactExists(implementerResponsePath) || !archivedArtifactExists(reviewerResponsePath)) {
+    fail(
+      `Refusing close-review: implementer-led mutual exhaustion requires both reciprocal APPROVED response artifacts `
+      + `(${implementerResponsePath}, ${reviewerResponsePath})`,
+    );
+  }
+
+  const implementerResponse = readArchivedArtifact(implementerResponsePath, "implementer concurrence response");
+  const reviewerResponse = readArchivedArtifact(reviewerResponsePath, "reviewer approval response");
+  if (implementerResponse.verdict !== "APPROVED" || reviewerResponse.verdict !== "APPROVED") {
+    fail(
+      `Refusing close-review: reciprocal response verdicts must both be APPROVED `
+      + `(got implementer=${implementerResponse.verdict}, reviewer=${reviewerResponse.verdict})`,
+    );
+  }
+
+  return {
+    mode: "implemented-request-reciprocal-approvals",
+    approvalArtifacts: [latestRequest, implementerResponse, reviewerResponse],
+  };
+}
+
 function trackTaskCommand(options) {
   const taskId = options["task-id"];
   const workstreamId = options["workstream-id"];
@@ -1407,16 +1472,10 @@ function closeReview(options) {
 
   const latestRequest = readArchivedArtifact(session.latest_request_path, "latest request");
   const latestResponse = readArchivedArtifact(session.latest_response_path, "latest response");
-  if (latestRequest.verdict !== "APPROVED" || latestResponse.verdict !== "APPROVED") {
+  const closeReviewArtifacts = resolveCloseReviewApprovalArtifacts(session, taskId, latestRequest, latestResponse);
+  if (!closeReviewArtifacts.approvalArtifacts.every((artifact) => sameTaskArtifact(artifact, taskId))) {
     fail(
-      `Refusing close-review: latest request/response verdicts must both be APPROVED (got request=${latestRequest.verdict}, response=${latestResponse.verdict})`,
-    );
-  }
-
-  const taskSlug = `-${slugify(taskId)}.md`;
-  if (!latestRequest.relativePath.endsWith(taskSlug) || !latestResponse.relativePath.endsWith(taskSlug)) {
-    fail(
-      `Refusing close-review: latest request/response artifacts do not both target task '${taskId}'`,
+      `Refusing close-review: closure artifacts do not all target task '${taskId}'`,
     );
   }
 
@@ -1437,7 +1496,7 @@ function closeReview(options) {
   task.blocked_by = null;
   appendTaskNote(
     task,
-    `[${transitionTimestamp}] Review closed after mutual exhaustion; request=${latestRequest.relativePath}; response=${latestResponse.relativePath}`,
+    `[${transitionTimestamp}] Review closed after mutual exhaustion (${closeReviewArtifacts.mode}); artifacts=${closeReviewArtifacts.approvalArtifacts.map((artifact) => artifact.relativePath).join(", ")}`,
   );
 
   session.review_in_flight_for_task = null;
@@ -1486,6 +1545,8 @@ function closeReview(options) {
     closed_at: transitionTimestamp,
     latest_request_path: latestRequest.relativePath,
     latest_response_path: latestResponse.relativePath,
+    close_review_mode: closeReviewArtifacts.mode,
+    close_review_artifacts: closeReviewArtifacts.approvalArtifacts.map((artifact) => artifact.relativePath),
     task_status: task.status,
     session_status: session.status,
     session_phase: session.phase,

@@ -69,6 +69,7 @@ data class DirectTimingSourceProofRunResult(
 class DirectTimingSourceProofRunner(
     private val companionProbe: () -> DirectSessionProbeOutcome,
     private val previewControl: () -> PreviewFrameOutcome,
+    private val primaryShape: DirectProofSessionShape = DirectProofSessionShape.COMPANION_ENCODER,
     private val logger: (String) -> Unit = {},
 ) {
     fun run(
@@ -76,7 +77,7 @@ class DirectTimingSourceProofRunner(
         mode: HighSpeedMode,
         pixelConfig: DirectPixelProofConfig,
     ): DirectTimingSourceProofRunResult {
-        logger(directProofLogLine("DIRECT_PROOF_START", mode, DirectProofSessionShape.COMPANION_ENCODER))
+        logger(directProofLogLine("DIRECT_PROOF_START", mode, primaryShape))
         val companionOutcome = companionProbe()
         logger(directProofLogLine("DIRECT_PROOF_COMPANION", mode, companionOutcome))
         val proofOutcome = buildProofOutcomeFromCompanion(runId, mode, pixelConfig, companionOutcome)
@@ -267,13 +268,16 @@ private fun directProofOutcomeLogLine(
     }
 
 private fun DirectCaptureDiagnostics.logFields(): String =
-    "frameCallbacks=$frameAvailableCallbackCount captureCallbacks=$captureResultCallbackCount appended=$appendedDirectFrameCount readbacks=$readbackCount readbackMedianMs=${medianReadbackMillis.formatOrNa()} readbackMaxMs=${maximumReadbackMillis.formatOrNa()} releaseSteps=${releaseStepTimings.size}"
+    "variant=$variantId consumer=$consumerModel surfaces=${surfaceOrder.joinToString(separator = "+")} requestTemplate=$requestTemplate directBuffer=${directBufferWidth ?: 0}x${directBufferHeight ?: 0} requestList=${requestListSize ?: 0} frameCallbacks=$frameAvailableCallbackCount captureCallbacks=$captureResultCallbackCount appended=$appendedDirectFrameCount readbacks=$readbackCount imageAcquireNulls=$imageAcquireNullCount readbackMedianMs=${medianReadbackMillis.formatOrNa()} readbackMaxMs=${maximumReadbackMillis.formatOrNa()} producerMedianMs=${producerMedianGapMillis.formatOrNa()} producerMaxMs=${producerMaximumGapMillis.formatOrNa()} producerInBand=${producerInRequestedFpsBand.formatOrNa()} consumerRatioUsable=${consumerRatioInterpretable.formatOrNa()} releaseSteps=${releaseStepTimings.size}"
 
 private fun DirectTimingSourceDiagnostics.logFields(): String =
     "directMedianMs=${directMedianGapMillis.formatOrNa()} directMaxMs=${directMaximumGapMillis.formatOrNa()} sensorMedianMs=${sensorMedianGapMillis.formatOrNa()} sensorMaxMs=${sensorMaximumGapMillis.formatOrNa()} finalGate=${finalFailure ?: "none"} ${captureDiagnostics.logFields()}"
 
 private fun Double?.formatOrNa(): String =
-    this?.let { "%.3f".format(it) } ?: "n/a"
+    this?.let { "%.3f".format(it) } ?: "na"
+
+private fun Boolean?.formatOrNa(): String =
+    this?.toString() ?: "na"
 
 private fun String.sanitizedDirectLogToken(): String =
     replace(Regex("\\s+"), "_")
