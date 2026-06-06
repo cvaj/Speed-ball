@@ -258,6 +258,51 @@ class Phase14WorkflowStateTest {
         assertEquals(640.0 / 11.0, readiness.pixelsPerFoot, 1.0e-9)
     }
 
+    @Test
+    fun distanceEditOverwritesFeetAndPreservesCalipers() {
+        val ready = baseReadyState()
+        val edited = ready.reduce(
+            Phase14WorkflowEvent.KnownDistanceSelected(
+                pointA = requireNotNull(ready.calibrationPointA),
+                pointB = requireNotNull(ready.calibrationPointB),
+                knownDistanceFeet = 10.0,
+            ),
+        )
+
+        val readiness = assertInstanceOf(
+            CalibrationWorkflowReadiness.Ready::class.java,
+            edited.buildCalibrationForActiveReadback().readiness(),
+        )
+
+        assertEquals(ready.calibrationPointA, edited.calibrationPointA)
+        assertEquals(ready.calibrationPointB, edited.calibrationPointB)
+        assertEquals(10.0, edited.knownDistanceFeet)
+        assertEquals(12.8, readiness.pixelsPerFoot, 1.0e-9)
+        assertTrue(edited.canArm())
+    }
+
+    @Test
+    fun invalidDistanceEditBlocksLiveAndCurrentCalibrationConsumers() {
+        val ready = baseReadyState()
+        val invalid = ready.reduce(
+            Phase14WorkflowEvent.KnownDistanceSelected(
+                pointA = requireNotNull(ready.calibrationPointA),
+                pointB = requireNotNull(ready.calibrationPointB),
+                knownDistanceFeet = Double.NaN,
+            ),
+        )
+
+        val readiness = assertInstanceOf(
+            CalibrationWorkflowReadiness.NotReady::class.java,
+            invalid.buildCalibrationForActiveReadback().readiness(),
+        )
+
+        assertFalse(invalid.canArm())
+        assertEquals(ready.calibrationPointA, invalid.calibrationPointA)
+        assertEquals(ready.calibrationPointB, invalid.calibrationPointB)
+        assertTrue(readiness.message.contains("positive", ignoreCase = true) || readiness.message.contains("finite", ignoreCase = true))
+    }
+
     private fun baseReadyState(): Phase14WorkflowState =
         baseReadyStateWithoutLevel().reduce(Phase14WorkflowEvent.LevelReferenceCaptured(levelSnapshot()))
 

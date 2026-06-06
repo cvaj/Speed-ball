@@ -26,6 +26,8 @@ Run this on every code change before review and before commit.
 ## Input Validation
 
 - [ ] User-entered calibration distances are finite, positive, and unit-validated.
+- [ ] Editing calibration distance replaces the active value and invalid current
+      distance cannot reuse stale feet for live or import estimates.
 - [ ] HSV tolerances and ROI bounds are clamped.
 - [ ] Video metadata and frame counts are validated before processing.
 - [ ] Timestamp sequences are monotonic and reconciled to frames.
@@ -34,6 +36,8 @@ Run this on every code change before review and before commit.
 
 - [ ] Measurement failures produce "No read" with actionable reason.
 - [ ] Capture failures produce developer diagnostics/no-read with actionable reason.
+- [ ] Readiness-blocked `shoot` commands expose the specific setup reason in UI
+      and logs without raw frames, pixels, paths, or secrets.
 - [ ] Exceptions that affect correctness are not swallowed.
 - [ ] Defaults do not hide missing calibration, missing timestamps, or failed detection.
 
@@ -133,10 +137,28 @@ Run this on every code change before review and before commit.
   recorder diagnostics live on the setup drawer page and still do not persist
   raw media, paths, endpoints, or device identifiers. Hiding the drawer leaves
   calibration gestures active without exposing additional data.
+- App-level Setup Mode and Run Mode are transient UI state. Setup values remain
+  in memory for repeated shots, while Run Mode command state stores only
+  readiness labels such as manual-ready, listening, retrying, degraded, or
+  setup-invalid reason. It must not store raw speech transcripts, frames,
+  wireless-debugging endpoints, or pairing codes.
+- Speech-recognizer no-match and speech-timeout events are treated as ordinary
+  idle listening restarts, not fatal errors. Other restart paths are bounded by
+  one delayed scheduler, backoff, and a consecutive-error cap. Logs include only
+  bounded error codes/counts and command recognition markers; they must not
+  include full raw alternatives or transcript text beyond existing bounded
+  counts.
+- Visual-estimate reports are process-lifetime attempt-scoped UI objects.
+  Clearing a report stores at most the dismissed attempt id and must not persist
+  media, raw pixels, private paths, endpoints, pairing codes, or secrets.
 - Live color sampling copies only a small bounded patch from the setup feed,
   averages it immediately to HSV, recycles the bitmap, and leaves color
   not-ready if `PixelCopy` fails or the feed is unavailable. A failed sample
   must not silently fall back to a hidden default color.
+- Direct visual-estimate diagnostics log frame/callback counts, unique sensor
+  timestamp count, readback dimensions, and redacted session/no-go evidence
+  only. They must not log raw frames, raw pixels, preview screenshots, ADB
+  endpoints, pairing details, file paths, or device-private identifiers.
 - Level capture prefers `TYPE_GRAVITY`, falls back to accelerometer, uses
   gyroscope movement to reject a bumped phone, and stores only roll/pitch,
   source, sample count, and capture time.
@@ -150,6 +172,14 @@ Run this on every code change before review and before commit.
   disclose ball-type and motion-blur scale assumptions during setup.
 - Estimate no-read UI remains value-free. Mph, angle, trajectory, carry, apex,
   and hang time are displayed only by `VisualEstimateOutcome.Success`.
+- Direct visual-estimate proof thumbnails are bounded, in-memory diagnostic
+  copies from the processed low-resolution readback frames. They are owned only
+  by the current attempt report, are dropped on clear/new attempt, and are not
+  written to public storage or exported automatically.
+- Proof logs contain counts only: captured frames, readback dimensions,
+  callbacks, unique sensor timestamps, candidate frames/blobs, and selected
+  samples. They must not log raw pixels, thumbnail bytes, image paths,
+  screenshots, ADB endpoints, pairing codes, or speech transcripts.
 - Detector/setup diagnostics must stay bounded and must not log raw pixels,
   private paths, device IPs, pairing ports, media files, APKs, keystores, or
   credentials.

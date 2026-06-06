@@ -484,6 +484,7 @@ Measured S10+ variant matrix:
 | `pbo-gl-readback` | constrained high-speed accepted, request list `4` | `8.333 ms` median, in band | `200 : 25 : 24` | `DIRECT_CADENCE_MISMATCH` |
 | `direct-gl-only` | constrained high-speed accepted, request list `4` | `33.378 ms` median, below band | `24 : 24 : 24` | `DIRECT_CADENCE_MISMATCH` |
 | `constrained-image-reader` | constrained high-speed session rejected | Not available | `0 : 0 : 0` | `SESSION_CONFIGURATION_FAILED` |
+| `direct-estimate-preview-plus-gl-readback` | constrained high-speed session rejected | Not available | `0 : 0 : 0` | `SESSION_CONFIGURATION_FAILED` |
 | `constrained-private-image-reader` | constrained high-speed accepted, request list `4` | `16.667 ms` median, below band | `12 : 0 : 0` | `MISSING_DIRECT_TIMESTAMPS` |
 | `standard-image-reader` | standard Camera2 session accepted, request list `1` | `33.283 ms` median, below band | `24 : 24 : 24` | `DIRECT_CADENCE_MISMATCH` |
 
@@ -499,6 +500,10 @@ Interpretation:
   cannot prove a 120 fps source route.
 - The constrained high-speed YUV ImageReader target was device-exercised and
   rejected during session configuration.
+- The direct-estimate preview-plus-GL/readback two-`SurfaceTexture` target shape
+  was device-exercised on S10+ and rejected during constrained high-speed session
+  configuration because the output surfaces must have different types. Redacted
+  evidence is in `.interagent/tmp/two-surface-direct-estimate-rejection-2026-06-05.txt`.
 - The constrained high-speed PRIVATE/video-encode ImageReader target was
   device-exercised and accepted, but delivered zero `ImageReader` callbacks and
   zero direct proof frames while producer callbacks were below the requested

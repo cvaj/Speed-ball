@@ -32,10 +32,30 @@ data class WorkflowSection(
     val detail: String,
 )
 
+/** Top-level app mode: setup edits are separate from run/listen/capture/report. */
+enum class SpeedBallAppMode {
+    Setup,
+    Run,
+}
+
+/** Command readiness shown in Run Mode, independent from capture status text. */
+sealed interface SpeedBallRunCommandState {
+    data class SetupInvalid(val reason: String) : SpeedBallRunCommandState
+    data object VoiceUnavailable : SpeedBallRunCommandState
+    data class VoiceError(val code: Int, val message: String) : SpeedBallRunCommandState
+    data class VoiceRetrying(val errorCount: Int, val nextDelayMillis: Long) : SpeedBallRunCommandState
+    data object ManualReady : SpeedBallRunCommandState
+    data object Listening : SpeedBallRunCommandState
+    data object Capturing : SpeedBallRunCommandState
+    data object Reporting : SpeedBallRunCommandState
+}
+
 /** Compose-free state used by JVM tests to guard the no-fake-result contract. */
 data class SpeedBallShellState(
     val title: String,
     val sections: List<WorkflowSection>,
+    val appMode: SpeedBallAppMode = SpeedBallAppMode.Setup,
+    val runCommandState: SpeedBallRunCommandState = SpeedBallRunCommandState.SetupInvalid("Setup not ready"),
     val cameraPermission: String = "Not requested",
     val captureStatus: String = "Idle",
     val modeLines: List<String> = emptyList(),
@@ -46,6 +66,7 @@ data class SpeedBallShellState(
     val savedResultLines: List<String> = emptyList(),
     val exportLines: List<String> = emptyList(),
     val failureLine: String? = null,
+    val visualEstimateReport: VisualEstimateReport? = null,
     val phase14State: Phase14WorkflowState = Phase14WorkflowState(),
     val setupAdjustmentTargetLabel: String = "A",
     val knownDistanceFeetText: String = "",
@@ -55,6 +76,8 @@ data class SpeedBallShellState(
     val visibleText: List<String>
         get() = buildList {
             add(title)
+            add("appMode=${appMode.name}")
+            add("runCommand=${runCommandState.visibleText()}")
             add(cameraPermission)
             add(captureStatus)
             selectedModeLine?.let(::add)
@@ -64,6 +87,7 @@ data class SpeedBallShellState(
             addAll(importLines)
             addAll(savedResultLines)
             addAll(exportLines)
+            visualEstimateReport?.lines?.forEach { add("visualEstimateReport=$it") }
             failureLine?.let(::add)
             add("setupTarget=$setupAdjustmentTargetLabel")
             add("knownDistanceFeetInput=$knownDistanceFeetText")
@@ -94,6 +118,8 @@ fun speedBallPlaceholderState(): SpeedBallShellState =
 fun speedBallCaptureState(
     permissionLabel: String,
     captureStatus: String,
+    appMode: SpeedBallAppMode = SpeedBallAppMode.Setup,
+    runCommandState: SpeedBallRunCommandState = SpeedBallRunCommandState.SetupInvalid("Setup not ready"),
     modeLines: List<String>,
     selectedModeLine: String?,
     diagnosticLines: List<String>,
@@ -108,12 +134,15 @@ fun speedBallCaptureState(
     setupAdjustmentTargetLabel: String = "A",
     knownDistanceFeetText: String = "",
     previewRotationDegrees: Int = 0,
+    visualEstimateReport: VisualEstimateReport? = null,
     workflowFrameWidth: Int = 0,
     workflowFrameHeight: Int = 0,
 ): SpeedBallShellState =
     speedBallPlaceholderState().copy(
         cameraPermission = permissionLabel,
         captureStatus = captureStatus,
+        appMode = appMode,
+        runCommandState = runCommandState,
         modeLines = modeLines,
         selectedModeLine = selectedModeLine,
         resultLines = workflowGuidanceUiLines(
@@ -129,6 +158,7 @@ fun speedBallCaptureState(
         savedResultLines = savedResultHistoryUiLines(savedResultSummaries),
         exportLines = exportEvidenceUiLines(exportEvidenceText),
         failureLine = failureLine,
+        visualEstimateReport = visualEstimateReport,
         phase14State = phase14State,
         setupAdjustmentTargetLabel = setupAdjustmentTargetLabel,
         knownDistanceFeetText = knownDistanceFeetText,
@@ -142,6 +172,18 @@ fun speedBallCaptureState(
             WorkflowSection("Results", PlaceholderStatus.Pending, measurementOutcomeUiLines(workflowState.result).first()),
         ),
     )
+
+private fun SpeedBallRunCommandState.visibleText(): String =
+    when (this) {
+        is SpeedBallRunCommandState.SetupInvalid -> "setup-invalid reason=${reason.compactForImportLine()}"
+        SpeedBallRunCommandState.VoiceUnavailable -> "voice-unavailable manual-shoot=true"
+        is SpeedBallRunCommandState.VoiceError -> "voice-error code=$code message=${message.compactForImportLine()} manual-shoot=true"
+        is SpeedBallRunCommandState.VoiceRetrying -> "voice-retrying count=$errorCount nextDelayMs=$nextDelayMillis"
+        SpeedBallRunCommandState.ManualReady -> "manual-ready"
+        SpeedBallRunCommandState.Listening -> "listening"
+        SpeedBallRunCommandState.Capturing -> "capturing"
+        SpeedBallRunCommandState.Reporting -> "reporting"
+    }
 
 fun workflowGuidanceUiLines(
     calibrationState: CalibrationWorkflowState,

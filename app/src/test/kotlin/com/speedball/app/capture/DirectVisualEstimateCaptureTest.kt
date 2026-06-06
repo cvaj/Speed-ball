@@ -47,10 +47,50 @@ class DirectVisualEstimateCaptureTest {
         assertTrue(source.contains("DirectGlReadbackResources.create"))
         assertTrue(source.contains("updateAndReadArgbFrames"))
         assertTrue(source.contains("VisualEstimateFramePipeline.estimateFromFrames"))
+        assertTrue(source.contains("val rgbFrames = snapshot.frames.map { it.toRgbFrame() }"))
+        assertTrue(source.contains("TimedFrameSequence(rgbFrames)"))
         assertTrue(source.contains("VisualEstimateFramePipelineConfig"))
         assertFalse(source.contains("MediaExtractor"))
         assertFalse(source.contains("MediaMetadataRetriever"))
         assertFalse(source.contains("BurstVideoDecoder"))
+    }
+
+    @Test
+    fun directVisualEstimateUsesSingleHiddenReadbackSurface() {
+        val source = Files.readAllBytes(sourcePath("DirectVisualEstimateCapture.kt")).toString(Charsets.UTF_8)
+
+        assertTrue(source.contains("createConstrainedHighSpeedCaptureSession(listOf(readbackSurface), callback, backgroundHandler)"))
+        assertTrue(source.contains("addTarget(readbackSurface)"))
+        assertFalse(source.contains("visiblePreviewSurface"))
+        assertFalse(source.contains("surfaces=preview,gl-readback"))
+        assertFalse(source.contains("addTarget(visiblePreviewSurface)"))
+        assertFalse(source.contains("setDefaultBufferSize"))
+    }
+
+    @Test
+    fun directVisualEstimateLogsIntegrityAndKeepsSingleSurfaceFailureMessage() {
+        val source = Files.readAllBytes(sourcePath("DirectVisualEstimateCapture.kt")).toString(Charsets.UTF_8)
+
+        assertTrue(source.contains("uniqueSensorTimestampCount"))
+        assertTrue(source.contains("CaptureResult.SENSOR_TIMESTAMP"))
+        assertTrue(source.contains("Direct visual estimate session configuration failed."))
+        assertFalse(source.contains("DIRECT_VISUAL_PREVIEW_UNSUPPORTED_MESSAGE"))
+        assertFalse(source.contains("android.util.Log"))
+        assertFalse(source.contains("LOG_TAG"))
+    }
+
+    @Test
+    fun terminalOutcomesCarryBoundedProofButNoFullFrameBuffers() {
+        val source = Files.readAllBytes(sourcePath("DirectVisualEstimateCapture.kt")).toString(Charsets.UTF_8)
+        val completedContract = Regex("data class Completed\\([\\s\\S]*?\\) : DirectVisualEstimateCaptureOutcome").find(source)?.value.orEmpty()
+        val failureContract = Regex("data class Failure\\([\\s\\S]*?\\) : DirectVisualEstimateCaptureOutcome").find(source)?.value.orEmpty()
+
+        assertTrue(completedContract.contains("captureProof: VisualEstimateCaptureProof"))
+        assertTrue(failureContract.contains("captureProof: VisualEstimateCaptureProof?"))
+        assertFalse(completedContract.contains("List<DirectArgbFrame>"))
+        assertFalse(completedContract.contains("List<RgbFrame>"))
+        assertFalse(failureContract.contains("List<DirectArgbFrame>"))
+        assertFalse(failureContract.contains("List<RgbFrame>"))
     }
 
     private fun config(mode: HighSpeedMode): DirectVisualEstimateCaptureConfig =

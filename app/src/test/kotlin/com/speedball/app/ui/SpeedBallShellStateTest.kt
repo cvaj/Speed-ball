@@ -287,6 +287,34 @@ class SpeedBallShellStateTest {
     }
 
     @Test
+    fun appModeAndRunCommandStateAreVisibleAndIndependentFromCaptureStatus() {
+        val runState = speedBallCaptureState(
+            permissionLabel = "Granted",
+            captureStatus = "Idle",
+            appMode = SpeedBallAppMode.Run,
+            runCommandState = SpeedBallRunCommandState.VoiceUnavailable,
+            modeLines = emptyList(),
+            selectedModeLine = null,
+            diagnosticLines = emptyList(),
+            failureLine = null,
+        )
+        val setupState = runState.copy(
+            appMode = SpeedBallAppMode.Setup,
+            runCommandState = SpeedBallRunCommandState.SetupInvalid("Sample the ball color before measuring."),
+        )
+
+        val runText = runState.visibleText.joinToString("\n")
+        val setupText = setupState.visibleText.joinToString("\n")
+
+        assertTrue(runText.contains("appMode=Run"))
+        assertTrue(runText.contains("runCommand=voice-unavailable manual-shoot=true"))
+        assertTrue(runText.contains("Idle"))
+        assertTrue(setupText.contains("appMode=Setup"))
+        assertTrue(setupText.contains("runCommand=setup-invalid reason=Sample the ball color before measuring."))
+        assertTrue(setupText.contains("Idle"))
+    }
+
+    @Test
     fun developerProofDiagnosticsDoNotCreateMeasurementResultValues() {
         val state = speedBallCaptureState(
             permissionLabel = "Granted",

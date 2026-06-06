@@ -102,7 +102,10 @@ import com.speedball.app.measurement.FrameProcessingBounds
 import com.speedball.app.measurement.FrameDimensions
 import com.speedball.app.measurement.HsvColor
 import com.speedball.app.measurement.HsvTolerance
+import com.speedball.app.measurement.LevelReferenceDisplayRotation
 import com.speedball.app.measurement.LevelReferenceOutcome
+import com.speedball.app.measurement.LevelReferenceSnapshot
+import com.speedball.app.measurement.LevelReferenceSource
 import com.speedball.app.measurement.MeasurementCalibrationState
 import com.speedball.app.measurement.MeasurementWorkflowState
 import com.speedball.app.measurement.NormalizedFramePoint
@@ -121,13 +124,18 @@ import com.speedball.app.measurement.VisualEstimateOutcome
 import com.speedball.app.measurement.VisualEstimatePipelineConfig
 import com.speedball.app.measurement.parsePositiveFeet
 import com.speedball.app.ui.SpeedBallApp
+import com.speedball.app.ui.SpeedBallAppMode
+import com.speedball.app.ui.SpeedBallRunCommandState
 import com.speedball.app.ui.SpeedBallShellState
+import com.speedball.app.ui.VisualEstimateReport
+import com.speedball.app.ui.VisualEstimateReportKind
 import com.speedball.app.ui.decodeOutcomeUiLines
 import com.speedball.app.ui.directProofRunUiLines
 import com.speedball.app.ui.previewOutcomeUiLines
 import com.speedball.app.ui.speedBallCaptureState
 import com.speedball.app.ui.speedBallPlaceholderState
 import com.speedball.app.ui.visualEstimateOutcomeUiLines
+import com.speedball.app.ui.visualEstimateReportFor
 import com.speedball.core.calibration.CalibrationResult
 import com.speedball.core.model.ImagePoint
 import java.io.File
@@ -189,6 +197,8 @@ class MainActivity : ComponentActivity() {
     private var debugImportStartFrameIndex: Int = 0
     private var debugImportFrameCount: Int = DEFAULT_IMPORT_MAX_FRAMES
     private var voiceRecordListening = false
+    private var voiceConsecutiveErrors = 0
+    private var voiceRestartRunnable: Runnable? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private var readySpeech: TextToSpeech? = null
     private var readySpeechReady = false
@@ -196,6 +206,11 @@ class MainActivity : ComponentActivity() {
     private var activityResumed = false
     private var windowFocused = false
     private var previewRotationDegrees = 0
+    private var appMode = SpeedBallAppMode.Setup
+    private var runCommandState: SpeedBallRunCommandState = SpeedBallRunCommandState.SetupInvalid("Setup not ready")
+    private var visualEstimateAttemptId = 0L
+    private var currentVisualEstimateReport: VisualEstimateReport? = null
+    private var dismissedVisualEstimateAttemptId: Long? = null
 
     private val requestCameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         updateShellState(status = if (it) "Permission granted" else "Permission denied")
@@ -207,6 +222,7 @@ class MainActivity : ComponentActivity() {
             startVoiceRecordListener()
         } else {
             voiceRecordListening = false
+            runCommandState = SpeedBallRunCommandState.VoiceUnavailable
             updateShellState(status = "Microphone permission denied")
         }
     }
@@ -264,6 +280,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         startLiveCameraFeedIfReady()
                     }
+                    startAutoDirectVisualEstimateIfReady()
                     startAutoBurstIfReady()
                 },
                 onKnownDistanceChanged = { updateKnownDistanceFeetInput(it) },
@@ -291,6 +308,10 @@ class MainActivity : ComponentActivity() {
                 onRetryEstimate = { retryDirectVisualEstimate() },
                 onRecalibrateEstimate = { recalibrateDirectVisualEstimate() },
                 onStopBurst = { stopBurst() },
+                onEnterRunMode = { enterRunMode() },
+                onEnterSetupMode = { enterSetupMode() },
+                onManualShoot = { handleShootCommand(ShootTrigger.Manual) },
+                onDismissVisualEstimateReport = { dismissVisualEstimateReport(it) },
             )
         }
         logTimestampSourceIfRequested()
@@ -369,6 +390,7 @@ class MainActivity : ComponentActivity() {
     private fun toggleVoiceRecordListener() {
         if (voiceRecordListening) {
             stopVoiceRecordListener()
+            runCommandState = SpeedBallRunCommandState.ManualReady
             updateShellState(status = "Voice trigger off")
             return
         }
@@ -379,9 +401,38 @@ class MainActivity : ComponentActivity() {
         startVoiceRecordListener()
     }
 
-    private fun startVoiceRecordListener() {
+    private fun enterRunMode() {
+        appMode = SpeedBallAppMode.Run
+        val notReadyStatus = shootNotReadyStatus()
+        if (notReadyStatus != null) {
+            runCommandState = SpeedBallRunCommandState.SetupInvalid(notReadyStatus)
+            updateShellState(status = notReadyStatus)
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startVoiceRecordListener()
+        } else {
+            voiceRecordListening = false
+            runCommandState = SpeedBallRunCommandState.ManualReady
+            updateShellState(status = "Run mode manual ready")
+        }
+    }
+
+    private fun enterSetupMode() {
+        appMode = SpeedBallAppMode.Setup
+        stopVoiceRecordListener()
+        runCommandState = SpeedBallRunCommandState.SetupInvalid(shootNotReadyStatus() ?: "Setup mode")
+        updateShellState(status = "Setup mode")
+    }
+
+    private fun startVoiceRecordListener(resetErrorCount: Boolean = true) {
+        cancelVoiceRestart()
+        if (resetErrorCount) {
+            voiceConsecutiveErrors = 0
+        }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             voiceRecordListening = false
+            runCommandState = SpeedBallRunCommandState.VoiceUnavailable
             updateShellState(status = "Voice trigger unavailable")
             return
         }
@@ -390,13 +441,16 @@ class MainActivity : ComponentActivity() {
             it.setRecognitionListener(voiceRecognitionListener())
             speechRecognizer = it
         }
+        if (appMode == SpeedBallAppMode.Run && runCommandState !is SpeedBallRunCommandState.Capturing) {
+            runCommandState = SpeedBallRunCommandState.ManualReady
+        }
         updateShellState(status = "Say shoot or record")
         recognizer.startListening(voiceRecognizerIntent())
     }
 
     private fun stopVoiceRecordListener() {
         voiceRecordListening = false
-        mainHandler.removeCallbacksAndMessages(null)
+        cancelVoiceRestart()
         speechRecognizer?.let {
             runCatching { it.stopListening() }
             runCatching { it.cancel() }
@@ -405,18 +459,44 @@ class MainActivity : ComponentActivity() {
         speechRecognizer = null
     }
 
-    private fun restartVoiceRecordListenerSoon() {
+    private fun cancelVoiceRestart() {
+        voiceRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        voiceRestartRunnable = null
+    }
+
+    private fun restartVoiceRecordListenerSoon(delayMillis: Long = VOICE_RESTART_DELAY_MILLIS) {
         if (!voiceRecordListening) return
-        mainHandler.postDelayed({
+        cancelVoiceRestart()
+        val restart = Runnable {
+            voiceRestartRunnable = null
             if (voiceRecordListening) {
                 runCatching { speechRecognizer?.startListening(voiceRecognizerIntent()) }
             }
-        }, VOICE_RESTART_DELAY_MILLIS)
+        }
+        voiceRestartRunnable = restart
+        mainHandler.postDelayed(restart, delayMillis)
+    }
+
+    private fun voiceRestartDelayMillis(errorCount: Int): Long {
+        val multiplier = 1L shl (errorCount - 1).coerceAtLeast(0)
+        return (VOICE_RESTART_DELAY_MILLIS * multiplier).coerceAtMost(VOICE_RESTART_MAX_DELAY_MILLIS)
     }
 
     private fun voiceRecognitionListener(): RecognitionListener =
         object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
+                voiceConsecutiveErrors = 0
+                if (appMode == SpeedBallAppMode.Run) {
+                    val notReadyStatus = shootNotReadyStatus()
+                    if (notReadyStatus != null) {
+                        runCommandState = SpeedBallRunCommandState.SetupInvalid(notReadyStatus)
+                        updateShellState(status = notReadyStatus)
+                        return
+                    }
+                    if (currentVisualEstimateReport?.kind != VisualEstimateReportKind.Success) {
+                        runCommandState = SpeedBallRunCommandState.Listening
+                    }
+                }
                 updateShellState(status = "Listening for shoot")
             }
 
@@ -431,8 +511,28 @@ class MainActivity : ComponentActivity() {
             override fun onError(error: Int) {
                 if (!voiceRecordListening) return
                 Log.i(logTag, "VOICE_RECORD_LISTEN_ERROR code=$error")
-                updateShellState(status = "Say shoot or record")
-                restartVoiceRecordListenerSoon()
+                if (isIdleVoiceRecognizerError(error)) {
+                    voiceConsecutiveErrors = 0
+                    val delayMillis = VOICE_IDLE_RESTART_DELAY_MILLIS
+                    runCommandState = SpeedBallRunCommandState.VoiceRetrying(0, delayMillis)
+                    Log.i(logTag, "VOICE_RECORD_LISTEN_IDLE code=$error nextDelayMs=$delayMillis")
+                    updateShellState(status = "Listening restarting")
+                    restartVoiceRecordListenerSoon(delayMillis)
+                    return
+                }
+                voiceConsecutiveErrors += 1
+                if (voiceConsecutiveErrors >= VOICE_RESTART_MAX_CONSECUTIVE_ERRORS) {
+                    cancelVoiceRestart()
+                    runCommandState = SpeedBallRunCommandState.VoiceError(error, "Use manual Shoot")
+                    Log.i(logTag, "VOICE_RECORD_LISTEN_DEGRADED code=$error attempts=$voiceConsecutiveErrors")
+                    stopVoiceRecordListener()
+                    updateShellState(status = "Voice degraded - use Shoot")
+                    return
+                }
+                val delayMillis = voiceRestartDelayMillis(voiceConsecutiveErrors)
+                runCommandState = SpeedBallRunCommandState.VoiceRetrying(voiceConsecutiveErrors, delayMillis)
+                updateShellState(status = "Voice retrying")
+                restartVoiceRecordListenerSoon(delayMillis)
             }
 
             override fun onResults(results: Bundle?) {
@@ -478,15 +578,28 @@ class MainActivity : ComponentActivity() {
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
         }
 
-    private fun handleShootCommand() {
+    private fun handleShootCommand(trigger: ShootTrigger = ShootTrigger.Voice) {
         if (readySignalPending) return
+        if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+            runCommandState = SpeedBallRunCommandState.Reporting
+            updateShellState(status = "Clear result before next shot")
+            return
+        }
         val notReadyStatus = shootNotReadyStatus()
         if (notReadyStatus != null) {
+            val event = if (trigger == ShootTrigger.Voice) "VOICE_SHOOT_NOT_READY" else "MANUAL_SHOOT_NOT_READY"
+            Log.i(logTag, "$event reason=${notReadyStatus.compactForLog()}")
+            runCommandState = SpeedBallRunCommandState.SetupInvalid(notReadyStatus)
             updateShellState(status = notReadyStatus)
-            restartVoiceRecordListenerSoon()
+            if (trigger == ShootTrigger.Voice && notReadyStatus == "Capture already running") {
+                restartVoiceRecordListenerSoon()
+            } else if (trigger == ShootTrigger.Voice) {
+                stopVoiceRecordListener()
+            }
             return
         }
         stopVoiceRecordListener()
+        runCommandState = SpeedBallRunCommandState.Capturing
         updateShellState(status = "Ready to shoot")
         playReadySignalThenVisualEstimate()
     }
@@ -500,12 +613,30 @@ class MainActivity : ComponentActivity() {
         if (phase14WorkflowState.geometry == null) return "Camera geometry required"
         val calibrationNoRead = calibrationWorkflowState.noReadOrNull()
         val hasBallFallback = phase14WorkflowState.knownBallDiameterFeet != null
-        if (calibrationNoRead != null && !hasBallFallback) return "Distance calibration required"
+        if (calibrationNoRead != null && !hasBallFallback) return calibrationNoRead.message
         val geometry = phase14WorkflowState.geometry ?: return "Camera geometry required"
+        phase14ColorNotReadyStatus()?.let { return it }
         val colorReadiness = colorWorkflowState.readiness(geometry.readback.width, geometry.readback.height)
-        if (colorReadiness is ColorWorkflowReadiness.NotReady) return "Ball color required"
+        if (colorReadiness is ColorWorkflowReadiness.NotReady) return colorReadiness.message
         if (phase14WorkflowState.levelReference?.hasOnlyFiniteValues() != true) return "Level required"
         return if (phase14WorkflowState.canArm()) null else "Setup not ready"
+    }
+
+    private fun phase14ColorNotReadyStatus(): String? {
+        val sample = phase14WorkflowState.colorSample
+        if (phase14WorkflowState.colorSamplePoint?.isInFrame() != true || sample == null) {
+            return "Sample the ball color before measuring."
+        }
+        if (!sample.hueDegrees.isFinite() ||
+            !sample.saturation.isFinite() ||
+            !sample.value.isFinite() ||
+            sample.saturation !in 0.0..1.0 ||
+            sample.value !in 0.0..1.0
+        ) {
+            return "Sampled ball color is outside the valid HSV range."
+        }
+        val roi = phase14WorkflowState.regionOfInterest ?: return "Set the ball-flight ROI before measuring."
+        return if (roi.isInFrame()) null else "Color region does not overlap the frame."
     }
 
     private fun playReadySignalThenVisualEstimate() {
@@ -548,6 +679,15 @@ class MainActivity : ComponentActivity() {
         text.lowercase(Locale.US)
             .split(Regex("[^a-z]+"))
             .any { it in VOICE_RECORD_COMMANDS }
+
+    private fun isIdleVoiceRecognizerError(error: Int): Boolean =
+        error == SpeechRecognizer.ERROR_NO_MATCH ||
+            error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+
+    private enum class ShootTrigger {
+        Voice,
+        Manual,
+    }
 
     private fun startLiveCameraFeedIfReady() {
         if (!activityResumed || !hasCameraPermission()) return
@@ -941,34 +1081,60 @@ class MainActivity : ComponentActivity() {
 
     private fun startDirectVisualEstimate() {
         readySignalPending = false
+        beginVisualEstimateAttempt()
         phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.StartCapture)
         if (!hasCameraPermission()) {
-            lastDirectVisualEstimateOutcome = VisualEstimateOutcome.NoRead(
+            val noRead = VisualEstimateOutcome.NoRead(
                 reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
                 message = "Camera permission is required.",
             )
+            lastDirectVisualEstimateOutcome = noRead
+            currentVisualEstimateReport = visualEstimateReportFor(visualEstimateAttemptId, noRead, failure = true)
+            runCommandState = SpeedBallRunCommandState.SetupInvalid("Permission required")
             updateShellState(status = "Permission required")
             return
         }
         if (modes.isEmpty()) refreshModes()
         val mode = selectedMode
         if (mode == null) {
-            lastDirectVisualEstimateOutcome = VisualEstimateOutcome.NoRead(
+            val noRead = VisualEstimateOutcome.NoRead(
                 reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
                 message = "A fixed high-speed mode is required.",
             )
+            lastDirectVisualEstimateOutcome = noRead
+            currentVisualEstimateReport = visualEstimateReportFor(visualEstimateAttemptId, noRead, failure = true)
+            runCommandState = SpeedBallRunCommandState.SetupInvalid("Mode required")
             updateShellState(status = "Visual estimate unavailable")
+            return
+        }
+        if (previewSurface == null) {
+            val noRead = VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.DETECTION_FAILED,
+                message = "Live camera feed is required before estimating.",
+            )
+            lastDirectVisualEstimateOutcome = noRead
+            currentVisualEstimateReport = visualEstimateReportFor(visualEstimateAttemptId, noRead)
+            phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.ArmCapture)
+            runCommandState = SpeedBallRunCommandState.SetupInvalid("Live feed required")
+            updateShellState(status = "Live feed required")
             return
         }
         val config = buildDirectVisualEstimateConfig(mode)
         if (config == null) {
             phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.ArmCapture)
+            lastDirectVisualEstimateOutcome?.let { noRead ->
+                currentVisualEstimateReport = visualEstimateReportFor(visualEstimateAttemptId, noRead)
+            }
+            runCommandState = SpeedBallRunCommandState.SetupInvalid("Visual estimate setup incomplete")
             updateShellState(status = "Visual estimate setup incomplete")
             return
         }
         stopLiveLevelReference()
         captureStatus = "Visual estimate running"
         lastDirectVisualEstimateOutcome = null
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = null
+        runCommandState = SpeedBallRunCommandState.Capturing
         lastDirectProofResult = null
         lastPreviewOutcome = null
         lastFailure = null
@@ -990,7 +1156,51 @@ class MainActivity : ComponentActivity() {
         restartLiveCameraFeedIfReady()
     }
 
+    private fun beginVisualEstimateAttempt() {
+        visualEstimateAttemptId += 1
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = null
+    }
+
+    private fun dismissVisualEstimateReport(attemptId: Long) {
+        if (currentVisualEstimateReport?.attemptId != attemptId) return
+        dismissedVisualEstimateAttemptId = attemptId
+        currentVisualEstimateReport = null
+        if (appMode == SpeedBallAppMode.Run) {
+            resumeRunModeCommandPath()
+        } else {
+            updateShellState(status = captureStatus)
+        }
+    }
+
+    private fun visibleVisualEstimateReport(): VisualEstimateReport? =
+        currentVisualEstimateReport?.takeUnless { it.attemptId == dismissedVisualEstimateAttemptId }
+
+    private fun resumeRunModeCommandPath() {
+        if (appMode != SpeedBallAppMode.Run) return
+        val notReadyStatus = shootNotReadyStatus()
+        if (notReadyStatus != null) {
+            runCommandState = SpeedBallRunCommandState.SetupInvalid(notReadyStatus)
+            updateShellState(status = notReadyStatus)
+            return
+        }
+        if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+            runCommandState = SpeedBallRunCommandState.Reporting
+            stopVoiceRecordListener()
+            updateShellState(status = captureStatus)
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startVoiceRecordListener()
+        } else {
+            voiceRecordListening = false
+            runCommandState = SpeedBallRunCommandState.ManualReady
+            updateShellState(status = "Run mode manual ready")
+        }
+    }
+
     private fun handleDirectVisualEstimateOutcome(outcome: DirectVisualEstimateCaptureOutcome) {
+        var reportKind = VisualEstimateReportKind.NoRead
         when (outcome) {
             is DirectVisualEstimateCaptureOutcome.Completed -> {
                 lastDirectVisualEstimateOutcome = outcome.estimateOutcome
@@ -999,10 +1209,20 @@ class MainActivity : ComponentActivity() {
                     is VisualEstimateOutcome.Success -> "Visual estimate complete"
                     is VisualEstimateOutcome.NoRead -> "Visual estimate no-read"
                 }
+                currentVisualEstimateReport = visualEstimateReportFor(
+                    attemptId = visualEstimateAttemptId,
+                    outcome = outcome.estimateOutcome,
+                    captureProof = outcome.captureProof.withAttemptId(visualEstimateAttemptId),
+                )
+                reportKind = currentVisualEstimateReport?.kind ?: VisualEstimateReportKind.NoRead
                 Log.i(
                     logTag,
                     "VISUAL_ESTIMATE_COMPLETE frames=${outcome.capturedFrameCount} callbacks=${outcome.frameAvailableCallbackCount} " +
-                        "captureCallbacks=${outcome.captureResultCallbackCount} readback=${outcome.readbackWidth}x${outcome.readbackHeight}",
+                        "captureCallbacks=${outcome.captureResultCallbackCount} uniqueSensorTs=${outcome.uniqueSensorTimestampCount} " +
+                        "readback=${outcome.readbackWidth}x${outcome.readbackHeight} " +
+                        "candidateFrames=${outcome.captureProof.detectorSummary.candidateFrameCount} " +
+                        "candidateBlobs=${outcome.captureProof.detectorSummary.candidateBlobCount} " +
+                        "selectedSamples=${outcome.captureProof.detectorSummary.selectedSampleCount}",
                 )
                 visualEstimateOutcomeUiLines(outcome.estimateOutcome).forEach { line ->
                     Log.i(logTag, "VISUAL_ESTIMATE_RESULT ${line.compactForLog()}")
@@ -1010,13 +1230,26 @@ class MainActivity : ComponentActivity() {
             }
             is DirectVisualEstimateCaptureOutcome.Failure -> {
                 val noRead = VisualEstimateOutcome.NoRead(
-                    reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                    reason = outcome.reason.toVisualEstimateNoReadReason(),
                     message = outcome.message,
                 )
                 lastDirectVisualEstimateOutcome = noRead
                 phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.CaptureCompleted(noRead))
                 captureStatus = "Visual estimate failed"
-                Log.i(logTag, "VISUAL_ESTIMATE_FAILURE reason=${outcome.reason} frames=${outcome.capturedFrameCount} message=${outcome.message.compactForLog()}")
+                currentVisualEstimateReport = visualEstimateReportFor(
+                    attemptId = visualEstimateAttemptId,
+                    outcome = noRead,
+                    failure = true,
+                    captureProof = outcome.captureProof?.withAttemptId(visualEstimateAttemptId),
+                )
+                reportKind = VisualEstimateReportKind.Failure
+                val proofSummary = outcome.captureProof?.detectorSummary
+                Log.i(
+                    logTag,
+                    "VISUAL_ESTIMATE_FAILURE reason=${outcome.reason} frames=${outcome.capturedFrameCount} " +
+                        "candidateFrames=${proofSummary?.candidateFrameCount ?: 0} candidateBlobs=${proofSummary?.candidateBlobCount ?: 0} " +
+                        "selectedSamples=${proofSummary?.selectedSampleCount ?: 0} message=${outcome.message.compactForLog()}",
+                )
                 lastDirectVisualEstimateOutcome?.let { noRead ->
                     visualEstimateOutcomeUiLines(noRead).forEach { line ->
                         Log.i(logTag, "VISUAL_ESTIMATE_RESULT ${line.compactForLog()}")
@@ -1024,9 +1257,47 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        dismissedVisualEstimateAttemptId = null
+        runCommandState = if (reportKind == VisualEstimateReportKind.Success) {
+            SpeedBallRunCommandState.Reporting
+        } else {
+            SpeedBallRunCommandState.ManualReady
+        }
         updateShellState(status = captureStatus)
         restartLiveCameraFeedIfReady()
+        if (appMode == SpeedBallAppMode.Run && reportKind != VisualEstimateReportKind.Success) {
+            resumeRunModeCommandPath()
+        }
     }
+
+    private fun DirectTimingSourceFailure.toVisualEstimateNoReadReason(): VisualEstimateNoReadReason =
+        when (this) {
+            DirectTimingSourceFailure.MISSING_DIRECT_TIMESTAMPS,
+            DirectTimingSourceFailure.INSUFFICIENT_DIRECT_FRAMES,
+            DirectTimingSourceFailure.DUPLICATE_DIRECT_TIMESTAMPS,
+            DirectTimingSourceFailure.DIRECT_TIMESTAMPS_NON_MONOTONIC,
+            DirectTimingSourceFailure.DIRECT_CADENCE_MISMATCH,
+            DirectTimingSourceFailure.DIRECT_DROPPED_FRAME_GAP,
+            DirectTimingSourceFailure.DIRECT_TIMESTAMP_NEAR_DUPLICATE,
+            DirectTimingSourceFailure.MISSING_SENSOR_TIMESTAMPS,
+            DirectTimingSourceFailure.SENSOR_MEMBERSHIP_UNAVAILABLE,
+            DirectTimingSourceFailure.NONZERO_OFFSET_OUT_OF_BOUND,
+            DirectTimingSourceFailure.AMBIGUOUS_WRONG_BY_K_OFFSET ->
+                VisualEstimateNoReadReason.BAD_TIMESTAMPS
+
+            DirectTimingSourceFailure.UNSUPPORTED_MODE,
+            DirectTimingSourceFailure.CAPTURE_BUSY,
+            DirectTimingSourceFailure.CAMERA_OPEN_FAILED,
+            DirectTimingSourceFailure.SESSION_CONFIGURATION_FAILED,
+            DirectTimingSourceFailure.COMPANION_RECORDER_SETUP_FAILED,
+            DirectTimingSourceFailure.SCRATCH_FILE_CLEANUP_FAILED,
+            DirectTimingSourceFailure.PIXEL_READBACK_FAILED,
+            DirectTimingSourceFailure.BLANK_OR_STALE_PIXEL_PROOF,
+            DirectTimingSourceFailure.RESOURCE_LIMIT_EXCEEDED,
+            DirectTimingSourceFailure.LATE_CALLBACK_AFTER_TEARDOWN,
+            DirectTimingSourceFailure.PROOF_TOKEN_REJECTED ->
+                VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED
+        }
 
     private fun runDirectCompanionProbe(
         options: BurstOptions,
@@ -1144,7 +1415,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startAutoDirectVisualEstimateIfReady() {
-        if (!autoStartDirectVisualEstimatePending || selectedMode == null || !activityResumed || !windowFocused) return
+        if (!autoStartDirectVisualEstimatePending || selectedMode == null || previewSurface == null || !activityResumed || !windowFocused) return
         autoStartDirectVisualEstimatePending = false
         startDirectVisualEstimate()
     }
@@ -1240,6 +1511,19 @@ class MainActivity : ComponentActivity() {
                 )
                 .reduce(Phase14WorkflowEvent.RegionOfInterestSelected(roi))
         }
+        val levelRoll = intent.doubleExtraOrNull("visualEstimateLevelRollDeg")
+        if (levelRoll != null) {
+            val snapshot = LevelReferenceSnapshot(
+                rollDegrees = levelRoll,
+                pitchDegrees = intent.doubleExtraOrNull("visualEstimateLevelPitchDeg"),
+                sampleCount = intent.intExtraOrNull("visualEstimateLevelSamples") ?: 30,
+                source = LevelReferenceSource.GRAVITY_SENSOR,
+                displayRotation = currentLevelReferenceDisplayRotation(),
+                maxGyroMagnitudeRadPerSecond = intent.doubleExtraOrNull("visualEstimateLevelMaxGyroRadPerSec") ?: 0.0,
+                capturedAtEpochMillis = System.currentTimeMillis(),
+            )
+            phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.LevelReferenceCaptured(snapshot))
+        }
     }
 
     private fun updatePhase14Geometry() {
@@ -1250,6 +1534,7 @@ class MainActivity : ComponentActivity() {
         } else {
             phase14WorkflowState.reduce(Phase14WorkflowEvent.GeometryChanged(mode.toPhase14Geometry()))
         }
+        applyDebugVisualEstimateSetupFromIntent()
     }
 
     private fun useKnownDistanceSetup() {
@@ -1930,13 +2215,18 @@ class MainActivity : ComponentActivity() {
     private fun retryDirectVisualEstimate() {
         phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.Retry)
         lastDirectVisualEstimateOutcome = null
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = null
         updateShellState(status = "Visual estimate retry ready")
     }
 
     private fun recalibrateDirectVisualEstimate() {
+        enterSetupMode()
         phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.Recalibrate)
         calibrationWorkflowState = CalibrationWorkflowState()
         debugVisualEstimateKnownBallDiameterFeet = null
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = null
         updateLegacyWorkflowFromPhase14()
         updateShellState(status = "Recalibrate estimate")
     }
@@ -2013,6 +2303,7 @@ class MainActivity : ComponentActivity() {
             mode = mode,
             readbackWidth = readbackWidth,
             readbackHeight = readbackHeight,
+            attemptId = visualEstimateAttemptId,
             calibration = calibrationWorkflowState.toMeasurementCalibrationState(),
             framePipelineConfig = VisualEstimateFramePipelineConfig(
                 trackConfig = TrackExtractionConfig(
@@ -2087,6 +2378,8 @@ class MainActivity : ComponentActivity() {
         shellState = speedBallCaptureState(
             permissionLabel = if (hasCameraPermission()) "Granted" else "Not granted",
             captureStatus = status,
+            appMode = appMode,
+            runCommandState = runCommandState,
             modeLines = modes.map { mode ->
                 val support = if (mode.recordSupported && mode.fps == 120) "recordable" else "unsupported for Phase 4 record"
                 "${mode.label} ($support)"
@@ -2108,6 +2401,7 @@ class MainActivity : ComponentActivity() {
             setupAdjustmentTargetLabel = setupAdjustmentTarget.label,
             knownDistanceFeetText = knownDistanceFeetText,
             previewRotationDegrees = previewRotationDegrees,
+            visualEstimateReport = visibleVisualEstimateReport(),
             workflowFrameWidth = selectedMode?.width ?: 0,
             workflowFrameHeight = selectedMode?.height ?: 0,
         )
@@ -2150,6 +2444,14 @@ class MainActivity : ComponentActivity() {
             Surface.ROTATION_180 -> 180
             Surface.ROTATION_270 -> 270
             else -> 0
+        }
+
+    private fun currentLevelReferenceDisplayRotation(): LevelReferenceDisplayRotation =
+        when (currentDisplayRotation()) {
+            Surface.ROTATION_90 -> LevelReferenceDisplayRotation.ROTATION_90
+            Surface.ROTATION_180 -> LevelReferenceDisplayRotation.ROTATION_180
+            Surface.ROTATION_270 -> LevelReferenceDisplayRotation.ROTATION_270
+            else -> LevelReferenceDisplayRotation.ROTATION_0
         }
 
     private fun refreshPreviewOrientation() {
@@ -2397,7 +2699,10 @@ class MainActivity : ComponentActivity() {
         const val IMPORT_ESTIMATE_MIN_BLOB_AREA_PX = 4
         const val HIT_BALL_MIN_ESTIMATE_MPH = 25.0
         const val AUTO_RECORD_ESTIMATE_DURATION_MILLIS = 3_000L
+        const val VOICE_IDLE_RESTART_DELAY_MILLIS = 250L
         const val VOICE_RESTART_DELAY_MILLIS = 350L
+        const val VOICE_RESTART_MAX_DELAY_MILLIS = 2_800L
+        const val VOICE_RESTART_MAX_CONSECUTIVE_ERRORS = 3
         const val READY_BEEP_COUNT = 3
         const val READY_BEEP_DURATION_MILLIS = 110
         const val READY_BEEP_SPACING_MILLIS = 170L

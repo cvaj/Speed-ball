@@ -137,8 +137,11 @@ screen coordinates, and preserves the oriented camera aspect ratio instead of
 stretching the image. Draggable
 vertical A/B caliper lines, the user-entered distance in feet, a tap-sampled
 live ball color point, and the ROI rectangle feed the same reducer used by live
-and import estimate paths. Import mode is estimate-only and uses the existing
-detector/calibration/estimate pipeline.
+and import estimate paths. Editing the distance field overwrites the active
+known-distance feet value while preserving A/B points; invalid distance text is
+stored as not-ready state and cannot arm live capture or feed import
+calibration as a stale older value. Import mode is estimate-only and uses the
+existing detector/calibration/estimate pipeline.
 
 ## Phase 8 Pure Measurement Foundation
 
@@ -165,21 +168,81 @@ time-spread gates still see gaps.
 
 ## Phase 13 S10+ Visual Estimate Path
 
-The setup drawer button labeled `Est 120` starts this path. The readiness-gated
-voice command `shoot` also starts this path after the Ready voice and three
-beeps. It uses the selected fixed 120 fps Camera2 high-speed mode, but it does
-not create a MediaRecorder MP4 or decode a file; it reads app-owned frames
-through the direct GL/readback surface and runs the live estimate pipeline.
+Setup Mode owns camera permission, selected high-speed mode, A/B caliper
+positions, raw distance text and parsed feet, color sample, ROI, level reference,
+and fallback/import setup. Run Mode consumes that setup but does not edit it as
+the normal surface. Entering Run Mode and every `shoot` re-checks the same setup
+gates; invalid setup produces a specific run-state reason and does not start
+capture.
+
+The setup drawer button labeled `Est 120`, the Run Mode manual `Shoot` button,
+and the readiness-gated voice command `shoot` all start the direct visual
+estimate path. The voice path first speaks Ready and plays three short beeps.
+It uses the selected fixed 120 fps Camera2 high-speed mode, but it does not
+create a MediaRecorder MP4 or decode a file; it reads app-owned frames through
+the direct GL/readback surface and runs the live estimate pipeline. The setup
+preview surface is required before capture so the user can align distance, ROI,
+color, calipers, and level, but it is not a direct-capture target.
+`VisualEstimateFramePipeline` receives only GL/readback frames. The visible
+preview may go black while the bounded direct capture owns the camera; the setup
+preview is restarted after completion, failure, or no-read.
+
+```text
+DirectVisualEstimateCapture
+  -> snapshot bounded DirectArgbFrame list
+  -> convert same frame copy to RgbFrame list
+  -> VisualEstimateFramePipeline.estimateFromFramesWithTrace
+  -> estimator-owned BlobDetector trace and selected samples
+  -> VisualEstimateCaptureProofBuilder bounded thumbnails
+  -> clear full DirectArgbFrame/RgbFrame buffers
+  -> DirectVisualEstimateCaptureOutcome with bounded proof only
+  -> attempt-scoped VisualEstimateReport
+```
+
+Capture proof is one-attempt-deep and in memory by default. It contains
+low-resolution thumbnail pixels, ROI/candidate/selected overlays, readback
+dimensions, frame callback counts, unique sensor timestamp count, and bounded
+detector counts. It does not contain mph, angle, distance, raw media paths, or a
+strict timing-proof token. No-read and failure reports use the proof to explain
+whether zero frames, zero candidates, too few candidate frames, or too few
+selected samples caused the attempt to fail loud.
 On success, estimate result formatting includes speed, launch angle, and a
 carry-distance estimate computed through the existing trajectory simulator.
 The camera UI presents those values in a black full-screen result overlay only
 while the current capture status is a successful estimate-complete state. Ready
-states, active capture, and no-read outcomes report status/no-read text instead
-of showing the result overlay.
+states and active capture do not show that result overlay. No-read and direct
+failure outcomes produce a typed report from `VisualEstimateOutcome.NoRead` and
+render it as a non-fullscreen bottom panel with reason/action/message and no
+mph, angle, or distance values while the setup preview holder remains present.
+Readiness-blocked `shoot` commands do not start capture; they show and log a
+specific `VOICE_SHOOT_NOT_READY` reason from calibration/color/ROI/level
+readiness state.
+
+Run command state is explicit and separate from capture status:
+
+```text
+Setup Mode state
+  -> SpeedBallAppMode.Setup
+  -> raw distance text + parsed readiness
+  -> valid setup gates
+  -> SpeedBallAppMode.Run
+  -> SpeedBallRunCommandState.ManualReady / Listening / VoiceRetrying /
+     VoiceUnavailable / VoiceError / Capturing / Reporting / SetupInvalid
+```
+
+Green listening is set only from `onReadyForSpeech` after setup is still valid.
+Speech recognizer `ERROR_NO_MATCH` and `ERROR_SPEECH_TIMEOUT` are idle-listening
+events, so they clear the consecutive-error count and schedule another listen
+window without degrading voice. Other recognizer errors use one delayed restart
+runnable, bounded backoff, and a consecutive-error cap before degrading to
+manual-ready/voice-error state. Manual Run Mode `Shoot` remains available
+whenever setup is valid, including voice unavailable/error/retrying states, but
+voice remains the primary hands-free command path.
 
 ```text
 MainActivity / DirectVisualEstimateCapture
-  -> Camera2 constrained high-speed direct SurfaceTexture target
+  -> begin monotonic visual-estimate attempt id
+  -> Camera2 constrained high-speed direct GL/readback SurfaceTexture target
   -> SurfaceTexture.updateTexImage()
   -> bounded GL readback to DirectArgbFrame
   -> TimedFrameSequence from app-owned full-frame/ROI RGB frames
@@ -195,8 +258,17 @@ MainActivity / DirectVisualEstimateCapture
   -> VelocityMeasurementCalculator with estimate residual threshold
   -> confidence/no-read gates
   -> VisualEstimateOutcome.Success or VisualEstimateOutcome.NoRead
-  -> estimate-only result UI
+  -> typed VisualEstimateReport(attemptId, kind, lines, dismiss key)
+  -> success-only ResultOverlay OR non-destructive no-read/failure bottom panel
+  -> CLEAR dismisses only that attempt id
 ```
+
+`updateShellState()` does not derive report visibility from volatile status
+strings. It receives the currently owned attempt report, excluding an attempt id
+that has been cleared. Setup edits, status changes, distance edits, live-feed
+restarts, and voice-listener updates therefore cannot resurrect the same old
+report after `CLEAR`; the next shot gets a new attempt id and can show a new
+report.
 
 This path is for the S10+ personal estimate mode, not certified measurement.
 Real per-frame timestamps anchor absolute time when available. If a frame
@@ -510,4 +582,10 @@ it checks the same Phase 14 `canArm()` gate used by the visual estimate setup,
 prints `Ready to shoot`, speaks `Ready`, plays three short beeps, and then
 starts `Est 120`/`DirectVisualEstimateCapture`. It must not route through the
 MediaRecorder/decode path on S10+. If readiness fails, the status row reports
-the missing condition and listening continues.
+the specific condition, logcat records `VOICE_SHOOT_NOT_READY`, and listening
+continues.
+Starting direct visual estimate also requires the current visible preview
+surface. If the surface is missing, the status row reports `Live feed required`.
+The preview surface is a setup-readiness gate only; direct capture does not pass
+that surface into its Camera2 request. The setup feed restarts after direct
+completion, failure, or no-read.

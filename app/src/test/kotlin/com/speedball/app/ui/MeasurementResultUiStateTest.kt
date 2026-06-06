@@ -16,6 +16,7 @@ import com.speedball.core.physics.TrajectoryResult
 import com.speedball.core.physics.TrajectorySample
 import com.speedball.core.velocity.VelocityFitResult
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.nio.file.Files
@@ -165,6 +166,106 @@ class MeasurementResultUiStateTest {
         assertTrue(joined.contains("result=estimate-no-read"))
         assertTrue(joined.contains("reason=PLANAR_ASSUMPTION_VIOLATED"))
         assertTrue(joined.contains("action=keep-ball-across-calibrated-plane"))
+        assertNoResultValues(joined)
+    }
+
+    @Test
+    fun visualEstimateNoReadReportShowsReasonActionMessageWithoutValues() {
+        val report = visualEstimateReportFor(
+            attemptId = 7L,
+            outcome = VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.PLANAR_ASSUMPTION_VIOLATED,
+                message = "Depth motion violates the calibrated-plane estimate assumption.",
+            ),
+        )
+        val joined = requireNotNull(report).lines.joinToString("\n")
+
+        assertTrue(report.kind == VisualEstimateReportKind.NoRead)
+        assertTrue(report.attemptId == 7L)
+        assertTrue(joined.contains("NO READ"))
+        assertTrue(joined.contains("REASON PLANAR_ASSUMPTION_VIOLATED"))
+        assertTrue(joined.contains("ACTION keep-ball-across-calibrated-plane"))
+        assertTrue(joined.contains("MESSAGE Depth motion"))
+        assertNoResultValues(joined)
+    }
+
+    @Test
+    fun visualEstimateFailureReportUsesFailureKindWithoutValues() {
+        val report = visualEstimateReportFor(
+            attemptId = 8L,
+            outcome = VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = "Direct visual estimate session configuration failed.",
+            ),
+            failure = true,
+        )
+        val joined = requireNotNull(report).lines.joinToString("\n")
+
+        assertTrue(report.kind == VisualEstimateReportKind.Failure)
+        assertTrue(report.attemptId == 8L)
+        assertTrue(joined.contains("CAPTURE FAILED"))
+        assertTrue(joined.contains("REASON RESOURCE_LIMIT_EXCEEDED"))
+        assertTrue(joined.contains("ACTION reduce-frame-processing-load"))
+        assertNoResultValues(joined)
+    }
+
+    @Test
+    fun visualEstimateSuccessReportContainsOnlyTypedSuccessValues() {
+        val outcome = VisualEstimateResultFactory.successOrNoRead(
+            milesPerHour = 68.18182,
+            launchAngleDegrees = 12.0,
+            diagnostics = VisualEstimateDiagnostics(
+                frameCount = 4,
+                detectionCount = 4,
+                timingBasis = EstimateTimingBasis.REAL_PER_FRAME_TIMESTAMPS,
+                timestampGapSummary = TimestampGapSummary(
+                    intervalCount = 3,
+                    minGapSeconds = 0.1,
+                    medianGapSeconds = 0.1,
+                    maxGapSeconds = 0.1,
+                ),
+                fitResidualPx = 1.0,
+                confidence = VisualEstimateConfidence.LOW,
+            ),
+        )
+
+        val report = visualEstimateReportFor(9L, outcome)
+        val joined = requireNotNull(report).lines.joinToString("\n")
+
+        assertTrue(report.kind == VisualEstimateReportKind.Success)
+        assertTrue(report.attemptId == 9L)
+        assertTrue(joined.contains("VELOCITY 68.2 MPH"))
+        assertTrue(joined.contains("ANGLE 12.0 DEG"))
+        assertTrue(report.dismissToken.startsWith("visual-estimate-report-attempt-"))
+    }
+
+    @Test
+    fun visualEstimateReportIdentityChangesOnlyWithAttemptId() {
+        val outcome = VisualEstimateOutcome.NoRead(
+            reason = VisualEstimateNoReadReason.DETECTION_FAILED,
+            message = "No visible ball.",
+        )
+
+        val first = requireNotNull(visualEstimateReportFor(10L, outcome))
+        val second = requireNotNull(visualEstimateReportFor(11L, outcome))
+
+        assertNotEquals(first.attemptId, second.attemptId)
+        assertNotEquals(first.dismissToken, second.dismissToken)
+        assertTrue(first.lines == second.lines)
+    }
+
+    @Test
+    fun directSessionFailureNoReadNeverDisplaysSpeedOrAngleValues() {
+        val joined = visualEstimateOutcomeUiLines(
+            VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = "Direct visual estimate session configuration failed.",
+            ),
+        ).joinToString("\n")
+
+        assertTrue(joined.contains("result=estimate-no-read"))
+        assertTrue(joined.contains("reason=RESOURCE_LIMIT_EXCEEDED"))
+        assertTrue(joined.contains("action=reduce-frame-processing-load"))
         assertNoResultValues(joined)
     }
 

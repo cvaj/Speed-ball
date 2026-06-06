@@ -1,6 +1,7 @@
 package com.speedball.app.measurement
 
 import com.speedball.core.model.ImagePoint
+import java.util.IdentityHashMap
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -38,92 +39,161 @@ object VisualEstimateFramePipeline {
         sequence: TimedFrameSequence,
         calibration: MeasurementCalibrationState,
         config: VisualEstimateFramePipelineConfig,
-    ): VisualEstimateOutcome {
-        val samples = when (val outcome = extractSamples(sequence, config.trackConfig)) {
+    ): VisualEstimateOutcome =
+        estimateFromFramesWithTrace(sequence, calibration, config).outcome
+
+    fun estimateFromFramesWithTrace(
+        sequence: TimedFrameSequence,
+        calibration: MeasurementCalibrationState,
+        config: VisualEstimateFramePipelineConfig,
+    ): VisualEstimateFramePipelineResult {
+        val extraction = extractSamplesWithTrace(sequence, config.trackConfig)
+        val samples = when (val outcome = extraction.outcome) {
             is VisualEstimateSampleExtractionOutcome.Success -> outcome.samples
-            is VisualEstimateSampleExtractionOutcome.Failure -> return outcome.toNoRead(
-                frameCount = sequence.frames.size,
-                timingBasis = config.timing.noReadTimingBasis(sequence.frames),
+            is VisualEstimateSampleExtractionOutcome.Failure -> {
+                val noRead = outcome.toNoRead(
+                    frameCount = sequence.frames.size,
+                    timingBasis = config.timing.noReadTimingBasis(sequence.frames),
+                    trace = extraction.trace,
+                )
+                return VisualEstimateFramePipelineResult(
+                    outcome = noRead,
+                    detectorTrace = extraction.trace.withOutcome(noRead),
+                )
+            }
+        }
+        val outcome = estimateSamplesWithPolicy(samples, calibration, config)
+        return VisualEstimateFramePipelineResult(
+            outcome = outcome,
+            detectorTrace = extraction.trace.withOutcome(outcome),
+        )
+    }
+
+    private fun extractSamplesWithTrace(
+        sequence: TimedFrameSequence,
+        config: TrackExtractionConfig,
+    ): VisualEstimateSampleExtractionWithTrace {
+        val traceBuilder = VisualEstimateDetectorTraceBuilder(config.detectorConfig)
+        validateSequenceForEstimate(sequence, config.detectorConfig.bounds)?.let {
+            return VisualEstimateSampleExtractionWithTrace(
+                outcome = VisualEstimateSampleExtractionOutcome.Failure(it.reason.toVisualReason(), it.message),
+                trace = traceBuilder.build(),
             )
         }
-        return estimateSamplesWithPolicy(samples, calibration, config)
+        if (!config.maxFrameToFrameJumpPx.isFinite() || config.maxFrameToFrameJumpPx <= 0.0 || config.maxInteriorMisses < 0) {
+            return VisualEstimateSampleExtractionWithTrace(
+                outcome = VisualEstimateSampleExtractionOutcome.Failure(
+                    VisualEstimateNoReadReason.DETECTION_FAILED,
+                    "Track gates must be finite and positive.",
+                ),
+                trace = traceBuilder.build(),
+            )
+        }
+        return if (config.allowDirectionalCandidateSelection) {
+            extractDirectionalSamples(sequence, config, traceBuilder)
+        } else {
+            extractSingleBlobSamples(sequence, config, traceBuilder)
+        }
+    }
+
+    private fun extractSingleBlobSamples(
+        sequence: TimedFrameSequence,
+        config: TrackExtractionConfig,
+        traceBuilder: VisualEstimateDetectorTraceBuilder,
+    ): VisualEstimateSampleExtractionWithTrace {
+        val samples = mutableListOf<VisualEstimateTrackSample>()
+        var previousCentroid: ImagePoint? = null
+        var interiorMisses = 0
+        sequence.frames.forEachIndexed { index, frame ->
+            val detection = BlobDetector.detectCandidates(frame, config.detectorConfig)
+            val singleBlob = detection.toSingleBlobOutcome()
+            traceBuilder.recordFrame(index, frame, detection)
+            when (singleBlob) {
+                is BlobDetectionOutcome.Failure -> {
+                    if (singleBlob.reason == MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED) {
+                        return VisualEstimateSampleExtractionWithTrace(
+                            outcome = VisualEstimateSampleExtractionOutcome.Failure(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, singleBlob.message),
+                            trace = traceBuilder.build(),
+                        )
+                    }
+                    if (singleBlob.kind != BlobDetectionFailureKind.NO_BLOB || index == 0 || index == sequence.frames.lastIndex) {
+                        return VisualEstimateSampleExtractionWithTrace(
+                            outcome = VisualEstimateSampleExtractionOutcome.Failure(singleBlob.reason.toVisualReason(), singleBlob.message),
+                            trace = traceBuilder.build(),
+                        )
+                    }
+                    interiorMisses += 1
+                    if (interiorMisses > config.maxInteriorMisses) {
+                        return VisualEstimateSampleExtractionWithTrace(
+                            outcome = VisualEstimateSampleExtractionOutcome.Failure(
+                                VisualEstimateNoReadReason.DETECTION_FAILED,
+                                "Too many interior frames had no usable ball detection.",
+                            ),
+                            trace = traceBuilder.build(),
+                        )
+                    }
+                }
+                is BlobDetectionOutcome.Success -> {
+                    val centroid = singleBlob.blob.centroid
+                    previousCentroid?.let { previous ->
+                        if (centroid.distanceTo(previous) > config.maxFrameToFrameJumpPx) {
+                            return VisualEstimateSampleExtractionWithTrace(
+                                outcome = VisualEstimateSampleExtractionOutcome.Failure(
+                                    VisualEstimateNoReadReason.DETECTION_FAILED,
+                                    "Detected ball movement exceeded the frame-to-frame jump gate.",
+                                ),
+                                trace = traceBuilder.build(),
+                            )
+                        }
+                    }
+                    traceBuilder.markSelected(frame, singleBlob.blob)
+                    samples += VisualEstimateTrackSample(
+                        timestampSeconds = frame.timestampSeconds,
+                        xPx = centroid.xPx,
+                        yPx = centroid.yPx,
+                        apparentDiameterPx = min(singleBlob.blob.bounds.width, singleBlob.blob.bounds.height).toDouble(),
+                    )
+                    previousCentroid = centroid
+                }
+            }
+        }
+        return VisualEstimateSampleExtractionWithTrace(
+            outcome = VisualEstimateSampleExtractionOutcome.Success(samples),
+            trace = traceBuilder.build(),
+        )
     }
 
     private fun extractSamples(
         sequence: TimedFrameSequence,
         config: TrackExtractionConfig,
     ): VisualEstimateSampleExtractionOutcome {
-        validateSequenceForEstimate(sequence, config.detectorConfig.bounds)?.let {
-            return VisualEstimateSampleExtractionOutcome.Failure(it.reason.toVisualReason(), it.message)
-        }
-        if (!config.maxFrameToFrameJumpPx.isFinite() || config.maxFrameToFrameJumpPx <= 0.0 || config.maxInteriorMisses < 0) {
-            return VisualEstimateSampleExtractionOutcome.Failure(
-                VisualEstimateNoReadReason.DETECTION_FAILED,
-                "Track gates must be finite and positive.",
-            )
-        }
-        if (config.allowDirectionalCandidateSelection) {
-            return extractDirectionalSamples(sequence, config)
-        }
-
-        val samples = mutableListOf<VisualEstimateTrackSample>()
-        var previousCentroid: ImagePoint? = null
-        var interiorMisses = 0
-        sequence.frames.forEachIndexed { index, frame ->
-            when (val detection = BlobDetector.detect(frame, config.detectorConfig)) {
-                is BlobDetectionOutcome.Failure -> {
-                    if (detection.reason == MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED) {
-                        return VisualEstimateSampleExtractionOutcome.Failure(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, detection.message)
-                    }
-                    if (detection.kind != BlobDetectionFailureKind.NO_BLOB || index == 0 || index == sequence.frames.lastIndex) {
-                        return VisualEstimateSampleExtractionOutcome.Failure(detection.reason.toVisualReason(), detection.message)
-                    }
-                    interiorMisses += 1
-                    if (interiorMisses > config.maxInteriorMisses) {
-                        return VisualEstimateSampleExtractionOutcome.Failure(
-                            VisualEstimateNoReadReason.DETECTION_FAILED,
-                            "Too many interior frames had no usable ball detection.",
-                        )
-                    }
-                }
-                is BlobDetectionOutcome.Success -> {
-                    val centroid = detection.blob.centroid
-                    previousCentroid?.let { previous ->
-                        if (centroid.distanceTo(previous) > config.maxFrameToFrameJumpPx) {
-                            return VisualEstimateSampleExtractionOutcome.Failure(
-                                VisualEstimateNoReadReason.DETECTION_FAILED,
-                                "Detected ball movement exceeded the frame-to-frame jump gate.",
-                            )
-                        }
-                    }
-                    samples += VisualEstimateTrackSample(
-                        timestampSeconds = frame.timestampSeconds,
-                        xPx = centroid.xPx,
-                        yPx = centroid.yPx,
-                        apparentDiameterPx = min(detection.blob.bounds.width, detection.blob.bounds.height).toDouble(),
-                    )
-                    previousCentroid = centroid
-                }
-            }
-        }
-        return VisualEstimateSampleExtractionOutcome.Success(samples)
+        return extractSamplesWithTrace(sequence, config).outcome
     }
 }
 
 private fun extractDirectionalSamples(
     sequence: TimedFrameSequence,
     config: TrackExtractionConfig,
-): VisualEstimateSampleExtractionOutcome {
+    traceBuilder: VisualEstimateDetectorTraceBuilder,
+): VisualEstimateSampleExtractionWithTrace {
     val frameCandidates = mutableListOf<Pair<RgbFrame, List<Blob>>>()
-    sequence.frames.forEach { frame ->
+    sequence.frames.forEachIndexed { index, frame ->
         when (val detection = BlobDetector.detectCandidates(frame, config.detectorConfig)) {
             is BlobCandidateDetectionOutcome.Failure -> {
+                traceBuilder.recordFrame(index, frame, detection)
                 if (detection.reason == MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED) {
-                    return VisualEstimateSampleExtractionOutcome.Failure(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, detection.message)
+                    return VisualEstimateSampleExtractionWithTrace(
+                        outcome = VisualEstimateSampleExtractionOutcome.Failure(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, detection.message),
+                        trace = traceBuilder.build(),
+                    )
                 }
-                return VisualEstimateSampleExtractionOutcome.Failure(detection.reason.toVisualReason(), detection.message)
+                return VisualEstimateSampleExtractionWithTrace(
+                    outcome = VisualEstimateSampleExtractionOutcome.Failure(detection.reason.toVisualReason(), detection.message),
+                    trace = traceBuilder.build(),
+                )
             }
             is BlobCandidateDetectionOutcome.Success -> {
+                traceBuilder.recordFrame(index, frame, detection)
                 if (detection.blobs.isNotEmpty()) {
                     frameCandidates += frame to detection.blobs
                 }
@@ -131,9 +201,12 @@ private fun extractDirectionalSamples(
         }
     }
     if (frameCandidates.size < 4) {
-        return VisualEstimateSampleExtractionOutcome.Failure(
-            VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
-            "At least four usable detections are required for an estimate.",
+        return VisualEstimateSampleExtractionWithTrace(
+            outcome = VisualEstimateSampleExtractionOutcome.Failure(
+                VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
+                "At least four usable detections are required for an estimate.",
+            ),
+            trace = traceBuilder.build(),
         )
     }
     val selected = if (config.seedPoint != null) {
@@ -141,19 +214,26 @@ private fun extractDirectionalSamples(
     } else {
         selectHighVelocityDirectionalTrack(frameCandidates, config)
     }
-        ?: return VisualEstimateSampleExtractionOutcome.Failure(
-            VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
-            "Multiple blobs did not form one coherent horizontal ball track or seeded moving ball track.",
+        ?: return VisualEstimateSampleExtractionWithTrace(
+            outcome = VisualEstimateSampleExtractionOutcome.Failure(
+                VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
+                "Multiple blobs did not form one coherent horizontal ball track or seeded moving ball track.",
+            ),
+            trace = traceBuilder.build(),
         )
-    return VisualEstimateSampleExtractionOutcome.Success(
-        selected.map { (frame, blob) ->
-            VisualEstimateTrackSample(
-                timestampSeconds = frame.timestampSeconds,
-                xPx = blob.centroid.xPx,
-                yPx = blob.centroid.yPx,
-                apparentDiameterPx = min(blob.bounds.width, blob.bounds.height).toDouble(),
-            )
-        },
+    selected.forEach { (frame, blob) -> traceBuilder.markSelected(frame, blob) }
+    return VisualEstimateSampleExtractionWithTrace(
+        outcome = VisualEstimateSampleExtractionOutcome.Success(
+            selected.map { (frame, blob) ->
+                VisualEstimateTrackSample(
+                    timestampSeconds = frame.timestampSeconds,
+                    xPx = blob.centroid.xPx,
+                    yPx = blob.centroid.yPx,
+                    apparentDiameterPx = min(blob.bounds.width, blob.bounds.height).toDouble(),
+                )
+            },
+        ),
+        trace = traceBuilder.build(),
     )
 }
 
@@ -637,9 +717,15 @@ private sealed interface VisualEstimateSampleExtractionOutcome {
     ) : VisualEstimateSampleExtractionOutcome
 }
 
+private data class VisualEstimateSampleExtractionWithTrace(
+    val outcome: VisualEstimateSampleExtractionOutcome,
+    val trace: VisualEstimateDetectorTrace,
+)
+
 private fun VisualEstimateSampleExtractionOutcome.Failure.toNoRead(
     frameCount: Int,
     timingBasis: EstimateTimingBasis,
+    trace: VisualEstimateDetectorTrace,
 ): VisualEstimateOutcome.NoRead =
     VisualEstimateOutcome.NoRead(
         reason = reason,
@@ -651,8 +737,89 @@ private fun VisualEstimateSampleExtractionOutcome.Failure.toNoRead(
             timestampGapSummary = null,
             fitResidualPx = null,
             confidence = null,
+            candidateFrameCount = trace.detectorSummary.candidateFrameCount,
+            candidateBlobCount = trace.detectorSummary.candidateBlobCount,
+            selectedSampleCount = trace.detectorSummary.selectedSampleCount,
         ),
     )
+
+private class VisualEstimateDetectorTraceBuilder(
+    private val detectorConfig: BlobDetectionConfig,
+) {
+    private val frameIndexesByIdentity = IdentityHashMap<RgbFrame, Int>()
+    private val frames = mutableListOf<MutableDetectorFrameTrace>()
+
+    fun recordFrame(
+        frameIndex: Int,
+        frame: RgbFrame,
+        detection: BlobCandidateDetectionOutcome,
+    ) {
+        val roi = detectorConfig.roi.clippedTo(frame.width, frame.height)
+        val allCandidates = when (detection) {
+            is BlobCandidateDetectionOutcome.Success -> detection.blobs
+            is BlobCandidateDetectionOutcome.Failure -> emptyList()
+        }
+        frameIndexesByIdentity[frame] = frames.size
+        frames += MutableDetectorFrameTrace(
+            frameIndex = frameIndex,
+            timestampSeconds = frame.timestampSeconds,
+            roi = roi,
+            candidateCount = allCandidates.size,
+            candidates = allCandidates.take(MAX_TRACE_CANDIDATES_PER_FRAME),
+        )
+    }
+
+    fun markSelected(frame: RgbFrame, blob: Blob) {
+        val index = frameIndexesByIdentity[frame] ?: return
+        frames[index] = frames[index].copy(selectedBlob = blob)
+    }
+
+    fun build(): VisualEstimateDetectorTrace =
+        VisualEstimateDetectorTrace(
+            detectorConfig = detectorConfig,
+            frames = frames.map {
+                VisualEstimateDetectorFrameTrace(
+                    frameIndex = it.frameIndex,
+                    timestampSeconds = it.timestampSeconds,
+                    roi = it.roi,
+                    candidateCount = it.candidateCount,
+                    candidates = it.candidates,
+                    selectedBlob = it.selectedBlob,
+                )
+            },
+        )
+}
+
+private data class MutableDetectorFrameTrace(
+    val frameIndex: Int,
+    val timestampSeconds: Double,
+    val roi: RegionOfInterest?,
+    val candidateCount: Int,
+    val candidates: List<Blob>,
+    val selectedBlob: Blob? = null,
+)
+
+private fun BlobCandidateDetectionOutcome.toSingleBlobOutcome(): BlobDetectionOutcome =
+    when (this) {
+        is BlobCandidateDetectionOutcome.Failure -> BlobDetectionOutcome.Failure(
+            reason = reason,
+            message = message,
+            kind = kind,
+        )
+        is BlobCandidateDetectionOutcome.Success -> when (blobs.size) {
+            0 -> BlobDetectionOutcome.Failure(
+                MeasurementRunFailure.DETECTION_FAILED,
+                "No single ball blob was detected.",
+                BlobDetectionFailureKind.NO_BLOB,
+            )
+            1 -> BlobDetectionOutcome.Success(blobs.single())
+            else -> BlobDetectionOutcome.Failure(
+                MeasurementRunFailure.DETECTION_FAILED,
+                "Multiple ball-like blobs were detected.",
+                BlobDetectionFailureKind.AMBIGUOUS_BLOBS,
+            )
+        }
+    }
 
 private fun validateSequenceForEstimate(
     sequence: TimedFrameSequence,
@@ -683,3 +850,5 @@ private fun MeasurementRunFailure.toVisualReason(): VisualEstimateNoReadReason =
         MeasurementRunFailure.MEASUREMENT_REJECTED -> VisualEstimateNoReadReason.EXCESSIVE_RESIDUAL
         MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED -> VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED
     }
+
+private const val MAX_TRACE_CANDIDATES_PER_FRAME = 16

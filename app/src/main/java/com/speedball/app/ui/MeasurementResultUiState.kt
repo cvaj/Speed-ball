@@ -3,6 +3,7 @@ package com.speedball.app.ui
 import com.speedball.app.measurement.MeasurementPipeline
 import com.speedball.app.measurement.MeasurementRunFailure
 import com.speedball.app.measurement.MeasurementRunOutcome
+import com.speedball.app.measurement.VisualEstimateCaptureProof
 import com.speedball.app.measurement.VisualEstimateNoReadReason
 import com.speedball.app.measurement.VisualEstimateOutcome
 import com.speedball.core.physics.LaunchState
@@ -15,6 +16,22 @@ sealed interface MeasurementResultUiState {
     data object Running : MeasurementResultUiState
     data class Outcome(val outcome: MeasurementRunOutcome) : MeasurementResultUiState
     data class EstimateOutcome(val outcome: VisualEstimateOutcome) : MeasurementResultUiState
+}
+
+/** Display contract for a visual-estimate report after a capture attempt. */
+data class VisualEstimateReport(
+    val attemptId: Long,
+    val kind: VisualEstimateReportKind,
+    val lines: List<String>,
+    val dismissToken: String,
+    val captureProof: VisualEstimateCaptureProof? = null,
+)
+
+/** Separates success overlays from non-destructive no-read/failure panels. */
+enum class VisualEstimateReportKind {
+    Success,
+    NoRead,
+    Failure,
 }
 
 fun measurementResultUiLines(state: MeasurementResultUiState): List<String> =
@@ -44,6 +61,39 @@ fun visualEstimateOutcomeUiLines(outcome: VisualEstimateOutcome): List<String> =
         is VisualEstimateOutcome.Success -> estimateSuccessUiLines(outcome)
     }
 
+/** Builds the capture report shown after a visual-estimate attempt. */
+fun visualEstimateReportFor(
+    attemptId: Long,
+    outcome: VisualEstimateOutcome?,
+    failure: Boolean = false,
+    captureProof: VisualEstimateCaptureProof? = null,
+): VisualEstimateReport? {
+    val estimateOutcome = outcome ?: return null
+    val kind = when (estimateOutcome) {
+        is VisualEstimateOutcome.Success -> VisualEstimateReportKind.Success
+        is VisualEstimateOutcome.NoRead ->
+            if (failure) {
+                VisualEstimateReportKind.Failure
+            } else {
+                VisualEstimateReportKind.NoRead
+            }
+    }
+    val lines = when (estimateOutcome) {
+        is VisualEstimateOutcome.Success -> estimateSuccessReportLines(estimateOutcome)
+        is VisualEstimateOutcome.NoRead -> estimateNoReadReportLines(kind, estimateOutcome)
+    }
+    return VisualEstimateReport(
+        attemptId = attemptId,
+        kind = kind,
+        lines = lines + captureProof.reportLinesFor(kind),
+        dismissToken = visualEstimateDismissKey(attemptId),
+        captureProof = captureProof,
+    )
+}
+
+private fun visualEstimateDismissKey(attemptId: Long): String =
+    "visual-estimate-report-attempt-$attemptId"
+
 private fun noReadUiLines(
     reason: MeasurementRunFailure,
     message: String,
@@ -53,9 +103,47 @@ private fun noReadUiLines(
     )
 
 private fun estimateNoReadUiLines(outcome: VisualEstimateOutcome.NoRead): List<String> =
+    buildList {
+        val diagnostics = outcome.diagnostics
+        add("result=estimate-no-read reason=${outcome.reason} action=${outcome.reason.actionLabel()} message=${outcome.message.compactForResult()}")
+        if (diagnostics != null) {
+            add(
+                "estimate-no-read-diagnostics frames=${diagnostics.frameCount} detections=${diagnostics.detectionCount} " +
+                    "candidateFrames=${diagnostics.candidateFrameCount ?: 0} candidateBlobs=${diagnostics.candidateBlobCount ?: 0} " +
+                    "selectedSamples=${diagnostics.selectedSampleCount ?: 0} timing=${diagnostics.timingBasis}",
+            )
+        }
+    }
+
+private fun estimateNoReadReportLines(
+    kind: VisualEstimateReportKind,
+    outcome: VisualEstimateOutcome.NoRead,
+): List<String> =
     listOf(
-        "result=estimate-no-read reason=${outcome.reason} action=${outcome.reason.actionLabel()} message=${outcome.message.compactForResult()}",
+        if (kind == VisualEstimateReportKind.Failure) "CAPTURE FAILED" else "NO READ",
+        "REASON ${outcome.reason}",
+        "ACTION ${outcome.reason.actionLabel()}",
+        "MESSAGE ${outcome.message.compactForResult()}",
     )
+
+private fun VisualEstimateCaptureProof?.reportLinesFor(kind: VisualEstimateReportKind): List<String> {
+    val proof = this ?: return emptyList()
+    val summary = proof.detectorSummary
+    val base = buildList {
+        add("PROOF frames=${proof.capturedFrameCount} readback=${proof.readbackWidth}x${proof.readbackHeight}")
+        add("DETECTOR candidateFrames=${summary.candidateFrameCount} candidateBlobs=${summary.candidateBlobCount} selectedSamples=${summary.selectedSampleCount}")
+        if (proof.capturedFrameCount == 0) {
+            add("EVIDENCE 0 frames captured")
+        } else if (summary.candidateFrameCount == 0 && kind != VisualEstimateReportKind.Success) {
+            add("EVIDENCE selected color/ROI matched no blobs")
+        }
+    }
+    return if (kind == VisualEstimateReportKind.Success) {
+        base
+    } else {
+        base.filterNot { it.contains("mph", ignoreCase = true) || it.contains("angle", ignoreCase = true) || it.contains("distance", ignoreCase = true) }
+    }
+}
 
 private fun successUiLines(outcome: MeasurementRunOutcome.Success): List<String> =
     listOf(
@@ -81,6 +169,17 @@ private fun estimateSuccessUiLines(outcome: VisualEstimateOutcome.Success): List
         }
     }
 }
+
+private fun estimateSuccessReportLines(outcome: VisualEstimateOutcome.Success): List<String> =
+    buildList {
+        add("VELOCITY ${outcome.milesPerHour.formatResult(1)} MPH")
+        outcome.launchAngleDegrees?.takeIf { it.isFinite() }?.let {
+            add("ANGLE ${it.formatResult(1)} DEG")
+        }
+        estimateCarryFeet(outcome)?.let {
+            add("DISTANCE ${it.formatResult(1)} FT")
+        }
+    }
 
 private fun estimateCarryFeet(outcome: VisualEstimateOutcome.Success): Double? {
     val angle = outcome.launchAngleDegrees?.takeIf { it.isFinite() } ?: return null

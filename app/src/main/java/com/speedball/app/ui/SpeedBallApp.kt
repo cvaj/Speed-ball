@@ -1,13 +1,16 @@
 package com.speedball.app.ui
 
 import android.graphics.Matrix
+import android.graphics.Bitmap
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -19,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -28,10 +32,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,6 +45,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
@@ -53,6 +60,10 @@ import kotlin.math.cos
 import com.speedball.app.measurement.NormalizedFramePoint
 import com.speedball.app.measurement.NormalizedFrameRect
 import com.speedball.app.measurement.Phase14WorkflowState
+import com.speedball.app.measurement.VisualEstimateCaptureProof
+import com.speedball.app.measurement.VisualEstimateProofBlob
+import com.speedball.app.measurement.VisualEstimateProofFrame
+import com.speedball.app.measurement.VisualEstimateProofRect
 import com.speedball.app.measurement.FrameDimensions
 import com.speedball.app.measurement.PreviewFrameTransform
 import com.speedball.app.measurement.PreviewScaleMode
@@ -89,6 +100,10 @@ fun SpeedBallApp(
     onRetryEstimate: () -> Unit = {},
     onRecalibrateEstimate: () -> Unit = {},
     onStopBurst: () -> Unit = {},
+    onEnterRunMode: () -> Unit = {},
+    onEnterSetupMode: () -> Unit = {},
+    onManualShoot: () -> Unit = {},
+    onDismissVisualEstimateReport: (Long) -> Unit = {},
 ) {
     MaterialTheme(
         colorScheme = lightColorScheme(
@@ -132,6 +147,10 @@ fun SpeedBallApp(
                     onRecalibrateEstimate = onRecalibrateEstimate,
                     onStartBurst = onStartBurst,
                     onStopBurst = onStopBurst,
+                    onEnterRunMode = onEnterRunMode,
+                    onEnterSetupMode = onEnterSetupMode,
+                    onManualShoot = onManualShoot,
+                    onDismissVisualEstimateReport = onDismissVisualEstimateReport,
                 )
             }
         }
@@ -168,13 +187,16 @@ private fun SetupPreviewSurface(
     onRecalibrateEstimate: () -> Unit,
     onStartBurst: () -> Unit,
     onStopBurst: () -> Unit,
+    onEnterRunMode: () -> Unit,
+    onEnterSetupMode: () -> Unit,
+    onManualShoot: () -> Unit,
+    onDismissVisualEstimateReport: (Long) -> Unit,
 ) {
     var controlsVisible by remember { mutableStateOf(false) }
     var settingsVisible by remember { mutableStateOf(false) }
     var fineLineDrag by remember { mutableStateOf(false) }
     var dragCaliperAOverrideFraction by remember { mutableStateOf<Float?>(null) }
     var dragCaliperBOverrideFraction by remember { mutableStateOf<Float?>(null) }
-    var dismissedResultOverlayToken by remember { mutableStateOf<String?>(null) }
     val currentPhase14State by rememberUpdatedState(phase14State)
     val currentSetupAdjustmentTargetLabel by rememberUpdatedState(state.setupAdjustmentTargetLabel)
     val currentFineLineDrag by rememberUpdatedState(fineLineDrag)
@@ -186,15 +208,20 @@ private fun SetupPreviewSurface(
     val cameraAspect = sourceDimensions?.let { it.width.toFloat() / it.height.toFloat() } ?: (16f / 9f)
     val captureActive = state.captureStatus.contains("record", ignoreCase = true) ||
         state.captureStatus.contains("running", ignoreCase = true)
-    val showControls = controlsVisible && !captureActive
+    val setupModeActive = state.appMode == SpeedBallAppMode.Setup
+    val runModeActive = state.appMode == SpeedBallAppMode.Run
+    val showControls = setupModeActive && controlsVisible && !captureActive
     val hasSuccessfulResultStatus = isSuccessfulResultStatus(state.captureStatus)
+    val successReport = state.visualEstimateReport?.takeIf { it.kind == VisualEstimateReportKind.Success }
+    val noReadReport = state.visualEstimateReport?.takeIf { it.kind != VisualEstimateReportKind.Success }
     val resultOverlayLines = if (hasSuccessfulResultStatus) {
-        buildResultOverlayLines(state.diagnosticLines)
+        successReport?.lines.orEmpty().filterNot { it.startsWith("PROOF ") || it.startsWith("DETECTOR ") || it.startsWith("EVIDENCE ") }
     } else {
         emptyList()
     }
-    val resultOverlayToken = resultOverlayLines.joinToString(separator = "|")
-    val showResultOverlay = resultOverlayLines.isNotEmpty() && dismissedResultOverlayToken != resultOverlayToken
+    val showResultOverlay = resultOverlayLines.isNotEmpty()
+    val visibleNoReadReport = noReadReport?.takeIf { !showResultOverlay }
+    val showNoReadReport = visibleNoReadReport != null
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -476,6 +503,7 @@ private fun SetupPreviewSurface(
                     onRecalibrateEstimate = onRecalibrateEstimate,
                     onStartBurst = onStartBurst,
                     onStopBurst = onStopBurst,
+                    onEnterRunMode = onEnterRunMode,
                     onClose = { settingsVisible = false },
                     onHide = hideAllTools,
                     modifier = Modifier.align(Alignment.BottomCenter),
@@ -491,13 +519,23 @@ private fun SetupPreviewSurface(
                     onVoiceRecord = onVoiceRecord,
                     onOpenSettings = { settingsVisible = true },
                     onHide = hideAllTools,
+                    onEnterRunMode = onEnterRunMode,
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
             }
-        } else if (!captureActive) {
+        } else if (setupModeActive && !captureActive) {
             ToolsHandle(
                 onClick = { controlsVisible = true },
                 modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        }
+        if (runModeActive && !captureActive && !showResultOverlay) {
+            RunModePanel(
+                captureStatus = state.captureStatus,
+                runCommandState = state.runCommandState,
+                onShoot = onManualShoot,
+                onSetup = onEnterSetupMode,
+                modifier = Modifier.align(Alignment.TopCenter),
             )
         }
         if (captureActive && !showResultOverlay) {
@@ -509,9 +547,20 @@ private fun SetupPreviewSurface(
         if (showResultOverlay) {
             ResultOverlay(
                 lines = resultOverlayLines,
-                onClear = { dismissedResultOverlayToken = resultOverlayToken },
+                proof = successReport?.captureProof,
+                onClear = { successReport?.let { onDismissVisualEstimateReport(it.attemptId) } },
                 modifier = Modifier.align(Alignment.Center),
             )
+        }
+        if (showNoReadReport) {
+            visibleNoReadReport?.let { report ->
+                VisualEstimateNoReadPanel(
+                    lines = report.lines,
+                    proof = report.captureProof,
+                    onClear = { onDismissVisualEstimateReport(report.attemptId) },
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                )
+            }
         }
     }
 }
@@ -549,6 +598,53 @@ private fun buildResultOverlayLines(lines: List<String>): List<String> {
     }.takeIf { it.isNotEmpty() } ?: emptyList()
 }
 
+@Composable
+private fun VisualEstimateNoReadPanel(
+    lines: List<String>,
+    proof: VisualEstimateCaptureProof?,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .padding(horizontal = 18.dp, vertical = 18.dp)
+            .widthIn(min = 280.dp, max = 680.dp)
+            .background(Color(0xCC102027), RoundedCornerShape(6.dp))
+            .padding(horizontal = 18.dp, vertical = 14.dp),
+        horizontalAlignment = Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        lines.filterNot { it.startsWith("PROOF ") || it.startsWith("DETECTOR ") || it.startsWith("EVIDENCE ") }
+            .forEachIndexed { index, line ->
+            Text(
+                text = line,
+                color = Color.White,
+                style = if (index == 0) MaterialTheme.typography.titleLarge else MaterialTheme.typography.bodyLarge,
+                fontWeight = if (index == 0) FontWeight.Black else FontWeight.Bold,
+                maxLines = if (index >= 3) 3 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        VisualEstimateProofPanel(proof = proof)
+        Box(
+            modifier = Modifier
+                .padding(top = 6.dp)
+                .widthIn(min = 112.dp)
+                .height(38.dp)
+                .background(Color.White, RoundedCornerShape(6.dp))
+                .clickable(onClick = onClear),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "CLEAR",
+                color = Color.Black,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Black,
+            )
+        }
+    }
+}
+
 private fun isSuccessfulResultStatus(status: String): Boolean {
     val normalized = status.lowercase()
     return normalized == "visual estimate complete" ||
@@ -559,6 +655,7 @@ private fun isSuccessfulResultStatus(status: String): Boolean {
 @Composable
 private fun ResultOverlay(
     lines: List<String>,
+    proof: VisualEstimateCaptureProof?,
     onClear: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -580,6 +677,10 @@ private fun ResultOverlay(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        VisualEstimateProofPanel(
+            proof = proof,
+            modifier = Modifier.padding(top = 18.dp),
+        )
         Box(
             modifier = Modifier
                 .padding(top = 28.dp)
@@ -597,6 +698,147 @@ private fun ResultOverlay(
             )
         }
     }
+}
+
+@Composable
+private fun VisualEstimateProofPanel(
+    proof: VisualEstimateCaptureProof?,
+    modifier: Modifier = Modifier,
+) {
+    if (proof == null) return
+    val summary = proof.detectorSummary
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .widthIn(max = 640.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "PROOF frames=${proof.capturedFrameCount} readback=${proof.readbackWidth}x${proof.readbackHeight} candidates=${summary.candidateFrameCount}/${summary.candidateBlobCount} selected=${summary.selectedSampleCount}",
+            color = Color.White,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Bold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        val evidenceText = when {
+            proof.capturedFrameCount == 0 -> "0 frames captured"
+            summary.candidateFrameCount == 0 -> "selected color/ROI matched no blobs"
+            else -> summary.noReadMessage?.compactProofText() ?: "detector trace captured"
+        }
+        Text(
+            text = evidenceText,
+            color = Color(0xffc9f7ff),
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Bold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (proof.frames.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .horizontalScroll(rememberScrollState())
+                    .padding(top = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                proof.frames.forEach { frame ->
+                    VisualEstimateProofThumbnail(frame)
+                }
+            }
+        }
+    }
+}
+
+private fun String.compactProofText(): String =
+    replace(Regex("\\s+"), " ")
+        .trim()
+        .take(120)
+
+@Composable
+private fun VisualEstimateProofThumbnail(frame: VisualEstimateProofFrame) {
+    val bitmap = remember(frame.frameIndex, frame.thumbnailHash) {
+        Bitmap.createBitmap(frame.thumbnailWidth, frame.thumbnailHeight, Bitmap.Config.ARGB_8888).also { bitmap ->
+            bitmap.setPixels(
+                frame.thumbnailArgbPixels,
+                0,
+                frame.thumbnailWidth,
+                0,
+                0,
+                frame.thumbnailWidth,
+                frame.thumbnailHeight,
+            )
+        }
+    }
+    DisposableEffect(bitmap) {
+        onDispose { bitmap.recycle() }
+    }
+    val image = remember(bitmap) { bitmap.asImageBitmap() }
+    Box(
+        modifier = Modifier
+            .size(width = 112.dp, height = 63.dp)
+            .background(Color.Black, RoundedCornerShape(4.dp)),
+    ) {
+        Image(
+            bitmap = image,
+            contentDescription = "visual estimate proof frame ${frame.frameIndex}",
+            modifier = Modifier.fillMaxSize(),
+        )
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            frame.roi?.let { rect ->
+                drawProofRect(rect, frame.thumbnailWidth, frame.thumbnailHeight, Color(0xff1fbf75), 2f)
+            }
+            frame.candidates.forEach { candidate ->
+                drawProofBlob(candidate, frame.thumbnailWidth, frame.thumbnailHeight, Color(0xffffd400), 2f)
+            }
+            frame.selected?.let { selected ->
+                drawProofBlob(selected, frame.thumbnailWidth, frame.thumbnailHeight, Color(0xffff4f7b), 3f)
+            }
+        }
+        Text(
+            text = "#${frame.frameIndex}",
+            color = Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Black,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .background(Color(0x99000000), RoundedCornerShape(2.dp))
+                .padding(horizontal = 4.dp, vertical = 1.dp),
+        )
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawProofRect(
+    rect: VisualEstimateProofRect,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    color: Color,
+    strokeWidth: Float,
+) {
+    val left = rect.left / sourceWidth * size.width
+    val top = rect.top / sourceHeight * size.height
+    val right = rect.right / sourceWidth * size.width
+    val bottom = rect.bottom / sourceHeight * size.height
+    drawRect(
+        color = color,
+        topLeft = Offset(left, top),
+        size = Size(width = right - left, height = bottom - top),
+        style = Stroke(width = strokeWidth),
+    )
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawProofBlob(
+    blob: VisualEstimateProofBlob,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    color: Color,
+    strokeWidth: Float,
+) {
+    drawProofRect(blob.bounds, sourceWidth, sourceHeight, color, strokeWidth)
+    drawCircle(
+        color = color,
+        radius = 3.5f,
+        center = Offset(blob.centroidX / sourceWidth * size.width, blob.centroidY / sourceHeight * size.height),
+    )
 }
 
 private fun parseResultValue(line: String?, key: String): String? {
@@ -649,6 +891,7 @@ private fun BottomToolDrawer(
     onVoiceRecord: () -> Unit,
     onOpenSettings: () -> Unit,
     onHide: () -> Unit,
+    onEnterRunMode: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -665,6 +908,7 @@ private fun BottomToolDrawer(
             OverlayButton(if (fineLineDrag) "Fine" else "Coarse", onToggleFineLineDrag, Modifier.weight(1f))
             OverlayButton("Voice", onVoiceRecord, Modifier.weight(1f))
             OverlayButton("Setup", onOpenSettings, Modifier.weight(1f))
+            OverlayButton("Run", onEnterRunMode, Modifier.weight(1f), color = Color(0xAA1F8F45))
             OverlayButton("Hide", onHide, Modifier.weight(1f))
         }
     }
@@ -689,6 +933,7 @@ private fun ApplicationSettingsPanel(
     onRecalibrateEstimate: () -> Unit,
     onStartBurst: () -> Unit,
     onStopBurst: () -> Unit,
+    onEnterRunMode: () -> Unit,
     onClose: () -> Unit,
     onHide: () -> Unit,
     modifier: Modifier = Modifier,
@@ -721,11 +966,76 @@ private fun ApplicationSettingsPanel(
             OverlayButton("Import", onPickImport, Modifier.weight(1f))
             OverlayButton("Est 120", onStartVisualEstimate, Modifier.weight(1f))
             OverlayButton("Recal", onRecalibrateEstimate, Modifier.weight(1f))
+            OverlayButton("Run", onEnterRunMode, Modifier.weight(1f), color = Color(0xAA1F8F45))
             OverlayButton("Record 120", onStartBurst, Modifier.weight(1f))
             OverlayButton("Stop", onStopBurst, Modifier.weight(1f))
             OverlayButton("Close", onClose, Modifier.weight(1f))
             OverlayButton("Hide", onHide, Modifier.weight(1f))
         }
+    }
+}
+
+@Composable
+private fun RunModePanel(
+    captureStatus: String,
+    runCommandState: SpeedBallRunCommandState,
+    onShoot: () -> Unit,
+    onSetup: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shootEnabled = runCommandState.canManualShoot()
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color(0x77000000))
+            .padding(start = 8.dp, top = 6.dp, end = 88.dp, bottom = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        RunStatusStrip(captureStatus = captureStatus, runCommandState = runCommandState)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            OverlayButton(
+                label = "Shoot",
+                onClick = onShoot,
+                modifier = Modifier.weight(1f),
+                enabled = shootEnabled,
+                color = if (shootEnabled) Color(0xCC1F8F45) else Color(0x88555555),
+            )
+            OverlayButton("Setup", onSetup, Modifier.weight(1f), color = Color(0xAA207982))
+        }
+    }
+}
+
+@Composable
+private fun RunStatusStrip(
+    captureStatus: String,
+    runCommandState: SpeedBallRunCommandState,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(24.dp)
+            .background(runStatusColor(runCommandState), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = runCommandState.runLabel(),
+            color = Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Black,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = captureStatus,
+            color = Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -768,17 +1078,55 @@ private fun OverlayButton(
     label: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    color: Color = Color(0x99207982),
 ) {
     Box(
         modifier = modifier
             .height(28.dp)
-            .background(Color(0x99207982), RoundedCornerShape(6.dp))
-            .clickable(onClick = onClick),
+            .background(color, RoundedCornerShape(6.dp))
+            .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Text(text = label, color = Color.White, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
     }
 }
+
+private fun SpeedBallRunCommandState.canManualShoot(): Boolean =
+    when (this) {
+        SpeedBallRunCommandState.Listening,
+        SpeedBallRunCommandState.ManualReady,
+        SpeedBallRunCommandState.VoiceUnavailable,
+        is SpeedBallRunCommandState.VoiceError,
+        is SpeedBallRunCommandState.VoiceRetrying -> true
+        SpeedBallRunCommandState.Capturing,
+        SpeedBallRunCommandState.Reporting,
+        is SpeedBallRunCommandState.SetupInvalid -> false
+    }
+
+private fun SpeedBallRunCommandState.runLabel(): String =
+    when (this) {
+        SpeedBallRunCommandState.Listening -> "READY - LISTENING"
+        SpeedBallRunCommandState.ManualReady -> "READY - MANUAL"
+        SpeedBallRunCommandState.VoiceUnavailable -> "VOICE UNAVAILABLE - MANUAL READY"
+        is SpeedBallRunCommandState.VoiceError -> "VOICE ERROR $code - MANUAL READY"
+        is SpeedBallRunCommandState.VoiceRetrying -> "VOICE RETRY $errorCount"
+        SpeedBallRunCommandState.Capturing -> "CAPTURING"
+        SpeedBallRunCommandState.Reporting -> "REPORTING"
+        is SpeedBallRunCommandState.SetupInvalid -> "SETUP NEEDED: $reason"
+    }
+
+private fun runStatusColor(state: SpeedBallRunCommandState): Color =
+    when (state) {
+        SpeedBallRunCommandState.Listening,
+        SpeedBallRunCommandState.ManualReady -> Color(0xCC1F8F45)
+        SpeedBallRunCommandState.VoiceUnavailable,
+        is SpeedBallRunCommandState.VoiceError,
+        is SpeedBallRunCommandState.VoiceRetrying -> Color(0xCCB76E00)
+        SpeedBallRunCommandState.Capturing -> Color(0xCC1565C0)
+        SpeedBallRunCommandState.Reporting -> Color(0xCC37474F)
+        is SpeedBallRunCommandState.SetupInvalid -> Color(0xCCB00020)
+    }
 
 @Composable
 private fun DistanceInputOverlay(

@@ -36,6 +36,15 @@ lines onto the measured field markers with smooth finger drag, uses the drawer
 toggle for coarse/fine drag precision, samples the ball color from camera
 pixels, and places the ROI around the
 expected hit path before running a live visual estimate or import estimate. The
+distance field is replacement state: editing it after A/B lines are set
+overwrites the active known-distance feet value while preserving the current A/B
+line positions. The field remains raw user text while editing: clearing it stays
+empty, partial text is allowed, and accepted numeric values are parsed separately
+from the displayed text. Invalid distance text makes setup not ready instead of letting
+the next live or import estimate reuse an older distance. If `shoot` is
+recognized while setup is blocked, the app shows and logs the specific missing
+gate, such as missing color sample, invalid sampled HSV, missing/invalid ROI,
+missing distance setup, or invalid distance text. The
 app can request camera permission, enumerate Camera2 high-speed modes from the
 device HAL, listen for voice commands, release the setup feed so the
 high-speed recorder can own the camera, start a bounded 120 fps MediaRecorder
@@ -48,6 +57,52 @@ Camera2 high-speed mode, but it reads direct frames instead of recording an MP4.
 When an estimate succeeds, the camera preview is covered by a black result
 screen with large bold white velocity, launch-angle, and carry-distance text.
 The `CLEAR` button dismisses the result screen and returns to the camera view.
+No-read and capture-failure outcomes do not use that full-screen black result
+screen; they show a bottom report with reason, action, message, and
+attempt-scoped capture proof while the setup preview remains visible after
+capture recovery. The proof is a bounded contact sheet of the processed
+direct-readback frames the detector saw. On the S10+ direct path those frames
+are low-resolution 160x90 diagnostics, not full preview photos. The panel also
+shows captured-frame count, readback size, candidate-frame count,
+candidate-blob count, and selected-sample count. Zero captured frames means the
+attempt produced no imagery. Zero candidate frames means the selected color/ROI
+matched no blobs in the processed frames.
+
+The app now separates the visible workflow into two app-level modes:
+
+- **Setup Mode** is for configuring camera permission, high-speed mode, A/B
+  distance calipers, raw distance text, ball color, ROI, level, fallback, import,
+  and diagnostics. The live preview remains visible so the user can align setup.
+- **Run Mode** is for executing shots. It does not present setup editing as the
+  normal surface. It shows the camera view, command readiness, a manual `Shoot`
+  control, and a way back to Setup Mode.
+
+Setup is expected to happen once per physical setup. Repeated shots preserve A/B
+lines, distance text, color, ROI, and level unless the user explicitly changes
+or recalibrates them. Entering Run Mode and every `shoot` re-checks the setup
+gates, so a lost preview, invalid distance, missing color, invalid ROI, missing
+level, or missing permission blocks the next capture with the specific reason.
+Green ready/listening means the setup is valid and a command path is available.
+If Android speech recognition is unavailable or repeatedly errors, Run Mode
+shows a degraded/manual-ready state instead of green listening; manual `Shoot`
+remains available when setup is valid, but the intended operating path is still
+hands-free voice. Ordinary Android recognizer idle events such as no-match or
+speech-timeout mean the app did not hear `shoot` yet; they restart listening and
+do not count toward the fatal error cap. Real recognizer failures are bounded by
+a single delayed scheduler, backoff, and a consecutive-error cap before the UI
+settles into manual-ready/degraded state. Periodic listening beeps are deferred;
+the visual readiness state is the primary signal.
+
+Each Run Mode shot creates a monotonic visual-estimate attempt id. Success,
+no-read, and failure reports belong to that attempt. `CLEAR` hides only that
+attempt's report/proof and does not clear setup. Setup edits, live-feed
+restarts, status changes, distance edits, and voice-listener updates cannot
+resurrect a cleared report from the same attempt. A later shot can show a new
+report and new proof imagery even if the reason text is identical. A success
+full-screen overlay pauses command readiness until cleared because it covers
+the field view; the same attempt proof remains visible on that overlay before
+clear. A no-read/failure bottom panel may coexist with resumed
+manual/listening readiness because the preview remains visible.
 When exact-count reconciliation fails from near-duplicate sensor timestamps or a
 decoded/sensor count mismatch, Phase 6 can emit logcat-only value-anchor
 diagnostics. Those diagnostics are investigation evidence only; they cannot
@@ -203,28 +258,37 @@ a typed failure, or bounded logcat diagnostics.
 
 ## User Flow
 
-1. The user selects a supported camera mode, such as 720p at 120 fps.
-2. The user calibrates distance by entering the measured feet value and sliding
+1. In Setup Mode, the user selects a supported camera mode, such as 720p at 120
+   fps.
+2. In Setup Mode, the user calibrates distance by entering the measured feet value and sliding
    the two vertical A/B caliper lines onto the matching field markers in the
    ball's plane, or selects the reviewed
    ball-diameter fallback.
-3. The user taps the live feed at the hanging ball/start reference so the app
+   Editing the feet value later replaces the active distance calibration and
+   keeps the A/B points; invalid text blocks readiness without reformatting the
+   field text.
+3. In Setup Mode, the user taps the live feed at the hanging ball/start reference so the app
    samples the actual camera pixels for the HSV color band, then sets the ROI
    around the expected ball path.
-4. The app captures a still-phone IMU level snapshot and shows the horizon
+4. In Setup Mode, the app captures a still-phone IMU level snapshot and shows the horizon
    overlay; voice recording captures this automatically if it is missing.
-5. For live estimate mode, the app listens for the selected voice command,
-   records a bounded high-speed window, and stops automatically; the user
-   should not manage a recording lifecycle.
-6. For import mode, the user selects a video and the app processes it
+5. Once setup is valid, the user enters Run Mode. Run Mode shows ready/listening
+   only when the command path is truthful, and always exposes manual `Shoot`
+   when setup remains valid.
+6. In Run Mode, saying `shoot` or pressing `Shoot` starts a new capture attempt.
+   The app captures a bounded high-speed visual-estimate window and stops
+   automatically; the user should not reset setup between attempts.
+7. For import mode, the user selects a video and the app processes it
    end-to-end without a manual start/stop recording step.
-7. The app detects the ball center in each accepted frame.
-8. The app uses RANSAC-style straight-line consensus to reject non-hit motion
+8. The app detects the ball center in each accepted frame.
+9. The app uses RANSAC-style straight-line consensus to reject non-hit motion
    and fits velocity over the accepted detections.
-9. The app converts pixels per second to mph using the distance calibration or
+10. The app converts pixels per second to mph using the distance calibration or
    the reviewed ball-diameter estimate fallback.
-10. The app reports speed, level-corrected launch angle, confidence, and evidence for estimates,
-   or a typed no-read with no speed values.
+11. The app reports speed, level-corrected launch angle, confidence, and evidence for estimates,
+   or a typed no-read/failure report with no speed values. Clearing the report
+   returns Run Mode to the next ready/manual-ready shot path without clearing
+   setup.
 
 ## Measurement Rules
 
@@ -499,12 +563,20 @@ Phase 10 workflow/result behavior:
   leaves color not-ready instead of using a hidden yellow default.
   The `shoot` voice command checks readiness, prints `Ready to shoot`, speaks
   `Ready`, plays three beeps, and then starts the direct 120 fps visual
-  estimate path only when the setup readiness gate passes.
+  estimate path only when the setup readiness gate passes. The visible preview
+  is required for setup, and if the preview surface is unavailable, the app
+  reports `Live feed required` before starting capture. During direct capture,
+  the camera is owned by the single hidden GL/readback target, so the preview may
+  temporarily go black. Estimate frames still come only from GL/readback, and the
+  setup preview restarts after completion, failure, or no-read.
   Successful estimates cover the preview with a black full-screen result
   overlay showing velocity, angle, and carry distance in large bold white text
   until the user taps `CLEAR`. The overlay is gated to current successful
-  estimate-complete statuses, so `Ready to shoot` and no-read outcomes leave
-  the camera visible with status/no-read text.
+  estimate-complete statuses. No-read and direct-capture failure outcomes show a
+  non-destructive bottom report with reason/action/message and no mph, angle, or
+  distance values, so the returned setup preview stays visible.
+  Readiness-blocked `shoot` commands log `VOICE_SHOOT_NOT_READY` and display the
+  specific setup reason instead of silently returning to listening.
 - Synthetic timing proof remains in test source only and exists solely for JVM
   fixture coverage.
 - Phase 11 is the direct-readback-to-12-frames effort. It targets more than 12
