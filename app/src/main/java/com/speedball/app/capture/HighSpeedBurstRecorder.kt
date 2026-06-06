@@ -3,6 +3,7 @@ package com.speedball.app.capture
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
@@ -29,6 +30,8 @@ class HighSpeedBurstRecorder(private val context: Context) {
     private var cameraDevice: CameraDevice? = null
     private var session: CameraConstrainedHighSpeedCaptureSession? = null
     private var recorder: MediaRecorder? = null
+    private var companionSurface: Surface? = null
+    private var companionSurfaceTexture: SurfaceTexture? = null
     private var recorderStarted = false
     private var outputFile: File? = null
     private var timestamps = mutableListOf<Long>()
@@ -42,7 +45,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
     @Suppress("MissingPermission")
     fun start(
         options: BurstOptions,
-        previewSurface: Surface,
+        previewSurface: Surface?,
         availableModes: List<HighSpeedMode>,
         onComplete: (BurstOutcome) -> Unit,
     ): BurstOutcome.Failure? {
@@ -83,6 +86,12 @@ class HighSpeedBurstRecorder(private val context: Context) {
         }
         recorder = preparedRecorder
         val recorderSurface = preparedRecorder.surface
+        val previewCompanion = prepareCompanionSurface(options.mode, previewSurface, options.companionSurfaceMode)
+        if (previewCompanion == null) {
+            val failure = BurstOutcome.Failure(BurstFailure.SESSION_CONFIGURATION_FAILED, "Unable to prepare a preview-class companion surface.")
+            finishSynchronously(stopRecorder = false)
+            return failure
+        }
 
         val manager = context.getSystemService(CameraManager::class.java)
         if (manager == null) {
@@ -97,7 +106,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(device: CameraDevice) {
                         cameraDevice = device
-                        configureSession(device, previewSurface, recorderSurface, options.mode, manager, cameraId)
+                        configureSession(device, previewCompanion, recorderSurface, options.mode, manager, cameraId)
                     }
 
                     override fun onDisconnected(device: CameraDevice) {
@@ -134,7 +143,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
 
     private fun configureSession(
         device: CameraDevice,
-        previewSurface: Surface,
+        companionSurface: Surface,
         recorderSurface: Surface,
         mode: HighSpeedMode,
         manager: CameraManager,
@@ -144,12 +153,12 @@ class HighSpeedBurstRecorder(private val context: Context) {
         synchronized(lock) { state = BurstRecorderState.Configuring }
         try {
             device.createConstrainedHighSpeedCaptureSession(
-                listOf(previewSurface, recorderSurface),
+                listOf(companionSurface, recorderSurface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
                         val highSpeedSession = cameraCaptureSession as CameraConstrainedHighSpeedCaptureSession
                         session = highSpeedSession
-                        startRepeatingBurst(device, highSpeedSession, previewSurface, recorderSurface, mode, manager, cameraId)
+                        startRepeatingBurst(device, highSpeedSession, companionSurface, recorderSurface, mode, manager, cameraId)
                     }
 
                     override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) {
@@ -292,6 +301,22 @@ class HighSpeedBurstRecorder(private val context: Context) {
         }
     }
 
+    private fun prepareCompanionSurface(
+        mode: HighSpeedMode,
+        visiblePreviewSurface: Surface?,
+        surfaceMode: BurstCompanionSurfaceMode,
+    ): Surface? =
+        when (surfaceMode) {
+            BurstCompanionSurfaceMode.VISIBLE_PREVIEW -> visiblePreviewSurface
+            BurstCompanionSurfaceMode.OFFSCREEN_PREVIEW -> {
+                val texture = SurfaceTexture(0).apply {
+                    setDefaultBufferSize(mode.width, mode.height)
+                }
+                companionSurfaceTexture = texture
+                Surface(texture).also { companionSurface = it }
+            }
+        }
+
     private fun finishSynchronously(stopRecorder: Boolean) {
         synchronized(lock) {
             terminalGate.claim()
@@ -355,6 +380,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
                 requestedDurationMillis = safeOptions.durationMillis,
                 width = safeOptions.mode.width,
                 height = safeOptions.mode.height,
+                companionSurfaceMode = safeOptions.companionSurfaceMode,
             )
         } else {
             outcome
@@ -371,10 +397,14 @@ class HighSpeedBurstRecorder(private val context: Context) {
             recorder?.reset()
             recorder?.release()
         }.onFailure { releaseFailed = true }
+        runCatching { companionSurface?.release() }.onFailure { releaseFailed = true }
+        runCatching { companionSurfaceTexture?.release() }.onFailure { releaseFailed = true }
         runCatching { session?.close() }.onFailure { releaseFailed = true }
         runCatching { cameraDevice?.close() }.onFailure { releaseFailed = true }
         runCatching { handlerThread?.quitSafely() }.onFailure { releaseFailed = true }
         recorder = null
+        companionSurface = null
+        companionSurfaceTexture = null
         session = null
         cameraDevice = null
         handler = null

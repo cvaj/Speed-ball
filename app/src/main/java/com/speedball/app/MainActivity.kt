@@ -30,6 +30,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.speedball.app.capture.BurstDiagnostics
+import com.speedball.app.capture.BurstCompanionSurfaceMode
 import com.speedball.app.capture.BurstFailure
 import com.speedball.app.capture.BurstOptions
 import com.speedball.app.capture.BurstOutcome
@@ -90,6 +91,9 @@ import com.speedball.app.importing.ImportVideoMetadata
 import com.speedball.app.importing.ImportVideoFrameSequence
 import com.speedball.app.importing.ImportWorkflowEvent
 import com.speedball.app.importing.ImportWorkflowState
+import com.speedball.app.importing.RecordedHfrCaptureGate
+import com.speedball.app.importing.RecordedHfrWorkingResolution
+import com.speedball.app.importing.RecordedHfrWorkingResolutionSelector
 import com.speedball.app.importing.SavedResultHistory
 import com.speedball.app.importing.SavedResultSummary
 import com.speedball.app.importing.SavedResultSummaryStore
@@ -117,6 +121,8 @@ import com.speedball.app.measurement.Phase14WorkflowState
 import com.speedball.app.measurement.PreviewFrameTransform
 import com.speedball.app.measurement.PreviewScaleMode
 import com.speedball.app.measurement.TrackExtractionConfig
+import com.speedball.app.measurement.VisualEstimateCaptureProof
+import com.speedball.app.measurement.VisualEstimateCaptureProofBuilder
 import com.speedball.app.measurement.VisualEstimateFramePipelineConfig
 import com.speedball.app.measurement.VisualEstimateFrameTiming
 import com.speedball.app.measurement.VisualEstimateNoReadReason
@@ -601,7 +607,7 @@ class MainActivity : ComponentActivity() {
         stopVoiceRecordListener()
         runCommandState = SpeedBallRunCommandState.Capturing
         updateShellState(status = "Ready to shoot")
-        playReadySignalThenVisualEstimate()
+        playReadySignalThenRecordedHfrEstimate()
     }
 
     private fun shootNotReadyStatus(): String? {
@@ -639,7 +645,7 @@ class MainActivity : ComponentActivity() {
         return if (roi.isInFrame()) null else "Color region does not overlap the frame."
     }
 
-    private fun playReadySignalThenVisualEstimate() {
+    private fun playReadySignalThenRecordedHfrEstimate() {
         readySignalPending = true
         speakReady()
         repeat(READY_BEEP_COUNT) { index ->
@@ -648,7 +654,7 @@ class MainActivity : ComponentActivity() {
         mainHandler.postDelayed(
             {
                 readySignalPending = false
-                startDirectVisualEstimate()
+                startTimedRecordingEstimate()
             },
             READY_SIGNAL_TO_ESTIMATE_DELAY_MILLIS,
         )
@@ -896,9 +902,8 @@ class MainActivity : ComponentActivity() {
         }
         if (modes.isEmpty()) refreshModes()
         val mode = selectedMode
-        val surface = previewSurface
-        if (mode == null || surface == null) {
-            lastFailure = BurstOutcome.Failure(BurstFailure.UNSUPPORTED_MODE, "A 120 fps mode and preview surface are required.")
+        if (mode == null) {
+            lastFailure = BurstOutcome.Failure(BurstFailure.UNSUPPORTED_MODE, "A 120 fps mode is required.")
             updateShellState(status = "Voice capture unavailable")
             return
         }
@@ -907,20 +912,30 @@ class MainActivity : ComponentActivity() {
             captureLevelReference(status = "Leveling before record", onSuccess = { startTimedRecordingEstimate() })
             return
         }
+        beginVisualEstimateAttempt()
+        phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.StartCapture)
         stopLiveLevelReference()
         lastFailure = null
         lastDecodeOutcome = null
         lastPreviewOutcome = null
         lastDirectProofResult = null
         lastDirectVisualEstimateOutcome = null
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = null
         lastImportExportText = null
         importWorkflowState = ImportWorkflowState()
-        captureStatus = "Voice recording"
+        captureStatus = "Recorded HFR capture running"
+        runCommandState = SpeedBallRunCommandState.Capturing
+        Log.i(logTag, "RECORDED_HFR_START attempt=$visualEstimateAttemptId mode=${mode.label.compactForLog()} source=RECORDER_OFFSCREEN_PREVIEW")
         updateShellState(status = captureStatus)
         cameraLiveFeedController.stop()
         val immediateFailure = burstRecorder.start(
-            BurstOptions(mode, durationMillis = AUTO_RECORD_ESTIMATE_DURATION_MILLIS),
-            surface,
+            BurstOptions(
+                mode,
+                durationMillis = AUTO_RECORD_ESTIMATE_DURATION_MILLIS,
+                companionSurfaceMode = BurstCompanionSurfaceMode.OFFSCREEN_PREVIEW,
+            ),
+            previewSurface,
             modes,
         ) { outcome ->
             runOnUiThread {
@@ -928,31 +943,41 @@ class MainActivity : ComponentActivity() {
                     is BurstOutcome.Success -> {
                         lastDiagnostics = outcome.diagnostics
                         lastFailure = null
-                        captureStatus = "Recording complete; estimating"
+                        captureStatus = "Recorded HFR decoding"
                         Log.i(
                             logTag,
-                            "VOICE_RECORD_SUCCESS callbacks=${outcome.diagnostics.callbackCount} uniqueTs=${outcome.diagnostics.uniqueTimestampCount} " +
-                                "file=${outcome.diagnostics.displayOutputName} bytes=${outcome.diagnostics.fileBytes}",
+                            "RECORDED_HFR_CAPTURE_SUCCESS attempt=$visualEstimateAttemptId callbacks=${outcome.diagnostics.callbackCount} " +
+                                "uniqueSensorTs=${outcome.diagnostics.uniqueTimestampCount} medianGapPass=${outcome.diagnostics.medianGapPassesRateBand} " +
+                                "captureProofPass=${outcome.diagnostics.captureProofPasses} source=${outcome.width}x${outcome.height}@${outcome.requestedFps} " +
+                                "companion=${outcome.companionSurfaceMode} file=${outcome.diagnostics.displayOutputName} bytes=${outcome.diagnostics.fileBytes}",
                         )
                         updateShellState(status = captureStatus)
                         startRecordedEstimate(outcome)
                     }
                     is BurstOutcome.Failure -> {
                         lastFailure = outcome
-                        captureStatus = "Voice recording failed"
-                        Log.e(logTag, "VOICE_RECORD_FAILURE reason=${outcome.reason} message=${outcome.message.compactForLog()}")
-                        updateShellState(status = captureStatus)
-                        restartLiveCameraFeedIfReady()
+                        Log.e(logTag, "RECORDED_HFR_CAPTURE_FAILURE attempt=$visualEstimateAttemptId reason=${outcome.reason} message=${outcome.message.compactForLog()}")
+                        finishRecordedVisualEstimateNoRead(
+                            reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                            message = outcome.message,
+                            failure = true,
+                            proof = null,
+                            status = "Recorded HFR capture failed",
+                        )
                     }
                 }
             }
         }
         if (immediateFailure != null) {
             lastFailure = immediateFailure
-            captureStatus = "Voice recording failed"
-            Log.e(logTag, "VOICE_RECORD_FAILURE reason=${immediateFailure.reason} message=${immediateFailure.message.compactForLog()}")
-            updateShellState(status = captureStatus)
-            restartLiveCameraFeedIfReady()
+            Log.e(logTag, "RECORDED_HFR_CAPTURE_FAILURE attempt=$visualEstimateAttemptId reason=${immediateFailure.reason} message=${immediateFailure.message.compactForLog()}")
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = immediateFailure.message,
+                failure = true,
+                proof = null,
+                status = "Recorded HFR capture failed",
+            )
         }
     }
 
@@ -960,17 +985,18 @@ class MainActivity : ComponentActivity() {
         val file = outcome.outputFile
         val fps = outcome.requestedFps ?: selectedMode?.fps
         if (file == null || fps == null || !file.isFile || file.length() <= 0L) {
-            val noRead = ImportRunOutcome.NoRead(
-                reason = ImportNoReadReason.INVALID_METADATA,
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
                 message = "Recorded capture did not produce a usable video file.",
-                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                failure = true,
+                proof = null,
+                status = "Recorded HFR no-read",
             )
-            finishImportRunOutcome(noRead, completePrefix = "Recorded")
             return
         }
         decodeWorkerExecutor.execute {
             val estimate = try {
-                runRecordedEstimate(file, fps)
+                runRecordedEstimate(file, fps, outcome.diagnostics)
             } finally {
                 runCatching { file.delete() }
             }
@@ -1893,6 +1919,16 @@ class MainActivity : ComponentActivity() {
                 persistSavedResults()
                 lastImportExportText = ImportEvidenceExporter.format(summary)
                 Log.i(logTag, "IMPORT_ESTIMATE_NO_READ reason=${outcome.reason} message=${outcome.message.compactForLog()}")
+                if (outcome.sourceKind == ImportResultSourceKind.RECORDED_ESTIMATE) {
+                    finishRecordedVisualEstimateNoRead(
+                        reason = outcome.reason.toVisualEstimateNoReadReason(),
+                        message = outcome.message,
+                        failure = false,
+                        proof = outcome.captureProof,
+                        status = "$completePrefix no-read",
+                    )
+                    return
+                }
                 updateShellState(status = "$completePrefix no-read")
             }
             is ImportRunOutcome.Estimate -> {
@@ -1908,6 +1944,10 @@ class MainActivity : ComponentActivity() {
                 visualEstimateOutcomeUiLines(outcome.estimate).forEach { line ->
                     Log.i(logTag, "IMPORT_ESTIMATE_RESULT ${line.compactForLog()}")
                 }
+                if (outcome.sourceKind == ImportResultSourceKind.RECORDED_ESTIMATE) {
+                    finishRecordedVisualEstimateOutcome(outcome.estimate, outcome.captureProof)
+                    return
+                }
                 updateShellState(
                     status = when (outcome.estimate) {
                         is VisualEstimateOutcome.Success -> "$completePrefix estimate complete"
@@ -1917,6 +1957,64 @@ class MainActivity : ComponentActivity() {
             }
         }
         restartLiveCameraFeedIfReady()
+    }
+
+    private fun finishRecordedVisualEstimateOutcome(
+        outcome: VisualEstimateOutcome,
+        proof: VisualEstimateCaptureProof?,
+    ) {
+        lastDirectVisualEstimateOutcome = outcome
+        phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.CaptureCompleted(outcome))
+        captureStatus = when (outcome) {
+            is VisualEstimateOutcome.Success -> "Recorded estimate complete"
+            is VisualEstimateOutcome.NoRead -> "Recorded estimate no-read"
+        }
+        currentVisualEstimateReport = visualEstimateReportFor(
+            attemptId = visualEstimateAttemptId,
+            outcome = outcome,
+            captureProof = proof?.withAttemptId(visualEstimateAttemptId),
+        )
+        dismissedVisualEstimateAttemptId = null
+        visualEstimateOutcomeUiLines(outcome).forEach { line ->
+            Log.i(logTag, "RECORDED_HFR_ESTIMATE_RESULT ${line.compactForLog()}")
+        }
+        runCommandState = if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+            SpeedBallRunCommandState.Reporting
+        } else {
+            SpeedBallRunCommandState.ManualReady
+        }
+        updateShellState(status = captureStatus)
+        restartLiveCameraFeedIfReady()
+        if (appMode == SpeedBallAppMode.Run && currentVisualEstimateReport?.kind != VisualEstimateReportKind.Success) {
+            resumeRunModeCommandPath()
+        }
+    }
+
+    private fun finishRecordedVisualEstimateNoRead(
+        reason: VisualEstimateNoReadReason,
+        message: String,
+        failure: Boolean,
+        proof: VisualEstimateCaptureProof?,
+        status: String,
+    ) {
+        val noRead = VisualEstimateOutcome.NoRead(reason = reason, message = message)
+        lastDirectVisualEstimateOutcome = noRead
+        phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.CaptureCompleted(noRead))
+        captureStatus = status
+        currentVisualEstimateReport = visualEstimateReportFor(
+            attemptId = visualEstimateAttemptId,
+            outcome = noRead,
+            failure = failure,
+            captureProof = proof?.withAttemptId(visualEstimateAttemptId),
+        )
+        dismissedVisualEstimateAttemptId = null
+        visualEstimateOutcomeUiLines(noRead).forEach { line ->
+            Log.i(logTag, "RECORDED_HFR_ESTIMATE_RESULT ${line.compactForLog()}")
+        }
+        runCommandState = SpeedBallRunCommandState.ManualReady
+        updateShellState(status = captureStatus)
+        restartLiveCameraFeedIfReady()
+        if (appMode == SpeedBallAppMode.Run) resumeRunModeCommandPath()
     }
 
     private fun runImportEstimate(uri: Uri): ImportRunOutcome {
@@ -2008,13 +2106,15 @@ class MainActivity : ComponentActivity() {
     private fun runRecordedEstimate(
         file: File,
         fps: Int,
+        diagnostics: BurstDiagnostics,
     ): ImportRunOutcome {
+        val maxSamplesToProbe = (diagnostics.uniqueTimestampCount + 1).coerceAtLeast(DEFAULT_IMPORT_MAX_FRAMES)
         val importFrameCount = DEFAULT_IMPORT_MAX_FRAMES
         Log.i(logTag, "RECORDED_ESTIMATE_STAGE metadata frameCount=$importFrameCount")
         val metadata = when (
             val validation = AndroidImportVideoFrameSource.readMetadata(
                 file = file,
-                maxSamplesToProbe = importFrameCount,
+                maxSamplesToProbe = maxSamplesToProbe,
             )
         ) {
             is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
@@ -2024,13 +2124,34 @@ class MainActivity : ComponentActivity() {
             )
             is ImportValidationResult.Success -> validation.value
         }
+        val workingResolution = when (
+            val selected = RecordedHfrWorkingResolutionSelector.select(
+                sourceWidth = if (metadata.rotationDegrees == 90 || metadata.rotationDegrees == 270) metadata.height else metadata.width,
+                sourceHeight = if (metadata.rotationDegrees == 90 || metadata.rotationDegrees == 270) metadata.width else metadata.height,
+            )
+        ) {
+            is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
+                selected.reason,
+                selected.message,
+                metadata,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            )
+            is ImportValidationResult.Success -> selected.value
+        }
+        val runtimeConfig = buildRecordedEstimateConfig(metadata, workingResolution)
+            ?: return ImportRunOutcome.NoRead(
+                reason = ImportNoReadReason.INVALID_METADATA,
+                message = "Recorded estimate needs distance setup, color sample, and ROI before processing.",
+                metadata = metadata,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            )
         Log.i(logTag, "RECORDED_ESTIMATE_STAGE source")
         val source = when (
             val validation = AndroidImportVideoFrameSource.create(
                 context = this,
                 file = file,
-                targetWidth = DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_WIDTH,
-                targetHeight = DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_HEIGHT,
+                targetWidth = workingResolution.working.width,
+                targetHeight = workingResolution.working.height,
                 maxFrames = importFrameCount,
             )
         ) {
@@ -2048,10 +2169,10 @@ class MainActivity : ComponentActivity() {
                 source = source,
                 config = ImportFrameExtractionConfig(
                     maxFrames = importFrameCount,
-                    maxWidth = DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_WIDTH,
-                    maxHeight = DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_HEIGHT,
-                    maxTotalPixels = DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_WIDTH.toLong() *
-                        DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_HEIGHT.toLong() *
+                    maxWidth = workingResolution.working.width,
+                    maxHeight = workingResolution.working.height,
+                    maxTotalPixels = workingResolution.working.width.toLong() *
+                        workingResolution.working.height.toLong() *
                         importFrameCount.toLong(),
                 ),
             )
@@ -2081,22 +2202,83 @@ class MainActivity : ComponentActivity() {
             is ImportValidationResult.Success -> reconciliation.value
         }
         Log.i(logTag, "RECORDED_ESTIMATE_STAGE estimate")
-        val config = buildImportEstimateConfig(metadata)
-            ?: return ImportRunOutcome.NoRead(
-                reason = ImportNoReadReason.INVALID_METADATA,
-                message = "Recorded estimate needs distance setup, color sample, and ROI before processing.",
-                metadata = metadata,
-                timing = timing,
-                frameCount = frames.frames.size,
-                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
-            )
-        val estimate = ImportEstimatePipeline.estimate(
+        val estimate = ImportEstimatePipeline.estimateWithTrace(
             frames = frames,
             timing = timing,
-            calibration = config.calibration,
-            config = config.framePipelineConfig,
+            calibration = runtimeConfig.calibration,
+            config = runtimeConfig.framePipelineConfig,
         )
-        return ImportRunOutcome.Estimate(metadata, frames, timing, estimate, ImportResultSourceKind.RECORDED_ESTIMATE)
+        val gateValidation = RecordedHfrCaptureGate.validate(
+            decodedFrameCount = metadata.sampleCount,
+            extractedFrameCount = frames.frames.size,
+            diagnostics = diagnostics,
+            metadata = metadata,
+        )
+        val gateNoRead = if (gateValidation is ImportValidationResult.NoRead) {
+            VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                message = gateValidation.message,
+                diagnostics = when (val outcome = estimate.outcome) {
+                    is VisualEstimateOutcome.Success -> outcome.diagnostics
+                    is VisualEstimateOutcome.NoRead -> outcome.diagnostics
+                },
+            )
+        } else {
+            null
+        }
+        val gate = (gateValidation as? ImportValidationResult.Success)?.value
+        val proof = VisualEstimateCaptureProofBuilder.build(
+            attemptId = visualEstimateAttemptId,
+            frames = estimate.processedFrames,
+            frameAvailableCallbackCount = frames.frames.size,
+            captureResultCallbackCount = diagnostics.callbackCount,
+            uniqueSensorTimestampCount = diagnostics.uniqueTimestampCount,
+            readbackWidth = workingResolution.working.width,
+            readbackHeight = workingResolution.working.height,
+            trace = gateNoRead?.let { estimate.detectorTrace.withOutcome(it) } ?: estimate.detectorTrace,
+            sourceKind = "RECORDED_HFR",
+            sourceWidth = workingResolution.source.width,
+            sourceHeight = workingResolution.source.height,
+            workingWidth = workingResolution.working.width,
+            workingHeight = workingResolution.working.height,
+            decodedFrameCount = metadata.sampleCount,
+            requestedFps = fps,
+            dropGateVerdict = gate?.dropVerdict ?: "NO_READ",
+            cadenceGateVerdict = gate?.cadenceVerdict ?: if (diagnostics.medianGapPassesRateBand && diagnostics.captureProofPasses) "PASS" else "NO_READ",
+        )
+        if (gateNoRead != null || gateValidation is ImportValidationResult.NoRead) {
+            val validation = gateValidation as ImportValidationResult.NoRead
+            Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${metadata.sampleCount ?: 0} " +
+                    "processed=${frames.frames.size} uniqueSensorTs=${diagnostics.uniqueTimestampCount} drop=NO_READ cadence=${proof.cadenceGateVerdict}",
+            )
+            return ImportRunOutcome.NoRead(
+                validation.reason,
+                validation.message,
+                metadata,
+                frameCount = frames.frames.size,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+            )
+        }
+        gate ?: return ImportRunOutcome.NoRead(
+            ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+            "Recorded capture gate did not return a usable proof.",
+            metadata,
+            frameCount = frames.frames.size,
+            sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            captureProof = proof,
+        )
+        Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_COMPLETE attempt=$visualEstimateAttemptId source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${gate.decodedFrameCount} " +
+                    "extracted=${gate.extractedFrameCount} processed=${frames.frames.size} uniqueSensorTs=${gate.uniqueSensorTimestampCount} " +
+                    "drop=${gate.dropVerdict} cadence=${gate.cadenceVerdict}",
+        )
+        return ImportRunOutcome.Estimate(metadata, frames, timing, estimate.outcome, ImportResultSourceKind.RECORDED_ESTIMATE, proof)
     }
 
     private fun reconcileImportTiming(frames: ImportVideoFrameSequence): ImportValidationResult<ImportTimingReconciliation> {
@@ -2176,6 +2358,68 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun buildRecordedEstimateConfig(
+        metadata: ImportVideoMetadata,
+        workingResolution: RecordedHfrWorkingResolution,
+    ): ImportEstimateRuntimeConfig? {
+        val importGeometry = Phase14Geometry(
+            modeId = "recorded-${metadata.width}x${metadata.height}",
+            previewTransformId = "recorded-fit-r$previewRotationDegrees",
+            source = workingResolution.source,
+            readback = workingResolution.working,
+        )
+        val calibration = buildImportCalibration(importGeometry)
+        val colorReadiness = buildImportColor(importGeometry).readiness(
+            workingResolution.working.width,
+            workingResolution.working.height,
+        )
+        if (colorReadiness !is ColorWorkflowReadiness.Ready) return null
+        val knownBallDiameterFeet = if (phase14WorkflowState.setupMode == Phase14SetupMode.BallDiameterFallback) {
+            phase14WorkflowState.knownBallDiameterFeet
+        } else {
+            debugVisualEstimateKnownBallDiameterFeet
+        }
+        if (calibration.pixelsPerFoot() is CalibrationResult.Failure && knownBallDiameterFeet == null) return null
+        val workingPixels = workingResolution.working.width * workingResolution.working.height
+        return ImportEstimateRuntimeConfig(
+            calibration = calibration,
+            framePipelineConfig = VisualEstimateFramePipelineConfig(
+                trackConfig = TrackExtractionConfig(
+                    detectorConfig = BlobDetectionConfig(
+                        threshold = colorReadiness.threshold,
+                        roi = colorReadiness.regionOfInterest,
+                        minAreaPx = IMPORT_ESTIMATE_MIN_BLOB_AREA_PX,
+                        maxAreaPx = max(8, workingPixels / 4),
+                        minCompactness = 0.0,
+                        bounds = FrameProcessingBounds(
+                            maxWidth = workingResolution.working.width,
+                            maxHeight = workingResolution.working.height,
+                            maxPixels = workingPixels,
+                            maxFrameCount = DEFAULT_IMPORT_MAX_FRAMES,
+                            maxThresholdPixels = workingPixels,
+                            maxComponentsPerFrame = workingPixels,
+                            maxOperationsPerFrame = workingPixels * 20,
+                        ),
+                    ),
+                    maxFrameToFrameJumpPx = workingResolution.working.width.toDouble(),
+                    maxInteriorMisses = 1,
+                    allowDirectionalCandidateSelection = true,
+                ),
+                estimateConfig = VisualEstimatePipelineConfig(
+                    maxEstimateRmsResidualPx = if (knownBallDiameterFeet != null) BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX else IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX,
+                    maxOutlierPasses = 2,
+                    maxRejectedOutlierCount = 4,
+                    knownBallDiameterFeet = knownBallDiameterFeet,
+                    allowApparentScaleChangeEstimate = knownBallDiameterFeet != null,
+                    requireFittedPathProgression = false,
+                    minEstimateMilesPerHour = HIT_BALL_MIN_ESTIMATE_MPH,
+                    levelReference = phase14WorkflowState.levelReference,
+                ),
+                timing = VisualEstimateFrameTiming.RequireRealTimestamps,
+            ),
+        )
+    }
+
     private fun buildImportCalibration(geometry: Phase14Geometry): MeasurementCalibrationState {
         if (phase14WorkflowState.setupMode != Phase14SetupMode.KnownDistance) return emptyCalibration()
         val pointA = phase14WorkflowState.calibrationPointA ?: return emptyCalibration()
@@ -2204,6 +2448,17 @@ class MainActivity : ComponentActivity() {
             regionOfInterest = readbackRoi,
         )
     }
+
+    private fun ImportNoReadReason.toVisualEstimateNoReadReason(): VisualEstimateNoReadReason =
+        when (this) {
+            ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+            ImportNoReadReason.INVALID_METADATA ->
+                VisualEstimateNoReadReason.BAD_TIMESTAMPS
+            ImportNoReadReason.UNSUPPORTED_MEDIA,
+            ImportNoReadReason.PERMISSION_DENIED,
+            ImportNoReadReason.RESOURCE_LIMIT_EXCEEDED ->
+                VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED
+        }
 
     private fun armDirectVisualEstimate() {
         updatePhase14Geometry()
@@ -2580,6 +2835,7 @@ class MainActivity : ComponentActivity() {
             val timing: ImportTimingReconciliation,
             val estimate: VisualEstimateOutcome,
             val sourceKind: ImportResultSourceKind = ImportResultSourceKind.IMPORT_ESTIMATE,
+            val captureProof: VisualEstimateCaptureProof? = null,
         ) : ImportRunOutcome
 
         data class NoRead(
@@ -2589,6 +2845,7 @@ class MainActivity : ComponentActivity() {
             val timing: ImportTimingReconciliation? = null,
             val frameCount: Int = 0,
             val sourceKind: ImportResultSourceKind = ImportResultSourceKind.IMPORT_ESTIMATE,
+            val captureProof: VisualEstimateCaptureProof? = null,
         ) : ImportRunOutcome
     }
 

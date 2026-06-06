@@ -28,7 +28,14 @@ data class BurstOptions(
     val mode: HighSpeedMode,
     val durationMillis: Long = DEFAULT_BURST_DURATION_MILLIS,
     val preferredExposureTimeNanos: Long? = DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS,
+    val companionSurfaceMode: BurstCompanionSurfaceMode = BurstCompanionSurfaceMode.VISIBLE_PREVIEW,
 )
+
+/** Preview-class companion target used beside the recorder surface in constrained HFR sessions. */
+enum class BurstCompanionSurfaceMode {
+    VISIBLE_PREVIEW,
+    OFFSCREEN_PREVIEW,
+}
 
 /** Fail-loud reasons for every Phase 4 capture terminal path. */
 enum class BurstFailure {
@@ -57,6 +64,7 @@ sealed interface BurstOutcome {
         val requestedDurationMillis: Long? = null,
         val width: Int? = null,
         val height: Int? = null,
+        val companionSurfaceMode: BurstCompanionSurfaceMode? = null,
     ) : BurstOutcome
 
     data class Failure(val reason: BurstFailure, val message: String) : BurstOutcome

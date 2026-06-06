@@ -121,6 +121,58 @@ class VisualEstimateCaptureProofTest {
         assertTrue(proof.frames.all { it.thumbnailArgbPixels.isNotEmpty() })
     }
 
+    @Test
+    fun recordedHfrProofKeepsSourceWorkingAndGateMetadataWithoutFullFramePixels() {
+        val config = framePipelineConfig(allowDirectionalCandidateSelection = true)
+        val frames = listOf(
+            ballFrame(x = 2, timestampSeconds = 0.0),
+            ballFrame(x = 6, timestampSeconds = 1.0 / 120.0),
+            ballFrame(x = 12, timestampSeconds = 2.0 / 120.0),
+            ballFrame(x = 20, timestampSeconds = 3.0 / 120.0),
+        )
+        val result = VisualEstimateFramePipeline.estimateFromFramesWithTrace(
+            sequence = TimedFrameSequence(frames),
+            calibration = MeasurementCalibrationState(
+                pointA = ImagePoint(0.0, 0.0),
+                pointB = ImagePoint(4.0, 0.0),
+                knownDistanceFeet = 1.0,
+            ),
+            config = config,
+        )
+
+        val proof = VisualEstimateCaptureProofBuilder.build(
+            attemptId = 44L,
+            frames = frames,
+            frameAvailableCallbackCount = 4,
+            captureResultCallbackCount = 240,
+            uniqueSensorTimestampCount = 240,
+            readbackWidth = 1280,
+            readbackHeight = 720,
+            trace = result.detectorTrace.withOutcome(result.outcome),
+            sourceKind = "RECORDED_HFR",
+            sourceWidth = 1920,
+            sourceHeight = 1080,
+            workingWidth = 1280,
+            workingHeight = 720,
+            decodedFrameCount = 240,
+            requestedFps = 120,
+            dropGateVerdict = "PASS",
+            cadenceGateVerdict = "PASS",
+        )
+
+        assertEquals("RECORDED_HFR", proof.sourceKind)
+        assertEquals(1920, proof.sourceWidth)
+        assertEquals(1080, proof.sourceHeight)
+        assertEquals(1280, proof.workingWidth)
+        assertEquals(720, proof.workingHeight)
+        assertEquals(240, proof.decodedFrameCount)
+        assertEquals(120, proof.requestedFps)
+        assertEquals("PASS", proof.dropGateVerdict)
+        assertEquals("PASS", proof.cadenceGateVerdict)
+        assertTrue(proof.frames.all { it.thumbnailWidth <= VisualEstimateCaptureProofBuilder.DEFAULT_THUMBNAIL_MAX_WIDTH })
+        assertTrue(proof.frames.all { it.thumbnailHeight <= VisualEstimateCaptureProofBuilder.DEFAULT_THUMBNAIL_MAX_HEIGHT })
+    }
+
     private fun framePipelineConfig(
         allowDirectionalCandidateSelection: Boolean,
     ): VisualEstimateFramePipelineConfig =

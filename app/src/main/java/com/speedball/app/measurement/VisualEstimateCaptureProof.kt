@@ -19,6 +19,15 @@ data class VisualEstimateCaptureProof(
     val readbackHeight: Int,
     val detectorSummary: VisualEstimateDetectorSummary,
     val frames: List<VisualEstimateProofFrame>,
+    val sourceKind: String = "DIRECT_READBACK",
+    val sourceWidth: Int = readbackWidth,
+    val sourceHeight: Int = readbackHeight,
+    val workingWidth: Int = readbackWidth,
+    val workingHeight: Int = readbackHeight,
+    val decodedFrameCount: Int? = null,
+    val requestedFps: Int? = null,
+    val dropGateVerdict: String? = null,
+    val cadenceGateVerdict: String? = null,
 ) {
     val hasCapturedFrames: Boolean get() = capturedFrameCount > 0
 
@@ -153,6 +162,15 @@ object VisualEstimateCaptureProofBuilder {
         detectorConfig: BlobDetectionConfig,
         noReadReason: VisualEstimateNoReadReason?,
         noReadMessage: String?,
+        sourceKind: String = "DIRECT_READBACK",
+        sourceWidth: Int = readbackWidth,
+        sourceHeight: Int = readbackHeight,
+        workingWidth: Int = readbackWidth,
+        workingHeight: Int = readbackHeight,
+        decodedFrameCount: Int? = null,
+        requestedFps: Int? = null,
+        dropGateVerdict: String? = null,
+        cadenceGateVerdict: String? = null,
     ): VisualEstimateCaptureProof =
         VisualEstimateCaptureProof(
             attemptId = attemptId,
@@ -171,6 +189,15 @@ object VisualEstimateCaptureProofBuilder {
                 noReadMessage = noReadMessage,
             ),
             frames = emptyList(),
+            sourceKind = sourceKind,
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight,
+            workingWidth = workingWidth,
+            workingHeight = workingHeight,
+            decodedFrameCount = decodedFrameCount,
+            requestedFps = requestedFps,
+            dropGateVerdict = dropGateVerdict,
+            cadenceGateVerdict = cadenceGateVerdict,
         )
 
     fun build(
@@ -183,6 +210,15 @@ object VisualEstimateCaptureProofBuilder {
         readbackHeight: Int,
         trace: VisualEstimateDetectorTrace,
         maxProofFrames: Int = DEFAULT_MAX_PROOF_FRAMES,
+        sourceKind: String = "DIRECT_READBACK",
+        sourceWidth: Int = readbackWidth,
+        sourceHeight: Int = readbackHeight,
+        workingWidth: Int = readbackWidth,
+        workingHeight: Int = readbackHeight,
+        decodedFrameCount: Int? = null,
+        requestedFps: Int? = null,
+        dropGateVerdict: String? = null,
+        cadenceGateVerdict: String? = null,
     ): VisualEstimateCaptureProof {
         if (frames.isEmpty()) {
             return empty(
@@ -195,6 +231,15 @@ object VisualEstimateCaptureProofBuilder {
                 detectorConfig = trace.detectorConfig,
                 noReadReason = trace.noReadReason,
                 noReadMessage = trace.noReadMessage,
+                sourceKind = sourceKind,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                workingWidth = workingWidth,
+                workingHeight = workingHeight,
+                decodedFrameCount = decodedFrameCount,
+                requestedFps = requestedFps,
+                dropGateVerdict = dropGateVerdict,
+                cadenceGateVerdict = cadenceGateVerdict,
             )
         }
         val traceByFrameIndex = trace.frames.associateBy { it.frameIndex }
@@ -226,6 +271,15 @@ object VisualEstimateCaptureProofBuilder {
                         ?.toProofBlob(frame.width, frame.height, thumbnail.width, thumbnail.height),
                 )
             },
+            sourceKind = sourceKind,
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight,
+            workingWidth = workingWidth,
+            workingHeight = workingHeight,
+            decodedFrameCount = decodedFrameCount,
+            requestedFps = requestedFps,
+            dropGateVerdict = dropGateVerdict,
+            cadenceGateVerdict = cadenceGateVerdict,
         )
     }
 

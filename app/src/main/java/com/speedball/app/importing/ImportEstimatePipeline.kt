@@ -5,6 +5,7 @@ import com.speedball.app.measurement.MeasurementCalibrationState
 import com.speedball.app.measurement.RgbFrame
 import com.speedball.app.measurement.TimedFrameSequence
 import com.speedball.app.measurement.VisualEstimateDiagnostics
+import com.speedball.app.measurement.VisualEstimateDetectorTrace
 import com.speedball.app.measurement.VisualEstimateFramePipeline
 import com.speedball.app.measurement.VisualEstimateFramePipelineConfig
 import com.speedball.app.measurement.VisualEstimateFrameTiming
@@ -18,30 +19,45 @@ object ImportEstimatePipeline {
         timing: ImportTimingReconciliation,
         calibration: MeasurementCalibrationState,
         config: VisualEstimateFramePipelineConfig,
-    ): ImportEstimateOutcome {
+    ): ImportEstimateOutcome =
+        estimateWithTrace(frames, timing, calibration, config).outcome
+
+    fun estimateWithTrace(
+        frames: ImportVideoFrameSequence,
+        timing: ImportTimingReconciliation,
+        calibration: MeasurementCalibrationState,
+        config: VisualEstimateFramePipelineConfig,
+    ): ImportEstimatePipelineResult {
         if (frames.frames.size != timing.timestampsSeconds.size) {
-            return importNoRead(
+            val noRead = importNoRead(
                 frameCount = frames.frames.size,
                 timing = timing,
                 message = "Imported frame count does not match reconciled timing.",
             )
+            return ImportEstimatePipelineResult(
+                outcome = noRead,
+                processedFrames = emptyList(),
+                detectorTrace = VisualEstimateDetectorTrace(config.trackConfig.detectorConfig, emptyList()).withOutcome(noRead),
+            )
         }
-        val sequence = TimedFrameSequence(
-            frames.frames.zip(timing.timestampsSeconds).map { (frame, timestampSeconds) ->
-                RgbFrame(
-                    width = frame.width,
-                    height = frame.height,
-                    argbPixels = frame.argbPixels,
-                    timestampSeconds = timestampSeconds,
-                )
-            },
-        )
-        val outcome = VisualEstimateFramePipeline.estimateFromFrames(
-            sequence = sequence,
+        val processedFrames = frames.frames.zip(timing.timestampsSeconds).map { (frame, timestampSeconds) ->
+            RgbFrame(
+                width = frame.width,
+                height = frame.height,
+                argbPixels = frame.argbPixels,
+                timestampSeconds = timestampSeconds,
+            )
+        }
+        val result = VisualEstimateFramePipeline.estimateFromFramesWithTrace(
+            sequence = TimedFrameSequence(processedFrames),
             calibration = calibration,
             config = config.copy(timing = VisualEstimateFrameTiming.RequireRealTimestamps),
         )
-        return outcome.withImportTimingProvenance(timing)
+        return ImportEstimatePipelineResult(
+            outcome = result.outcome.withImportTimingProvenance(timing),
+            processedFrames = processedFrames,
+            detectorTrace = result.detectorTrace.withOutcome(result.outcome.withImportTimingProvenance(timing)),
+        )
     }
 
     private fun importNoRead(
@@ -110,3 +126,10 @@ object ImportEstimatePipeline {
                 EstimateTimingBasis.IMPORT_VISUAL_FRAME_DELTA_INFERENCE
         }
 }
+
+/** Estimate output plus processed frames and estimator trace for proof rendering. */
+data class ImportEstimatePipelineResult(
+    val outcome: ImportEstimateOutcome,
+    val processedFrames: List<RgbFrame>,
+    val detectorTrace: VisualEstimateDetectorTrace,
+)

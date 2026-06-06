@@ -51,22 +51,28 @@ high-speed recorder can own the camera, start a bounded 120 fps MediaRecorder
 burst when a fixed 120 fps range is exposed, stop on its timer, and
 automatically estimate from the exact app-created MP4 without sending the user
 through the Android picker.
-In the setup drawer, `Record 120` is this MediaRecorder MP4 path. `Est 120` is
-the separate direct live estimate path: it still uses the selected fixed 120 fps
-Camera2 high-speed mode, but it reads direct frames instead of recording an MP4.
+In the setup drawer, `Record 120` is a manual MediaRecorder diagnostic. `Est
+120` is the separate direct live diagnostic estimate path: it still uses the
+selected fixed 120 fps Camera2 high-speed mode, but it reads direct frames
+instead of recording an MP4. Run Mode `shoot` is different: after setup passes
+and the Ready/three-beep cue completes, it starts the recorded-HFR estimate path
+so the phone records a bounded app-owned high-speed clip and then processes that
+clip.
 When an estimate succeeds, the camera preview is covered by a black result
 screen with large bold white velocity, launch-angle, and carry-distance text.
 The `CLEAR` button dismisses the result screen and returns to the camera view.
 No-read and capture-failure outcomes do not use that full-screen black result
 screen; they show a bottom report with reason, action, message, and
 attempt-scoped capture proof while the setup preview remains visible after
-capture recovery. The proof is a bounded contact sheet of the processed
-direct-readback frames the detector saw. On the S10+ direct path those frames
-are low-resolution 160x90 diagnostics, not full preview photos. The panel also
-shows captured-frame count, readback size, candidate-frame count,
-candidate-blob count, and selected-sample count. Zero captured frames means the
-attempt produced no imagery. Zero candidate frames means the selected color/ROI
-matched no blobs in the processed frames.
+capture recovery. The proof is a bounded contact sheet of the processed frames
+the detector saw. For Run Mode `shoot`, those thumbnails come from the
+recorded-HFR source after bounded decode and downscale for display; the report
+also shows source size, detector working size, decoded frame count, unique
+`SENSOR_TIMESTAMP` count, extracted frame count, requested fps, and
+recorded-source drop/cadence gate verdicts. For the manual direct diagnostic
+path, proof thumbnails remain bounded low-resolution direct-readback frames.
+Zero captured frames means the attempt produced no imagery. Zero candidate
+frames means the selected color/ROI matched no blobs in the processed frames.
 
 The app now separates the visible workflow into two app-level modes:
 
@@ -194,12 +200,11 @@ a true horizon and known-horizontal motion. Estimates without a captured level
 state that launch angle is not corrected for camera tilt.
 Phase 15 adds estimate-only video processing. The normal field-test path is
 hands-free: the user taps Voice once, then says "shoot" to run the
-readiness-gated ready/beep sequence before the direct 120 fps visual estimate
-path. Explicit "record" variants and the `Record 120` button remain a
-diagnostic app-owned 120 fps MP4 path; they are not the S10+ field-test
-`shoot` path because that route depends on recording then decoding a file. The
-recorded file is fed directly into the same import estimate pipeline. The
-high-speed recorder
+readiness-gated ready/beep sequence before the recorded-HFR estimate path.
+Explicit "record" variants and the `Record 120` button remain manual diagnostic
+recording paths, while Run Mode `shoot` uses the same high-speed recorder as
+the primary source. The recorded file is fed directly into the import/recorded
+estimate pipeline. The high-speed recorder
 requests a fast 1/1000s shutter through Camera2 manual exposure when the device
 and constrained high-speed session allow it; if that manual request is rejected,
 recording falls back to the device's auto-exposure path rather than failing the
@@ -209,16 +214,22 @@ recorded estimates use the app-private file directly and do not store a media
 URI or raw path in saved evidence. The app deletes the app-owned recorded MP4
 after frame extraction/estimate processing. The app reads redacted metadata,
 probes monotonic presentation timestamps as estimate evidence only for
-user-selected imports, decodes a bounded set of frames, scales them to the
-existing readback size, and runs the same color detector, calibration state, and
-visual estimate pipeline used by live estimates. The Android import adapter
+user-selected imports, decodes a bounded set of frames, scales recorded-HFR
+shots to a detector working size no larger than 1280x720, and runs the same
+color detector, calibration state, and visual estimate pipeline used by live
+estimates. The Android import adapter
 prefers indexed frame extraction and falls back to timestamp extraction when the
 platform cannot return frames by index. Estimate-mode import can use a known
 capture frame interval for slow-motion files whose playback PTS has been
 rewritten; app-owned recordings use a distinct recorded-capture frame-interval
 timing basis from the requested capture FPS. Recorded estimates are saved and
 exported as `RECORDED_ESTIMATE` with a LOW-confidence MediaRecorder
-frame-drop/coalescing caveat rather than import-only re-encode/VFR caveats.
+frame-drop/coalescing caveat rather than import-only re-encode/VFR caveats. For
+Run Mode `shoot`, an estimate value is allowed only after the decoded sample
+count and extracted frame count both match the capture-side unique
+`SENSOR_TIMESTAMP` count and the capture-side sensor cadence stays in the
+requested high-speed band; otherwise the app returns a no-read with proof
+thumbnails and detector counts but no mph.
 Import uses the sampled
 ball point to define the HSV color band, but does not force the track to start
 at that point; it skips leading frames before the ball enters the ROI, filters
@@ -276,8 +287,8 @@ a typed failure, or bounded logcat diagnostics.
    only when the command path is truthful, and always exposes manual `Shoot`
    when setup remains valid.
 6. In Run Mode, saying `shoot` or pressing `Shoot` starts a new capture attempt.
-   The app captures a bounded high-speed visual-estimate window and stops
-   automatically; the user should not reset setup between attempts.
+   The app records a bounded high-speed clip, processes bounded recorded frames,
+   and stops automatically; the user should not reset setup between attempts.
 7. For import mode, the user selects a video and the app processes it
    end-to-end without a manual start/stop recording step.
 8. The app detects the ball center in each accepted frame.
@@ -355,6 +366,12 @@ The app must show "No read" rather than a wrong speed when:
 - the recorder output file is missing, empty, lacks a video track, has invalid
   metadata, or cannot expose decoded sample timestamps;
 - fewer than three decoded frames are available;
+- recorded-HFR `shoot` cannot prove decoded-frame count equals the capture-side
+  unique `SENSOR_TIMESTAMP` count;
+- recorded-HFR `shoot` cannot prove extracted-frame count equals decoded-frame
+  count and capture-side unique `SENSOR_TIMESTAMP` count;
+- recorded-HFR `shoot` cannot prove capture-side sensor cadence stayed in the
+  requested high-speed band;
 - decoded presentation timestamps are non-monotonic, have a median cadence
   outside the requested fps band, or contain a gap larger than `1.5 *
   expectedGap`;
@@ -562,13 +579,13 @@ Phase 10 workflow/result behavior:
   active on the camera image. Failed live color sampling
   leaves color not-ready instead of using a hidden yellow default.
   The `shoot` voice command checks readiness, prints `Ready to shoot`, speaks
-  `Ready`, plays three beeps, and then starts the direct 120 fps visual
-  estimate path only when the setup readiness gate passes. The visible preview
-  is required for setup, and if the preview surface is unavailable, the app
-  reports `Live feed required` before starting capture. During direct capture,
-  the camera is owned by the single hidden GL/readback target, so the preview may
-  temporarily go black. Estimate frames still come only from GL/readback, and the
-  setup preview restarts after completion, failure, or no-read.
+  `Ready`, plays three beeps, and then starts the recorded-HFR estimate path
+  only when the setup readiness gate passes. The visible preview is required for
+  setup. During recorded capture, the recorder owns the camera and uses an
+  offscreen companion preview surface, so the visible preview may temporarily go
+  black. Estimate proof frames come from the bounded recorded-HFR decode at the
+  configured detector working resolution, and the setup preview restarts after
+  completion, failure, or no-read.
   Successful estimates cover the preview with a black full-screen result
   overlay showing velocity, angle, and carry distance in large bold white text
   until the user taps `CLEAR`. The overlay is gated to current successful

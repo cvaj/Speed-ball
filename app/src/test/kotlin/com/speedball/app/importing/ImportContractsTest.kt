@@ -187,7 +187,7 @@ class ImportContractsTest {
         assertTrue(source.contains("VOICE_RECORD_COMMAND"))
         assertTrue(source.contains("AUTO_RECORD_ESTIMATE_DURATION_MILLIS"))
         assertTrue(source.contains("startTimedRecordingEstimate()"))
-        assertTrue(source.contains("runRecordedEstimate(file, fps)"))
+        assertTrue(source.contains("runRecordedEstimate(file, fps, outcome.diagnostics)"))
         assertTrue(source.contains("AndroidImportVideoFrameSource.create("))
         assertTrue(source.contains("file = file"))
         assertTrue(source.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
@@ -202,6 +202,11 @@ class ImportContractsTest {
         assertFalse(importPath.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
         assertTrue(recordedPath.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
         assertTrue(recordedPath.contains("reconcileRecordedCaptureFrameInterval"))
+        assertTrue(recordedPath.contains("RecordedHfrCaptureGate.validate("))
+        assertTrue(recordedPath.indexOf("ImportFrameExtractor.extract(") < recordedPath.indexOf("RecordedHfrCaptureGate.validate("))
+        assertTrue(recordedPath.indexOf("ImportEstimatePipeline.estimateWithTrace(") < recordedPath.indexOf("RecordedHfrCaptureGate.validate("))
+        assertTrue(recordedPath.contains("VisualEstimateCaptureProofBuilder.build("))
+        assertFalse(recordedPath.contains("VisualEstimateCaptureProofBuilder.empty("))
         assertFalse(recordedPath.contains("reconcileContainerPresentationTimestamps"))
     }
 

@@ -172,10 +172,12 @@ Run this on every code change before review and before commit.
   disclose ball-type and motion-blur scale assumptions during setup.
 - Estimate no-read UI remains value-free. Mph, angle, trajectory, carry, apex,
   and hang time are displayed only by `VisualEstimateOutcome.Success`.
-- Direct visual-estimate proof thumbnails are bounded, in-memory diagnostic
-  copies from the processed low-resolution readback frames. They are owned only
-  by the current attempt report, are dropped on clear/new attempt, and are not
-  written to public storage or exported automatically.
+- Visual-estimate proof thumbnails are bounded, in-memory diagnostic copies from
+  the processed attempt frames. For Run Mode `shoot`, they come from bounded
+  recorded-HFR decode after downscale to the detector working size; for the
+  manual direct diagnostic path, they come from processed direct readback. They
+  are owned only by the current attempt report, are dropped on clear/new
+  attempt, and are not written to public storage or exported automatically.
 - Proof logs contain counts only: captured frames, readback dimensions,
   callbacks, unique sensor timestamps, candidate frames/blobs, and selected
   samples. They must not log raw pixels, thumbnail bytes, image paths,

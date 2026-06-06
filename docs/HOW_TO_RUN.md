@@ -134,7 +134,7 @@ waiting for the command.
 
 ## 6. Fire a shot
 
-Two ways (both run the same direct high-speed visual estimate):
+Two ways (both run the same recorded-HFR estimate path):
 
 - **Voice** — say **"shoot"** while the strip shows `READY - LISTENING`.
   This is the intended hands-free operating path after setup.
@@ -145,8 +145,11 @@ Two ways (both run the same direct high-speed visual estimate):
 Then **roll/throw the neon ball across the ROI** — the capture window is short
 (about 0.8 s), so time the throw to the trigger.
 
-While capturing, the preview may briefly go **black** (the capture path owns the
-camera). This is expected; the preview returns afterward.
+On S10+ the shot path records a bounded high-speed app-owned clip from the
+selected mode, normally `1280x720 @ 120`, with an offscreen companion preview
+surface. The visible preview is for setup only. While capturing, the preview may
+briefly go **black** because the recorder owns the camera; this is expected and
+the preview returns afterward.
 
 ---
 
@@ -160,9 +163,10 @@ camera). This is expected; the preview returns afterward.
   detector counts with **no speed value** (e.g. `INSUFFICIENT_DETECTIONS` —
   "At least four usable detections are required"). This is the app correctly
   refusing to show a wrong number.
-- Proof thumbnails are the processed direct-readback frames the detector saw.
-  On the S10+ direct route they are low-resolution `160x90` diagnostic frames,
-  not full preview photos.
+- Proof thumbnails are the processed recorded-HFR frames the detector saw,
+  downscaled for display. The report also shows the recorded source size,
+  detector working size, decoded frame count, extracted frame count, unique
+  `SENSOR_TIMESTAMP` count, requested fps, and drop/cadence gate verdicts.
 - `candidateFrames=0` means the selected color/ROI matched no ball-like blobs
   in the processed frames. `selectedSamples<4` means blobs existed but not
   enough usable track samples were selected.
@@ -179,15 +183,14 @@ In a second terminal:
 ```bash
 adb logcat -c                                   # clear first
 # fire a shot, then:
-adb logcat | grep -E "VISUAL_ESTIMATE|VOICE_|RECORDED_ESTIMATE|DECODE_"
+adb logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECODE_"
 ```
-- Expected for a `shoot`/`Shoot`: `VISUAL_ESTIMATE_COMPLETE frames=… uniqueSensorTs=…
-  candidateFrames=… candidateBlobs=… selectedSamples=…` then
-  `VISUAL_ESTIMATE_RESULT …`.
+- Expected for a `shoot`/`Shoot`: `RECORDED_HFR_START`, then
+  `RECORDED_HFR_CAPTURE_SUCCESS`, then `RECORDED_ESTIMATE_STAGE ...`, followed
+  by `RECORDED_HFR_ESTIMATE_COMPLETE` or `RECORDED_HFR_ESTIMATE_NO_READ`.
 - A blocked shot logs `VOICE_SHOOT_NOT_READY reason=<specific>`.
-- **Must NOT appear** for the direct shoot path: `VOICE_RECORD_SUCCESS`,
-  `RECORDED_ESTIMATE_STAGE`, `DECODE_` (those indicate the wrong
-  record-then-decode route).
+- **Must NOT appear** for the `shoot` path: `VOICE_RECORD_SUCCESS`. That marker
+  belongs to the old queued voice-record path and indicates the wrong route.
 
 ---
 
@@ -217,8 +220,9 @@ adb logcat | grep -E "VISUAL_ESTIMATE|VOICE_|RECORDED_ESTIMATE|DECODE_"
 - Voice recognition reliability varies by device/firmware, but Run Mode is
   designed to keep cycling through idle no-match/timeouts until it hears
   `shoot`.
-- 240 fps capture has device constraints; this flow uses the supported high-speed
-  direct path.
+- 240 fps capture has device constraints; this flow uses the supported
+  recorded-HFR 120 fps path on S10+ unless another mode is explicitly selected
+  and proven.
 
 ---
 
@@ -233,7 +237,7 @@ ANDROID_HOME=/home/vangmountain/Android/Sdk ./gradlew :app:installDebug
 # 3) launch
 $ADB shell am start -n com.speedball.app/.MainActivity
 # 4) (optional) watch logs while you shoot
-$ADB logcat -c && $ADB logcat | grep -E "VISUAL_ESTIMATE|VOICE_|RECORDED_ESTIMATE|DECODE_"
+$ADB logcat -c && $ADB logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECODE_"
 ```
 Then on the phone: **Setup** (permission → distance A/B + feet → color → ROI →
 level) → **Run** → **Shoot** (or say "shoot") with the neon ball crossing the ROI.

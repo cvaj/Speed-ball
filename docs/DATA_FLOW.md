@@ -67,13 +67,13 @@ LaunchState + BallSpec + AirSpec + TrajectoryOptions
 `TrajectoryOutcome.Failure` carries only a reason and message, never partial
 trajectory samples or plausible carry/hang/apex values.
 
-## Live 120 fps Path
+## Recorded-HFR 120 fps Path
 
-The setup drawer button labeled `Record 120` starts this diagnostic path. It is
-the app-owned MediaRecorder path: a constrained high-speed 120 fps Camera2
-session records an MP4, then the app decodes that file and runs the estimate
-pipeline with an explicit LOW-confidence MediaRecorder frame-drop/coalescing
-caveat. This is not the readiness-gated `shoot` path on S10+.
+Run Mode `shoot`, the Run Mode manual `Shoot` button, and the setup drawer
+`Record 120` diagnostic use the app-owned MediaRecorder path. A constrained
+high-speed 120 fps Camera2 session records an MP4, then the app decodes a
+bounded frame set, runs detector trace/proof generation, and gates the result
+against capture-side count/cadence proof before any estimate value may surface.
 
 ```text
 MainActivity
@@ -82,27 +82,36 @@ MainActivity
   -> HighSpeedCamera enumerates back-camera Camera2 high-speed HAL ranges
   -> pure HighSpeedMode mapper validates fixed Range(fps,fps)
   -> developer UI selects default 720p@120 when available
-  -> SpeechRecognizer listens for explicit "record" variants only for this path
+  -> SpeechRecognizer listens for "shoot" in Run Mode after setup is valid
 Camera2 constrained high-speed session
-  -> preview surface + MediaRecorder surface
+  -> offscreen companion preview surface + MediaRecorder surface for Run Mode
   -> best-effort 1/1000s Camera2 manual exposure request, with AE fallback
   -> fixed timer stops the recording automatically
   -> capture callback SENSOR_TIMESTAMP list
   -> BurstDiagnostics unique-count floor + median-gap band
   -> saved burst in app-specific external files
   -> app-owned MP4 is passed directly to recorded estimate processing
+  -> redacted metadata and decoded sample count probe
+  -> detector working resolution selection, capped at 1280x720
+  -> bounded frame extraction from the recorded source
   -> ImportTimingReconciliation with RECORDED_CAPTURE_FRAME_INTERVAL from requested capture FPS
-  -> LOW-confidence MediaRecorder frame-drop/coalescing caveat
-  -> existing HSV/blob detector, calibration, and VisualEstimateFramePipeline
+  -> existing HSV/blob detector, calibration, and VisualEstimateFramePipeline trace
   -> skip non-hit leading frames, filter tiny speckles, and use RANSAC-style
      consensus to select a short high-velocity one-directional straight
      yellow-ball motion window
-  -> VisualEstimateOutcome estimate success or no-read
+  -> VisualEstimateCaptureProofBuilder bounded thumbnails from processed recorded frames
+  -> RecordedHfrCaptureGate decoded count == extracted count == unique SENSOR_TIMESTAMP count
+  -> RecordedHfrCaptureGate sensor-cadence/capture-proof pass
+  -> VisualEstimateOutcome estimate success or no-read with proof
   -> MeasurementResultUiState.EstimateOutcome UI formatting
   -> SavedResultSummaryStore app-private redacted RECORDED_ESTIMATE summary
   -> ImportEvidenceExporter redacted RECORDED_ESTIMATE text export
   -> app-owned MP4 deleted after processing
 ```
+
+If the recorded-HFR gate fails, the detector trace/proof may still be shown as
+imagery and counts, but the terminal outcome is no-read and no mph/angle/carry
+value is displayed.
 
 The older decode proof branch remains diagnostic-only:
 
@@ -175,14 +184,14 @@ the normal surface. Entering Run Mode and every `shoot` re-checks the same setup
 gates; invalid setup produces a specific run-state reason and does not start
 capture.
 
-The setup drawer button labeled `Est 120`, the Run Mode manual `Shoot` button,
-and the readiness-gated voice command `shoot` all start the direct visual
-estimate path. The voice path first speaks Ready and plays three short beeps.
-It uses the selected fixed 120 fps Camera2 high-speed mode, but it does not
-create a MediaRecorder MP4 or decode a file; it reads app-owned frames through
-the direct GL/readback surface and runs the live estimate pipeline. The setup
-preview surface is required before capture so the user can align distance, ROI,
-color, calipers, and level, but it is not a direct-capture target.
+The setup drawer button labeled `Est 120` starts the direct visual-estimate
+diagnostic path. Run Mode `Shoot` and the readiness-gated voice command `shoot`
+start the recorded-HFR path above. The direct diagnostic path uses the selected
+fixed 120 fps Camera2 high-speed mode, but it does not create a MediaRecorder
+MP4 or decode a file; it reads app-owned frames through the direct GL/readback
+surface and runs the live estimate pipeline. The setup preview surface is
+required before setup can arm so the user can align distance, ROI, color,
+calipers, and level, but it is not a direct-capture target.
 `VisualEstimateFramePipeline` receives only GL/readback frames. The visible
 preview may go black while the bounded direct capture owns the camera; the setup
 preview is restarted after completion, failure, or no-read.
@@ -201,11 +210,12 @@ DirectVisualEstimateCapture
 
 Capture proof is one-attempt-deep and in memory by default. It contains
 low-resolution thumbnail pixels, ROI/candidate/selected overlays, readback
-dimensions, frame callback counts, unique sensor timestamp count, and bounded
-detector counts. It does not contain mph, angle, distance, raw media paths, or a
-strict timing-proof token. No-read and failure reports use the proof to explain
-whether zero frames, zero candidates, too few candidate frames, or too few
-selected samples caused the attempt to fail loud.
+dimensions, extracted-frame count, frame callback counts, unique sensor
+timestamp count, and bounded detector counts. It does not contain mph, angle,
+distance, raw media paths, or a strict timing-proof token. No-read and failure
+reports use the proof to explain whether zero frames, zero candidates, too few
+candidate frames, too few selected samples, or recorded-source count/cadence
+gates caused the attempt to fail loud.
 On success, estimate result formatting includes speed, launch angle, and a
 carry-distance estimate computed through the existing trajectory simulator.
 The camera UI presents those values in a black full-screen result overlay only
@@ -577,15 +587,11 @@ arm. The P14-G2-A golden covers the full composed chain: preview-space
 calibration plus readback-space ball motion plus known delta time must produce
 the expected mph through real estimate logic, including a non-square/aspect
 ratio case.
-The `shoot` voice command is a readiness-gated direct visual-estimate command:
-it checks the same Phase 14 `canArm()` gate used by the visual estimate setup,
-prints `Ready to shoot`, speaks `Ready`, plays three short beeps, and then
-starts `Est 120`/`DirectVisualEstimateCapture`. It must not route through the
-MediaRecorder/decode path on S10+. If readiness fails, the status row reports
-the specific condition, logcat records `VOICE_SHOOT_NOT_READY`, and listening
-continues.
-Starting direct visual estimate also requires the current visible preview
-surface. If the surface is missing, the status row reports `Live feed required`.
-The preview surface is a setup-readiness gate only; direct capture does not pass
-that surface into its Camera2 request. The setup feed restarts after direct
-completion, failure, or no-read.
+The `shoot` voice command is a readiness-gated recorded-HFR command: it checks
+the same Phase 14 `canArm()` gate used by setup, prints `Ready to shoot`, speaks
+`Ready`, plays three short beeps, and then starts the recorded-HFR path. It must
+not route through `startDirectVisualEstimate()` on S10+. If readiness fails, the
+status row reports the specific condition, logcat records
+`VOICE_SHOOT_NOT_READY`, and listening continues. The preview surface is a setup
+aid only. Recorded capture can use an offscreen companion preview surface, and
+the setup feed restarts after completion, failure, or no-read.

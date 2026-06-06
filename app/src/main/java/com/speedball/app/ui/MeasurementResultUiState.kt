@@ -130,7 +130,16 @@ private fun VisualEstimateCaptureProof?.reportLinesFor(kind: VisualEstimateRepor
     val proof = this ?: return emptyList()
     val summary = proof.detectorSummary
     val base = buildList {
-        add("PROOF frames=${proof.capturedFrameCount} readback=${proof.readbackWidth}x${proof.readbackHeight}")
+        if (proof.sourceKind == "RECORDED_HFR") {
+            add(
+                "PROOF source=RECORDED_HFR source=${proof.sourceWidth}x${proof.sourceHeight} " +
+                    "working=${proof.workingWidth}x${proof.workingHeight} decoded=${proof.decodedFrameCount ?: proof.capturedFrameCount} " +
+                    "extracted=${proof.capturedFrameCount} uniqueSensorTs=${proof.uniqueSensorTimestampCount} fps=${proof.requestedFps ?: 0}",
+            )
+            add("GATES drop=${proof.dropGateVerdict ?: "UNKNOWN"} cadence=${proof.cadenceGateVerdict ?: "UNKNOWN"}")
+        } else {
+            add("PROOF frames=${proof.capturedFrameCount} readback=${proof.readbackWidth}x${proof.readbackHeight}")
+        }
         add("DETECTOR candidateFrames=${summary.candidateFrameCount} candidateBlobs=${summary.candidateBlobCount} selectedSamples=${summary.selectedSampleCount}")
         if (proof.capturedFrameCount == 0) {
             add("EVIDENCE 0 frames captured")
