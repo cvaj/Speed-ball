@@ -122,6 +122,8 @@ object ImportEstimatePipeline {
                 EstimateTimingBasis.IMPORT_VISUAL_FRAME_DELTA_INFERENCE
             ImportTimingBasis.RECORDED_CAPTURE_FRAME_INTERVAL ->
                 EstimateTimingBasis.RECORDED_CAPTURE_FRAME_INTERVAL
+            ImportTimingBasis.RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS ->
+                EstimateTimingBasis.RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS
             ImportTimingBasis.NO_TRUSTWORTHY_TIMING ->
                 EstimateTimingBasis.IMPORT_VISUAL_FRAME_DELTA_INFERENCE
         }

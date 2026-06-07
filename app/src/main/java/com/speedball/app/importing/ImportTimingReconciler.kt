@@ -51,6 +51,8 @@ object ImportTimingReconciler {
         "Imported visual gap inference assumes roughly constant in-plane velocity within the timed window."
     const val RECORDED_CAPTURE_FRAME_DROP_ASSUMPTION: String =
         "Recorded estimate uses app-owned MediaRecorder frames; device or encoder frame drop/coalescing can under-sample fast motion and bias speed low."
+    const val RECORDED_CONTAINER_PTS_ASSUMPTION: String =
+        "Recorded window estimate uses MediaRecorder container presentation timestamp deltas; it is estimate-only and must not be treated as a strict SENSOR_TIMESTAMP pairing proof."
 
     fun reconcile(
         samples: List<ImportTrackSample>,
@@ -185,6 +187,81 @@ object ImportTimingReconciler {
                 assumptions = listOf(
                     CONSTANT_VELOCITY_WINDOW_ASSUMPTION,
                     RECORDED_CAPTURE_FRAME_DROP_ASSUMPTION,
+                ),
+            ),
+        )
+    }
+
+    /** Reconciles retained recorded-capture candidates using original decoded frame indexes. */
+    fun reconcileRecordedCaptureFrameIndexes(
+        frameIndexes: List<Int>,
+        frameIntervalSeconds: Double,
+    ): ImportValidationResult<ImportTimingReconciliation> {
+        if (frameIndexes.size < 2) {
+            return noRead("Recorded timing needs at least two retained candidate frames.")
+        }
+        if (!frameIntervalSeconds.isFinite() || frameIntervalSeconds <= 0.0) {
+            return noRead("Recorded timing interval must be finite and positive.")
+        }
+        if (frameIndexes.any { it < 0 } || frameIndexes.zipWithNext().any { (previous, current) -> current <= previous }) {
+            return noRead("Recorded retained frame indexes must be strictly increasing.")
+        }
+        val baseIndex = frameIndexes.first()
+        val timestamps = frameIndexes.map { (it - baseIndex) * frameIntervalSeconds }
+        val gaps = timestamps.zipWithNext { previous, current -> current - previous }
+        if (gaps.any { !it.isFinite() || it <= 0.0 }) {
+            return noRead("Recorded retained frame index gaps must be finite and positive.")
+        }
+        return ImportValidationResult.Success(
+            ImportTimingReconciliation(
+                basis = ImportTimingBasis.RECORDED_CAPTURE_FRAME_INTERVAL,
+                timestampsSeconds = timestamps,
+                timestampGapSummary = gapSummary(gaps),
+                frameStepMultipliers = frameIndexes.zipWithNext { previous, current -> current - previous },
+                confidence = VisualEstimateConfidence.LOW,
+                assumptions = listOf(
+                    CONSTANT_VELOCITY_WINDOW_ASSUMPTION,
+                    RECORDED_CAPTURE_FRAME_DROP_ASSUMPTION,
+                ),
+            ),
+        )
+    }
+
+    /**
+     * Reconciles retained recorded-HFR window candidates using actual container
+     * presentation timestamp deltas. This is the timing path for sound-window
+     * estimates because MediaRecorder can drop encoded frames between sensor
+     * timestamps and container samples.
+     */
+    fun reconcileRecordedContainerPresentationTimestamps(
+        presentationTimestampsNanos: List<Long?>,
+    ): ImportValidationResult<ImportTimingReconciliation> {
+        if (presentationTimestampsNanos.size < 2) {
+            return noRead("Recorded window timing needs at least two retained candidate timestamps.")
+        }
+        val timestamps = presentationTimestampsNanos.map {
+            it ?: return noRead("Recorded window timing requires container PTS for every retained candidate.")
+        }
+        if (timestamps.any { it < 0L } || timestamps.zipWithNext().any { (previous, current) -> current <= previous }) {
+            return noRead("Recorded window container presentation timestamps must be strictly increasing.")
+        }
+        val base = timestamps.first()
+        val seconds = timestamps.map { (it - base) / 1_000_000_000.0 }
+        val gaps = seconds.zipWithNext { previous, current -> current - previous }
+        if (gaps.any { !it.isFinite() || it <= 0.0 }) {
+            return noRead("Recorded window container PTS gaps must be finite and positive.")
+        }
+        return ImportValidationResult.Success(
+            ImportTimingReconciliation(
+                basis = ImportTimingBasis.RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS,
+                timestampsSeconds = seconds,
+                timestampGapSummary = gapSummary(gaps),
+                frameStepMultipliers = List(timestamps.size - 1) { 1 },
+                confidence = VisualEstimateConfidence.LOW,
+                assumptions = listOf(
+                    CONSTANT_VELOCITY_WINDOW_ASSUMPTION,
+                    RECORDED_CAPTURE_FRAME_DROP_ASSUMPTION,
+                    RECORDED_CONTAINER_PTS_ASSUMPTION,
                 ),
             ),
         )

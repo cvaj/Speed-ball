@@ -163,10 +163,14 @@ the preview returns afterward.
   detector counts with **no speed value** (e.g. `INSUFFICIENT_DETECTIONS` —
   "At least four usable detections are required"). This is the app correctly
   refusing to show a wrong number.
-- Proof thumbnails are the processed recorded-HFR frames the detector saw,
-  downscaled for display. The report also shows the recorded source size,
-  detector working size, decoded frame count, extracted frame count, unique
-  `SENSOR_TIMESTAMP` count, requested fps, and drop/cadence gate verdicts.
+- Proof thumbnails are the processed recorded-HFR candidate frames the detector
+  saw, downscaled for display. The app streams the recording one decoded frame
+  at a time, immediately discards full-frame pixels after detection, and keeps
+  only bounded thumbnail proof plus compact blob/index/timestamp records. The
+  report shows recorded source size, detector working size, decoded metadata
+  sample count, scanned decoded-frame count, candidate frame/blob counts,
+  selected samples, unique `SENSOR_TIMESTAMP` count, requested fps, and
+  drop/cadence gate verdicts.
 - `candidateFrames=0` means the selected color/ROI matched no ball-like blobs
   in the processed frames. `selectedSamples<4` means blobs existed but not
   enough usable track samples were selected.

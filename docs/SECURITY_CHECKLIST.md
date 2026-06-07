@@ -9,6 +9,7 @@ Run this on every code change before review and before commit.
 - [ ] User-selected imported files are accessed through validated Android URI/content APIs.
 - [ ] App-owned recorded clips stay app-private and saved/exported evidence does not store raw file paths.
 - [ ] App-owned recorded clips are deleted after estimate processing or no-read completion.
+- [ ] Recorded-HFR processing does not persist or export raw decoded frames, thumbnail bytes, or media identifiers.
 
 ## Camera And Permissions
 
@@ -48,6 +49,9 @@ Run this on every code change before review and before commit.
 - [ ] Thermal/resource guards exist for sustained high-speed capture.
 - [ ] Pure Kotlin frame processing has width, height, total-pixel, frame-count,
       threshold-pixel, connected-component, and operation-count caps.
+- [ ] Recorded-HFR estimate processing has scanned-frame, retained-candidate,
+      proof-thumbnail, and cancellation bounds; resource no-read is explicit
+      and does not rely on catching `OutOfMemoryError`.
 
 ## Supply Chain
 
@@ -199,6 +203,25 @@ Run this on every code change before review and before commit.
 - Imported frame extraction is bounded by frame count, dimensions, and total
   pixels; the Android frame source releases retriever/extractor resources on
   success and no-read paths.
+- App-owned recorded-HFR estimate processing streams one decoded frame at a
+  time, scans every frame for the capture/drop count, immediately drops
+  full-frame ARGB pixels after detection, and retains only bounded compact
+  blob/index/timestamp candidate records plus bounded downscaled proof
+  thumbnails. Retained candidate count is detector evidence only and must not
+  satisfy capture-side decoded/scanned/`SENSOR_TIMESTAMP` gates.
+- Sound-triggered recorded-HFR window foundations treat the loud pop only as a
+  timestamp marker. Raw PCM stays in memory, is never logged, persisted,
+  exported, or included in proof artifacts, and only derived scalar diagnostics
+  may be reported. Audio and speech-recognizer ownership must be single-owner
+  in the later Android route.
+- Sound-triggered window decoding must use bounded container-PTS windows and
+  low-resolution proof thumbnails only. Optional proof fields may contain
+  window times, anchor error, decode wall-clock, and source-validity verdicts,
+  but not raw audio, raw decoded frames, media paths, thumbnails bytes, ADB
+  endpoints, or pairing codes.
+- Recorded-HFR source processing must close the Android frame source on
+  success, no-read, resource-limit, cancellation, and decode-error paths. The
+  app-owned MP4 remains app-private and is deleted after terminal handling.
 - Imported clips are estimate-only. Clean monotonic container PTS is not strict
   timing proof, and import code must not construct
   `MeasurementRunOutcome.Success`.

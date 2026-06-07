@@ -28,6 +28,13 @@ data class VisualEstimateCaptureProof(
     val requestedFps: Int? = null,
     val dropGateVerdict: String? = null,
     val cadenceGateVerdict: String? = null,
+    val windowStartUs: Long? = null,
+    val windowEndUs: Long? = null,
+    val impactFrameIndex: Int? = null,
+    val anchorErrorNanos: Long? = null,
+    val preImpactMarginFrames: Int? = null,
+    val decodeWallClockMillis: Long? = null,
+    val sourceValidityVerdict: String? = null,
 ) {
     val hasCapturedFrames: Boolean get() = capturedFrameCount > 0
 
@@ -51,6 +58,7 @@ class VisualEstimateProofFrame(
     val roi: VisualEstimateProofRect?,
     val candidates: List<VisualEstimateProofBlob>,
     val selected: VisualEstimateProofBlob?,
+    val originalFrameIndex: Int = frameIndex,
 ) {
     val thumbnailHash: Int get() = thumbnailArgbPixels.contentHashCode()
 
@@ -58,6 +66,7 @@ class VisualEstimateProofFrame(
         this === other ||
             other is VisualEstimateProofFrame &&
             frameIndex == other.frameIndex &&
+            originalFrameIndex == other.originalFrameIndex &&
             timestampSeconds == other.timestampSeconds &&
             thumbnailWidth == other.thumbnailWidth &&
             thumbnailHeight == other.thumbnailHeight &&
@@ -68,6 +77,7 @@ class VisualEstimateProofFrame(
 
     override fun hashCode(): Int {
         var result = frameIndex
+        result = 31 * result + originalFrameIndex
         result = 31 * result + timestampSeconds.hashCode()
         result = 31 * result + thumbnailWidth
         result = 31 * result + thumbnailHeight
@@ -136,6 +146,7 @@ data class VisualEstimateDetectorFrameTrace(
     val candidateCount: Int,
     val candidates: List<Blob>,
     val selectedBlob: Blob? = null,
+    val originalFrameIndex: Int = frameIndex,
 )
 
 /** Estimate outcome plus the detector trace produced while estimating. */
@@ -171,6 +182,13 @@ object VisualEstimateCaptureProofBuilder {
         requestedFps: Int? = null,
         dropGateVerdict: String? = null,
         cadenceGateVerdict: String? = null,
+        windowStartUs: Long? = null,
+        windowEndUs: Long? = null,
+        impactFrameIndex: Int? = null,
+        anchorErrorNanos: Long? = null,
+        preImpactMarginFrames: Int? = null,
+        decodeWallClockMillis: Long? = null,
+        sourceValidityVerdict: String? = null,
     ): VisualEstimateCaptureProof =
         VisualEstimateCaptureProof(
             attemptId = attemptId,
@@ -198,6 +216,13 @@ object VisualEstimateCaptureProofBuilder {
             requestedFps = requestedFps,
             dropGateVerdict = dropGateVerdict,
             cadenceGateVerdict = cadenceGateVerdict,
+            windowStartUs = windowStartUs,
+            windowEndUs = windowEndUs,
+            impactFrameIndex = impactFrameIndex,
+            anchorErrorNanos = anchorErrorNanos,
+            preImpactMarginFrames = preImpactMarginFrames,
+            decodeWallClockMillis = decodeWallClockMillis,
+            sourceValidityVerdict = sourceValidityVerdict,
         )
 
     fun build(
@@ -219,6 +244,13 @@ object VisualEstimateCaptureProofBuilder {
         requestedFps: Int? = null,
         dropGateVerdict: String? = null,
         cadenceGateVerdict: String? = null,
+        windowStartUs: Long? = null,
+        windowEndUs: Long? = null,
+        impactFrameIndex: Int? = null,
+        anchorErrorNanos: Long? = null,
+        preImpactMarginFrames: Int? = null,
+        decodeWallClockMillis: Long? = null,
+        sourceValidityVerdict: String? = null,
     ): VisualEstimateCaptureProof {
         if (frames.isEmpty()) {
             return empty(
@@ -240,6 +272,13 @@ object VisualEstimateCaptureProofBuilder {
                 requestedFps = requestedFps,
                 dropGateVerdict = dropGateVerdict,
                 cadenceGateVerdict = cadenceGateVerdict,
+                windowStartUs = windowStartUs,
+                windowEndUs = windowEndUs,
+                impactFrameIndex = impactFrameIndex,
+                anchorErrorNanos = anchorErrorNanos,
+                preImpactMarginFrames = preImpactMarginFrames,
+                decodeWallClockMillis = decodeWallClockMillis,
+                sourceValidityVerdict = sourceValidityVerdict,
             )
         }
         val traceByFrameIndex = trace.frames.associateBy { it.frameIndex }
@@ -269,6 +308,7 @@ object VisualEstimateCaptureProofBuilder {
                         .map { it.toProofBlob(frame.width, frame.height, thumbnail.width, thumbnail.height) },
                     selected = frameTrace?.selectedBlob
                         ?.toProofBlob(frame.width, frame.height, thumbnail.width, thumbnail.height),
+                    originalFrameIndex = frameTrace?.originalFrameIndex ?: frameIndex,
                 )
             },
             sourceKind = sourceKind,
@@ -280,6 +320,90 @@ object VisualEstimateCaptureProofBuilder {
             requestedFps = requestedFps,
             dropGateVerdict = dropGateVerdict,
             cadenceGateVerdict = cadenceGateVerdict,
+            windowStartUs = windowStartUs,
+            windowEndUs = windowEndUs,
+            impactFrameIndex = impactFrameIndex,
+            anchorErrorNanos = anchorErrorNanos,
+            preImpactMarginFrames = preImpactMarginFrames,
+            decodeWallClockMillis = decodeWallClockMillis,
+            sourceValidityVerdict = sourceValidityVerdict,
+        )
+    }
+
+    fun buildFromThumbnails(
+        attemptId: Long,
+        scannedFrameCount: Int,
+        frameAvailableCallbackCount: Int,
+        captureResultCallbackCount: Int,
+        uniqueSensorTimestampCount: Int,
+        readbackWidth: Int,
+        readbackHeight: Int,
+        trace: VisualEstimateDetectorTrace,
+        thumbnails: List<VisualEstimateProofThumbnailFrame>,
+        sourceKind: String,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        workingWidth: Int,
+        workingHeight: Int,
+        decodedFrameCount: Int?,
+        requestedFps: Int?,
+        dropGateVerdict: String?,
+        cadenceGateVerdict: String?,
+        windowStartUs: Long? = null,
+        windowEndUs: Long? = null,
+        impactFrameIndex: Int? = null,
+        anchorErrorNanos: Long? = null,
+        preImpactMarginFrames: Int? = null,
+        decodeWallClockMillis: Long? = null,
+        sourceValidityVerdict: String? = null,
+    ): VisualEstimateCaptureProof {
+        val thumbnailsByPosition = thumbnails.associateBy { it.compactPosition }
+        return VisualEstimateCaptureProof(
+            attemptId = attemptId,
+            capturedFrameCount = scannedFrameCount,
+            frameAvailableCallbackCount = frameAvailableCallbackCount,
+            captureResultCallbackCount = captureResultCallbackCount,
+            uniqueSensorTimestampCount = uniqueSensorTimestampCount,
+            readbackWidth = readbackWidth,
+            readbackHeight = readbackHeight,
+            detectorSummary = trace.detectorSummary,
+            frames = trace.frames.mapNotNull { frameTrace ->
+                val thumbnail = thumbnailsByPosition[frameTrace.frameIndex] ?: return@mapNotNull null
+                VisualEstimateProofFrame(
+                    frameIndex = frameTrace.frameIndex,
+                    timestampSeconds = frameTrace.timestampSeconds,
+                    thumbnailWidth = thumbnail.thumbnailWidth,
+                    thumbnailHeight = thumbnail.thumbnailHeight,
+                    thumbnailArgbPixels = thumbnail.thumbnailArgbPixels,
+                    roi = frameTrace.roi?.toProofRect(thumbnail.sourceWidth, thumbnail.sourceHeight, thumbnail.thumbnailWidth, thumbnail.thumbnailHeight),
+                    candidates = frameTrace.candidates.map {
+                        it.toProofBlob(thumbnail.sourceWidth, thumbnail.sourceHeight, thumbnail.thumbnailWidth, thumbnail.thumbnailHeight)
+                    },
+                    selected = frameTrace.selectedBlob?.toProofBlob(
+                        thumbnail.sourceWidth,
+                        thumbnail.sourceHeight,
+                        thumbnail.thumbnailWidth,
+                        thumbnail.thumbnailHeight,
+                    ),
+                    originalFrameIndex = frameTrace.originalFrameIndex,
+                )
+            },
+            sourceKind = sourceKind,
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight,
+            workingWidth = workingWidth,
+            workingHeight = workingHeight,
+            decodedFrameCount = decodedFrameCount,
+            requestedFps = requestedFps,
+            dropGateVerdict = dropGateVerdict,
+            cadenceGateVerdict = cadenceGateVerdict,
+            windowStartUs = windowStartUs,
+            windowEndUs = windowEndUs,
+            impactFrameIndex = impactFrameIndex,
+            anchorErrorNanos = anchorErrorNanos,
+            preImpactMarginFrames = preImpactMarginFrames,
+            decodeWallClockMillis = decodeWallClockMillis,
+            sourceValidityVerdict = sourceValidityVerdict,
         )
     }
 
@@ -297,6 +421,42 @@ object VisualEstimateCaptureProofBuilder {
             fill += 1
         }
         return indices.sorted()
+    }
+}
+
+/** Downscaled proof pixels retained by streaming sources without full frame ARGB. */
+data class VisualEstimateProofThumbnailFrame(
+    val compactPosition: Int,
+    val originalFrameIndex: Int,
+    val timestampSeconds: Double,
+    val sourceWidth: Int,
+    val sourceHeight: Int,
+    val thumbnailWidth: Int,
+    val thumbnailHeight: Int,
+    val thumbnailArgbPixels: IntArray,
+) {
+    override fun equals(other: Any?): Boolean =
+        this === other ||
+            other is VisualEstimateProofThumbnailFrame &&
+                compactPosition == other.compactPosition &&
+                originalFrameIndex == other.originalFrameIndex &&
+                timestampSeconds == other.timestampSeconds &&
+                sourceWidth == other.sourceWidth &&
+                sourceHeight == other.sourceHeight &&
+                thumbnailWidth == other.thumbnailWidth &&
+                thumbnailHeight == other.thumbnailHeight &&
+                thumbnailArgbPixels.contentEquals(other.thumbnailArgbPixels)
+
+    override fun hashCode(): Int {
+        var result = compactPosition
+        result = 31 * result + originalFrameIndex
+        result = 31 * result + timestampSeconds.hashCode()
+        result = 31 * result + sourceWidth
+        result = 31 * result + sourceHeight
+        result = 31 * result + thumbnailWidth
+        result = 31 * result + thumbnailHeight
+        result = 31 * result + thumbnailArgbPixels.contentHashCode()
+        return result
     }
 }
 

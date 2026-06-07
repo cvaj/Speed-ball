@@ -93,14 +93,18 @@ Camera2 constrained high-speed session
   -> app-owned MP4 is passed directly to recorded estimate processing
   -> redacted metadata and decoded sample count probe
   -> detector working resolution selection, capped at 1280x720
-  -> bounded frame extraction from the recorded source
-  -> ImportTimingReconciliation with RECORDED_CAPTURE_FRAME_INTERVAL from requested capture FPS
-  -> existing HSV/blob detector, calibration, and VisualEstimateFramePipeline trace
+  -> streaming `AndroidImportVideoFrameSource.nextFrame()` decode loop
+  -> increment scanned decoded-frame count for every pulled frame
+  -> existing HSV/blob detector while full-frame pixels are local
+  -> discard full-frame ARGB immediately after detection
+  -> retain only bounded candidate blob/index/timestamp records plus bounded thumbnails
+  -> VisualEstimateCandidateReducer reuses the existing straight-hit/RANSAC selector
+  -> ImportTimingReconciliation with RECORDED_CAPTURE_FRAME_INTERVAL from retained original decoded frame indexes
   -> skip non-hit leading frames, filter tiny speckles, and use RANSAC-style
      consensus to select a short high-velocity one-directional straight
      yellow-ball motion window
-  -> VisualEstimateCaptureProofBuilder bounded thumbnails from processed recorded frames
-  -> RecordedHfrCaptureGate decoded count == extracted count == unique SENSOR_TIMESTAMP count
+  -> VisualEstimateCaptureProofBuilder bounded thumbnails from retained recorded-HFR proof frames
+  -> RecordedHfrCaptureGate metadata sample count == scanned decoded-frame count == unique SENSOR_TIMESTAMP count
   -> RecordedHfrCaptureGate sensor-cadence/capture-proof pass
   -> VisualEstimateOutcome estimate success or no-read with proof
   -> MeasurementResultUiState.EstimateOutcome UI formatting
@@ -108,6 +112,30 @@ Camera2 constrained high-speed session
   -> ImportEvidenceExporter redacted RECORDED_ESTIMATE text export
   -> app-owned MP4 deleted after processing
 ```
+
+The sound-triggered recorded-HFR window workstream now has batch-1 foundations
+only; `shoot` is not yet routed through it. The new pure path is:
+
+```text
+AudioRecord timestamp anchor from getTimestamp framePosition/nanoTime
+  -> ImpactAudioTrigger detects the first loud transient marker only
+  -> first positive Camera2 SENSOR_TIMESTAMP is the video anchor
+  -> AudioVideoClockAnchor maps both anchors to elapsedRealtimeNanos
+  -> ImpactWindowMapper computes container-time windowStartUs/windowEndUs
+     with sensor impact frame index retained as diagnostic only
+  -> RecordedHfrWindowFrameSource emits only frames with container PTS inside
+     the requested window and enforces maxFrames/strictly increasing PTS
+  -> RecordedHfrWindowCaptureGate accepts a bounded decoded subset while
+     keeping the full-burst scanned==metadata==sensor gate unchanged
+  -> RecordedHfrStreamingEstimate may use CONTAINER_PTS_DELTAS timing mode for
+     retained sound-window candidates
+  -> VisualEstimateCaptureProof can carry optional window/anchor/decode/source
+     validity fields for the attempt report
+```
+
+This foundation still requires batch-2 Android recorder/microphone orchestration,
+bounded MediaExtractor/MediaCodec implementation, and S10+ device proof before
+it can be claimed as the live Run Mode route.
 
 If the recorded-HFR gate fails, the detector trace/proof may still be shown as
 imagery and counts, but the terminal outcome is no-read and no mph/angle/carry
@@ -209,10 +237,11 @@ DirectVisualEstimateCapture
 ```
 
 Capture proof is one-attempt-deep and in memory by default. It contains
-low-resolution thumbnail pixels, ROI/candidate/selected overlays, readback
-dimensions, extracted-frame count, frame callback counts, unique sensor
-timestamp count, and bounded detector counts. It does not contain mph, angle,
-distance, raw media paths, or a strict timing-proof token. No-read and failure
+low-resolution thumbnail pixels, ROI/candidate/selected overlays, readback or
+recorded-source dimensions, scanned decoded-frame count, retained candidate
+counts, frame callback counts, unique sensor timestamp count, and bounded
+detector counts. It does not contain mph, angle, distance, raw media paths,
+full-resolution recorded frames, or a strict timing-proof token. No-read and failure
 reports use the proof to explain whether zero frames, zero candidates, too few
 candidate frames, too few selected samples, or recorded-source count/cadence
 gates caused the attempt to fail loud.

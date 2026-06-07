@@ -79,6 +79,7 @@ enum class EstimateTimingBasis {
     IMPORT_PARTIAL_TIMESTAMP_VISUAL_GAP_RECONCILIATION,
     IMPORT_VISUAL_FRAME_DELTA_INFERENCE,
     RECORDED_CAPTURE_FRAME_INTERVAL,
+    RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS,
 }
 
 /** User-facing confidence bucket for an estimate-only result. */

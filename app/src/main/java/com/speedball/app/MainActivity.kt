@@ -92,6 +92,8 @@ import com.speedball.app.importing.ImportVideoFrameSequence
 import com.speedball.app.importing.ImportWorkflowEvent
 import com.speedball.app.importing.ImportWorkflowState
 import com.speedball.app.importing.RecordedHfrCaptureGate
+import com.speedball.app.importing.RecordedHfrStreamingEstimate
+import com.speedball.app.importing.RecordedHfrStreamingEstimateConfig
 import com.speedball.app.importing.RecordedHfrWorkingResolution
 import com.speedball.app.importing.RecordedHfrWorkingResolutionSelector
 import com.speedball.app.importing.SavedResultHistory
@@ -1920,9 +1922,10 @@ class MainActivity : ComponentActivity() {
                 lastImportExportText = ImportEvidenceExporter.format(summary)
                 Log.i(logTag, "IMPORT_ESTIMATE_NO_READ reason=${outcome.reason} message=${outcome.message.compactForLog()}")
                 if (outcome.sourceKind == ImportResultSourceKind.RECORDED_ESTIMATE) {
+                    val visualNoRead = outcome.visualNoRead
                     finishRecordedVisualEstimateNoRead(
-                        reason = outcome.reason.toVisualEstimateNoReadReason(),
-                        message = outcome.message,
+                        reason = visualNoRead?.reason ?: outcome.reason.toVisualEstimateNoReadReason(),
+                        message = visualNoRead?.message ?: outcome.message,
                         failure = false,
                         proof = outcome.captureProof,
                         status = "$completePrefix no-read",
@@ -2163,54 +2166,24 @@ class MainActivity : ComponentActivity() {
             )
             is ImportValidationResult.Success -> validation.value
         }
-        Log.i(logTag, "RECORDED_ESTIMATE_STAGE extract")
-        val frames = when (
-            val extraction = ImportFrameExtractor.extract(
-                source = source,
-                config = ImportFrameExtractionConfig(
-                    maxFrames = importFrameCount,
-                    maxWidth = workingResolution.working.width,
-                    maxHeight = workingResolution.working.height,
-                    maxTotalPixels = workingResolution.working.width.toLong() *
-                        workingResolution.working.height.toLong() *
-                        importFrameCount.toLong(),
-                ),
-            )
-        ) {
-            is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
-                extraction.reason,
-                extraction.message,
-                metadata,
-                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
-            )
-            is ImportValidationResult.Success -> extraction.value
-        }
-        Log.i(logTag, "RECORDED_ESTIMATE_STAGE timing frames=${frames.frames.size}")
-        val timing = when (
-            val reconciliation = ImportTimingReconciler.reconcileRecordedCaptureFrameInterval(
-                frameCount = frames.frames.size,
+        Log.i(logTag, "RECORDED_ESTIMATE_STAGE streaming")
+        val estimate = RecordedHfrStreamingEstimate.estimate(
+            source = source,
+            config = RecordedHfrStreamingEstimateConfig(
                 frameIntervalSeconds = 1.0 / fps.toDouble(),
-            )
-        ) {
-            is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
-                reason = reconciliation.reason,
-                message = reconciliation.message,
-                metadata = metadata,
-                frameCount = frames.frames.size,
-                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
-            )
-            is ImportValidationResult.Success -> reconciliation.value
-        }
-        Log.i(logTag, "RECORDED_ESTIMATE_STAGE estimate")
-        val estimate = ImportEstimatePipeline.estimateWithTrace(
-            frames = frames,
-            timing = timing,
-            calibration = runtimeConfig.calibration,
-            config = runtimeConfig.framePipelineConfig,
+                calibration = runtimeConfig.calibration,
+                framePipelineConfig = runtimeConfig.framePipelineConfig,
+                maxScannedFrames = importFrameCount,
+                maxRetainedCandidateFrames = RECORDED_HFR_MAX_RETAINED_CANDIDATE_FRAMES,
+                maxProofFrames = VisualEstimateCaptureProofBuilder.DEFAULT_MAX_PROOF_FRAMES,
+                proofThumbnailMaxWidth = RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH,
+                proofThumbnailMaxHeight = RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT,
+            ),
         )
         val gateValidation = RecordedHfrCaptureGate.validate(
-            decodedFrameCount = metadata.sampleCount,
-            extractedFrameCount = frames.frames.size,
+            metadataSampleCount = metadata.sampleCount,
+            scannedFrameCount = estimate.scannedFrameCount,
+            retainedCandidateFrameCount = estimate.retainedCandidateFrameCount,
             diagnostics = diagnostics,
             metadata = metadata,
         )
@@ -2227,15 +2200,20 @@ class MainActivity : ComponentActivity() {
             null
         }
         val gate = (gateValidation as? ImportValidationResult.Success)?.value
-        val proof = VisualEstimateCaptureProofBuilder.build(
+        val proofTrace = when (val outcome = estimate.outcome) {
+            is VisualEstimateOutcome.NoRead -> estimate.detectorTrace.withOutcome(outcome)
+            is VisualEstimateOutcome.Success -> gateNoRead?.let { estimate.detectorTrace.withOutcome(it) } ?: estimate.detectorTrace
+        }
+        val proof = VisualEstimateCaptureProofBuilder.buildFromThumbnails(
             attemptId = visualEstimateAttemptId,
-            frames = estimate.processedFrames,
-            frameAvailableCallbackCount = frames.frames.size,
+            scannedFrameCount = estimate.scannedFrameCount,
+            frameAvailableCallbackCount = estimate.scannedFrameCount,
             captureResultCallbackCount = diagnostics.callbackCount,
             uniqueSensorTimestampCount = diagnostics.uniqueTimestampCount,
             readbackWidth = workingResolution.working.width,
             readbackHeight = workingResolution.working.height,
-            trace = gateNoRead?.let { estimate.detectorTrace.withOutcome(it) } ?: estimate.detectorTrace,
+            trace = proofTrace,
+            thumbnails = estimate.proofThumbnails,
             sourceKind = "RECORDED_HFR",
             sourceWidth = workingResolution.source.width,
             sourceHeight = workingResolution.source.height,
@@ -2246,39 +2224,99 @@ class MainActivity : ComponentActivity() {
             dropGateVerdict = gate?.dropVerdict ?: "NO_READ",
             cadenceGateVerdict = gate?.cadenceVerdict ?: if (diagnostics.medianGapPassesRateBand && diagnostics.captureProofPasses) "PASS" else "NO_READ",
         )
+        if (estimate.outcome is VisualEstimateOutcome.NoRead) {
+            val noRead = estimate.outcome
+            Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${metadata.sampleCount ?: 0} " +
+                    "scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "uniqueSensorTs=${diagnostics.uniqueTimestampCount} drop=${gate?.dropVerdict ?: "NO_READ"} cadence=${proof.cadenceGateVerdict} " +
+                    "reason=${noRead.reason}",
+            )
+            return ImportRunOutcome.NoRead(
+                reason = if (noRead.reason == VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED) {
+                    ImportNoReadReason.RESOURCE_LIMIT_EXCEEDED
+                } else {
+                    ImportNoReadReason.NO_TRUSTWORTHY_TIMING
+                },
+                message = noRead.message,
+                metadata = metadata,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = noRead,
+            )
+        }
         if (gateNoRead != null || gateValidation is ImportValidationResult.NoRead) {
             val validation = gateValidation as ImportValidationResult.NoRead
             Log.i(
                 logTag,
                 "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId source=${workingResolution.source.width}x${workingResolution.source.height} " +
                     "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${metadata.sampleCount ?: 0} " +
-                    "processed=${frames.frames.size} uniqueSensorTs=${diagnostics.uniqueTimestampCount} drop=NO_READ cadence=${proof.cadenceGateVerdict}",
+                    "scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "uniqueSensorTs=${diagnostics.uniqueTimestampCount} drop=NO_READ cadence=${proof.cadenceGateVerdict}",
             )
             return ImportRunOutcome.NoRead(
                 validation.reason,
                 validation.message,
                 metadata,
-                frameCount = frames.frames.size,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
                 sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
                 captureProof = proof,
+                visualNoRead = gateNoRead,
             )
         }
         gate ?: return ImportRunOutcome.NoRead(
             ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
             "Recorded capture gate did not return a usable proof.",
             metadata,
-            frameCount = frames.frames.size,
+            timing = estimate.timing,
+            frameCount = estimate.scannedFrameCount,
             sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
             captureProof = proof,
         )
+        if (estimate.timing == null) {
+            val noRead = VisualEstimateOutcome.NoRead(
+                VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                "Recorded-HFR estimate did not produce retained-frame timing.",
+            )
+            Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${metadata.sampleCount ?: 0} " +
+                    "scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "uniqueSensorTs=${diagnostics.uniqueTimestampCount} drop=${gate.dropVerdict} cadence=${proof.cadenceGateVerdict}",
+            )
+            return ImportRunOutcome.NoRead(
+                ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+                noRead.message,
+                metadata,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = noRead,
+            )
+        }
         Log.i(
                 logTag,
                 "RECORDED_HFR_ESTIMATE_COMPLETE attempt=$visualEstimateAttemptId source=${workingResolution.source.width}x${workingResolution.source.height} " +
-                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${gate.decodedFrameCount} " +
-                    "extracted=${gate.extractedFrameCount} processed=${frames.frames.size} uniqueSensorTs=${gate.uniqueSensorTimestampCount} " +
-                    "drop=${gate.dropVerdict} cadence=${gate.cadenceVerdict}",
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} metadataSamples=${gate.metadataSampleCount} " +
+                    "scanned=${gate.scannedFrameCount} candidates=${gate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "proofFrames=${estimate.retainedProofFrameCount} uniqueSensorTs=${gate.uniqueSensorTimestampCount} drop=${gate.dropVerdict} cadence=${gate.cadenceVerdict}",
         )
-        return ImportRunOutcome.Estimate(metadata, frames, timing, estimate.outcome, ImportResultSourceKind.RECORDED_ESTIMATE, proof)
+        return ImportRunOutcome.Estimate(
+            metadata = metadata,
+            frames = ImportVideoFrameSequence(emptyList()),
+            timing = estimate.timing,
+            estimate = estimate.outcome,
+            sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            captureProof = proof,
+            frameCount = estimate.scannedFrameCount,
+        )
     }
 
     private fun reconcileImportTiming(frames: ImportVideoFrameSequence): ImportValidationResult<ImportTimingReconciliation> {
@@ -2836,6 +2874,7 @@ class MainActivity : ComponentActivity() {
             val estimate: VisualEstimateOutcome,
             val sourceKind: ImportResultSourceKind = ImportResultSourceKind.IMPORT_ESTIMATE,
             val captureProof: VisualEstimateCaptureProof? = null,
+            val frameCount: Int = frames.frames.size,
         ) : ImportRunOutcome
 
         data class NoRead(
@@ -2846,6 +2885,7 @@ class MainActivity : ComponentActivity() {
             val frameCount: Int = 0,
             val sourceKind: ImportResultSourceKind = ImportResultSourceKind.IMPORT_ESTIMATE,
             val captureProof: VisualEstimateCaptureProof? = null,
+            val visualNoRead: VisualEstimateOutcome.NoRead? = null,
         ) : ImportRunOutcome
     }
 
@@ -2861,7 +2901,7 @@ class MainActivity : ComponentActivity() {
             evidence = ImportEvidenceSummary(
                 sourceKind = sourceKind,
                 timingBasis = timing.basis,
-                frameCount = frames.frames.size,
+                frameCount = frameCount,
                 detectionCount = diagnostics?.detectionCount ?: 0,
                 assumptions = timing.assumptions + diagnostics?.assumptions.orEmpty(),
             ),
@@ -2951,6 +2991,9 @@ class MainActivity : ComponentActivity() {
         const val DIRECT_PROOF_CAMERA_SETTLE_MILLIS = 1_000L
         const val SAVED_RESULTS_FILE_NAME = "saved-result-summaries.properties"
         const val DEFAULT_IMPORT_MAX_FRAMES = 1200
+        const val RECORDED_HFR_MAX_RETAINED_CANDIDATE_FRAMES = 360
+        const val RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH = 96
+        const val RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT = 54
         const val BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX = 24.0
         const val IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX = 8.0
         const val IMPORT_ESTIMATE_MIN_BLOB_AREA_PX = 4

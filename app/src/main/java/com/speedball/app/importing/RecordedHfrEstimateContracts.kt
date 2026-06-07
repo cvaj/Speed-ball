@@ -8,8 +8,9 @@ import com.speedball.app.measurement.FrameDimensions
  * interval as estimate-only timing. This is not a strict measurement proof.
  */
 data class RecordedHfrCaptureGateProof(
-    val decodedFrameCount: Int,
-    val extractedFrameCount: Int,
+    val metadataSampleCount: Int,
+    val scannedFrameCount: Int,
+    val retainedCandidateFrameCount: Int,
     val uniqueSensorTimestampCount: Int,
     val sensorCadencePasses: Boolean,
     val captureProofPasses: Boolean,
@@ -17,7 +18,7 @@ data class RecordedHfrCaptureGateProof(
     val secondaryDurationSanityPasses: Boolean,
 ) {
     val dropVerdict: String =
-        if (decodedFrameCount == uniqueSensorTimestampCount && extractedFrameCount == uniqueSensorTimestampCount) {
+        if (metadataSampleCount == scannedFrameCount && scannedFrameCount == uniqueSensorTimestampCount) {
             "PASS"
         } else {
             "NO_READ_CAPTURE_DECODE_COUNT_MISMATCH"
@@ -33,29 +34,32 @@ data class RecordedHfrCaptureGateProof(
  */
 object RecordedHfrCaptureGate {
     fun validate(
-        decodedFrameCount: Int?,
-        extractedFrameCount: Int?,
+        metadataSampleCount: Int?,
+        scannedFrameCount: Int?,
+        retainedCandidateFrameCount: Int?,
         diagnostics: BurstDiagnostics,
         metadata: ImportVideoMetadata,
     ): ImportValidationResult<RecordedHfrCaptureGateProof> {
-        val count = decodedFrameCount ?: return noRead("Recorded capture did not expose decoded sample count.")
-        val extractedCount = extractedFrameCount ?: return noRead("Recorded capture did not expose extracted frame count.")
-        if (count <= 0) return noRead("Recorded capture produced no decoded video frames.")
-        if (extractedCount <= 0) return noRead("Recorded capture produced no extracted video frames.")
-        if (extractedCount != count) {
+        val metadataCount = metadataSampleCount ?: return noRead("Recorded capture did not expose decoded sample count.")
+        val scannedCount = scannedFrameCount ?: return noRead("Recorded capture did not expose scanned frame count.")
+        val candidateCount = retainedCandidateFrameCount ?: return noRead("Recorded capture did not expose retained candidate count.")
+        if (metadataCount <= 0) return noRead("Recorded capture produced no decoded video frames.")
+        if (scannedCount <= 0) return noRead("Recorded capture produced no scanned video frames.")
+        if (candidateCount < 0) return noRead("Recorded retained candidate count cannot be negative.")
+        if (scannedCount != metadataCount) {
             return noRead(
-                "Recorded extracted frame count ($extractedCount) did not match decoded sample count ($count).",
+                "Recorded scanned frame count ($scannedCount) did not match decoded sample count ($metadataCount).",
             )
         }
         if (diagnostics.uniqueTimestampCount <= 0) return noRead("Recorded capture has no unique SENSOR_TIMESTAMP values.")
-        if (count != diagnostics.uniqueTimestampCount) {
+        if (metadataCount != diagnostics.uniqueTimestampCount) {
             return noRead(
-                "Recorded decoded frame count ($count) did not match capture-side unique SENSOR_TIMESTAMP count (${diagnostics.uniqueTimestampCount}).",
+                "Recorded decoded frame count ($metadataCount) did not match capture-side unique SENSOR_TIMESTAMP count (${diagnostics.uniqueTimestampCount}).",
             )
         }
-        if (extractedCount != diagnostics.uniqueTimestampCount) {
+        if (scannedCount != diagnostics.uniqueTimestampCount) {
             return noRead(
-                "Recorded extracted frame count ($extractedCount) did not match capture-side unique SENSOR_TIMESTAMP count (${diagnostics.uniqueTimestampCount}).",
+                "Recorded scanned frame count ($scannedCount) did not match capture-side unique SENSOR_TIMESTAMP count (${diagnostics.uniqueTimestampCount}).",
             )
         }
         if (!diagnostics.medianGapPassesRateBand || !diagnostics.captureProofPasses) {
@@ -66,13 +70,119 @@ object RecordedHfrCaptureGate {
         }
         return ImportValidationResult.Success(
             RecordedHfrCaptureGateProof(
-                decodedFrameCount = count,
-                extractedFrameCount = extractedCount,
+                metadataSampleCount = metadataCount,
+                scannedFrameCount = scannedCount,
+                retainedCandidateFrameCount = candidateCount,
                 uniqueSensorTimestampCount = diagnostics.uniqueTimestampCount,
                 sensorCadencePasses = diagnostics.medianGapPassesRateBand,
                 captureProofPasses = diagnostics.captureProofPasses,
                 metadataDurationSeconds = metadata.durationSeconds,
                 secondaryDurationSanityPasses = true,
+            ),
+        )
+    }
+
+    private fun noRead(message: String): ImportValidationResult.NoRead =
+        ImportValidationResult.NoRead(
+            reason = ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+            message = message,
+        )
+}
+
+/** Proof that a sound-triggered recorded-HFR window is a bounded usable subset. */
+data class RecordedHfrWindowGateProof(
+    val metadataSampleCount: Int,
+    val decodedWindowFrameCount: Int,
+    val requestedWindowFrameCount: Int,
+    val uniqueSensorTimestampCount: Int,
+    val sensorCadencePasses: Boolean,
+    val captureProofPasses: Boolean,
+    val metadataDurationSeconds: Double,
+    val windowStartUs: Long,
+    val windowEndUs: Long,
+    val emittedFirstPtsUs: Long,
+    val emittedLastPtsUs: Long,
+    val sourceWidth: Int,
+    val sourceHeight: Int,
+    val proofFrameCount: Int,
+    val sourceValidityVerdict: String,
+) {
+    val windowVerdict: String =
+        if (decodedWindowFrameCount == requestedWindowFrameCount) "PASS" else "NO_READ_WINDOW_FRAME_COUNT"
+
+    val cadenceVerdict: String =
+        if (sensorCadencePasses && captureProofPasses) "PASS" else "NO_READ_SENSOR_CADENCE"
+}
+
+/**
+ * Validates a bounded sound-triggered recorded-HFR decode window.
+ *
+ * This gate intentionally does not require decoded window count, container
+ * sample count, and sensor timestamp count to match. MediaRecorder may drop
+ * encoded frames, and this path only proves that the requested container-time
+ * subset is usable for an estimate.
+ */
+object RecordedHfrWindowCaptureGate {
+    fun validate(
+        metadataSampleCount: Int?,
+        decodedWindowFrameCount: Int?,
+        requestedWindowFrameCount: Int,
+        minUsableFrameCount: Int,
+        diagnostics: BurstDiagnostics,
+        metadata: ImportVideoMetadata,
+        windowStartUs: Long,
+        windowEndUs: Long,
+        emittedFirstPtsUs: Long?,
+        emittedLastPtsUs: Long?,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        proofFrameCount: Int,
+        sourceValidityPasses: Boolean,
+    ): ImportValidationResult<RecordedHfrWindowGateProof> {
+        val metadataCount = metadataSampleCount ?: return noRead("Recorded window metadata did not expose decoded sample count.")
+        val decodedCount = decodedWindowFrameCount ?: return noRead("Recorded window did not expose decoded frame count.")
+        if (metadataCount <= 0) return noRead("Recorded window source metadata had no decoded samples.")
+        if (requestedWindowFrameCount <= 0 || minUsableFrameCount <= 0 || minUsableFrameCount > requestedWindowFrameCount) {
+            return noRead("Recorded window frame limits must be positive.")
+        }
+        if (decodedCount < minUsableFrameCount || decodedCount > requestedWindowFrameCount) {
+            return noRead("Recorded window decoded frame count was outside the reviewed bounds.")
+        }
+        if (diagnostics.uniqueTimestampCount <= 0) return noRead("Recorded capture has no unique SENSOR_TIMESTAMP values.")
+        if (!diagnostics.medianGapPassesRateBand || !diagnostics.captureProofPasses) {
+            return noRead("Recorded capture sensor cadence did not stay in the requested high-speed band.")
+        }
+        if (!metadata.durationSeconds.isFinite() || metadata.durationSeconds <= 0.0) {
+            return noRead("Recorded video metadata duration is not finite and positive.")
+        }
+        if (windowStartUs < 0L || windowEndUs <= windowStartUs) {
+            return noRead("Recorded window bounds must be a positive container-time interval.")
+        }
+        val firstPts = emittedFirstPtsUs ?: return noRead("Recorded window emitted no first PTS.")
+        val lastPts = emittedLastPtsUs ?: return noRead("Recorded window emitted no last PTS.")
+        if (firstPts < windowStartUs || lastPts > windowEndUs || lastPts < firstPts) {
+            return noRead("Recorded window emitted PTS outside the requested container-time interval.")
+        }
+        if (sourceWidth <= 0 || sourceHeight <= 0) return noRead("Recorded window source dimensions must be positive.")
+        if (proofFrameCount <= 0) return noRead("Recorded window proof imagery is missing.")
+        if (!sourceValidityPasses) return noRead("Recorded window source frames were black or invalid.")
+        return ImportValidationResult.Success(
+            RecordedHfrWindowGateProof(
+                metadataSampleCount = metadataCount,
+                decodedWindowFrameCount = decodedCount,
+                requestedWindowFrameCount = requestedWindowFrameCount,
+                uniqueSensorTimestampCount = diagnostics.uniqueTimestampCount,
+                sensorCadencePasses = diagnostics.medianGapPassesRateBand,
+                captureProofPasses = diagnostics.captureProofPasses,
+                metadataDurationSeconds = metadata.durationSeconds,
+                windowStartUs = windowStartUs,
+                windowEndUs = windowEndUs,
+                emittedFirstPtsUs = firstPts,
+                emittedLastPtsUs = lastPts,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                proofFrameCount = proofFrameCount,
+                sourceValidityVerdict = "PASS",
             ),
         )
     }

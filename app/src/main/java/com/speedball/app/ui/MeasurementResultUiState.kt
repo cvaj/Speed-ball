@@ -134,9 +134,18 @@ private fun VisualEstimateCaptureProof?.reportLinesFor(kind: VisualEstimateRepor
             add(
                 "PROOF source=RECORDED_HFR source=${proof.sourceWidth}x${proof.sourceHeight} " +
                     "working=${proof.workingWidth}x${proof.workingHeight} decoded=${proof.decodedFrameCount ?: proof.capturedFrameCount} " +
-                    "extracted=${proof.capturedFrameCount} uniqueSensorTs=${proof.uniqueSensorTimestampCount} fps=${proof.requestedFps ?: 0}",
+                    "scanned=${proof.capturedFrameCount} candidates=${proof.detectorSummary.candidateFrameCount} " +
+                    "selected=${proof.detectorSummary.selectedSampleCount} uniqueSensorTs=${proof.uniqueSensorTimestampCount} fps=${proof.requestedFps ?: 0}",
             )
             add("GATES drop=${proof.dropGateVerdict ?: "UNKNOWN"} cadence=${proof.cadenceGateVerdict ?: "UNKNOWN"}")
+            if (proof.windowStartUs != null && proof.windowEndUs != null) {
+                add(
+                    "WINDOW startUs=${proof.windowStartUs} endUs=${proof.windowEndUs} " +
+                        "impactFrame=${proof.impactFrameIndex ?: -1} preMarginFrames=${proof.preImpactMarginFrames ?: 0} " +
+                        "anchorErrorMs=${proof.anchorErrorNanos?.let { it / 1_000_000.0 } ?: 0.0} " +
+                        "decodeMs=${proof.decodeWallClockMillis ?: 0} source=${proof.sourceValidityVerdict ?: "UNKNOWN"}",
+                )
+            }
         } else {
             add("PROOF frames=${proof.capturedFrameCount} readback=${proof.readbackWidth}x${proof.readbackHeight}")
         }

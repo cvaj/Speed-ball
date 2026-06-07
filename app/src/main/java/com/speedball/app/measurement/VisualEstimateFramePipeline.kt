@@ -171,12 +171,75 @@ object VisualEstimateFramePipeline {
     }
 }
 
+/**
+ * Post-detection candidate frame used by streaming sources.
+ *
+ * This record deliberately carries no full-frame pixel array. Selection uses
+ * only source position, timestamp, dimensions, and already-detected blobs.
+ */
+data class VisualEstimateCandidateFrame(
+    val compactPosition: Int,
+    val originalFrameIndex: Int,
+    val timestampSeconds: Double,
+    val width: Int,
+    val height: Int,
+    val blobs: List<Blob>,
+    val presentationTimestampNanos: Long? = null,
+)
+
+/** Result of reducing post-detection candidate frames into estimate samples. */
+sealed interface VisualEstimateCandidateReductionOutcome {
+    data class Success(
+        val samples: List<VisualEstimateTrackSample>,
+        val selected: List<Pair<VisualEstimateCandidateFrame, Blob>>,
+    ) : VisualEstimateCandidateReductionOutcome
+
+    data class Failure(
+        val reason: VisualEstimateNoReadReason,
+        val message: String,
+    ) : VisualEstimateCandidateReductionOutcome
+}
+
+/** Shared selector for in-memory and streaming visual-estimate candidate tracks. */
+object VisualEstimateCandidateReducer {
+    fun reduce(
+        frameCandidates: List<VisualEstimateCandidateFrame>,
+        config: TrackExtractionConfig,
+    ): VisualEstimateCandidateReductionOutcome {
+        if (frameCandidates.size < 4) {
+            return VisualEstimateCandidateReductionOutcome.Failure(
+                VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
+                "At least four usable detections are required for an estimate.",
+            )
+        }
+        val selected = if (config.seedPoint != null) {
+            selectSeededMovingTrack(frameCandidates, config)
+        } else {
+            selectHighVelocityDirectionalTrack(frameCandidates, config)
+        } ?: return VisualEstimateCandidateReductionOutcome.Failure(
+            VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
+            "Multiple blobs did not form one coherent horizontal ball track or seeded moving ball track.",
+        )
+        return VisualEstimateCandidateReductionOutcome.Success(
+            samples = selected.map { (frame, blob) ->
+                VisualEstimateTrackSample(
+                    timestampSeconds = frame.timestampSeconds,
+                    xPx = blob.centroid.xPx,
+                    yPx = blob.centroid.yPx,
+                    apparentDiameterPx = min(blob.bounds.width, blob.bounds.height).toDouble(),
+                )
+            },
+            selected = selected,
+        )
+    }
+}
+
 private fun extractDirectionalSamples(
     sequence: TimedFrameSequence,
     config: TrackExtractionConfig,
     traceBuilder: VisualEstimateDetectorTraceBuilder,
 ): VisualEstimateSampleExtractionWithTrace {
-    val frameCandidates = mutableListOf<Pair<RgbFrame, List<Blob>>>()
+    val frameCandidates = mutableListOf<VisualEstimateCandidateFrame>()
     sequence.frames.forEachIndexed { index, frame ->
         when (val detection = BlobDetector.detectCandidates(frame, config.detectorConfig)) {
             is BlobCandidateDetectionOutcome.Failure -> {
@@ -195,65 +258,53 @@ private fun extractDirectionalSamples(
             is BlobCandidateDetectionOutcome.Success -> {
                 traceBuilder.recordFrame(index, frame, detection)
                 if (detection.blobs.isNotEmpty()) {
-                    frameCandidates += frame to detection.blobs
+                    frameCandidates += VisualEstimateCandidateFrame(
+                        compactPosition = index,
+                        originalFrameIndex = index,
+                        timestampSeconds = frame.timestampSeconds,
+                        width = frame.width,
+                        height = frame.height,
+                        blobs = detection.blobs,
+                    )
                 }
             }
         }
     }
-    if (frameCandidates.size < 4) {
-        return VisualEstimateSampleExtractionWithTrace(
+    return when (val reduction = VisualEstimateCandidateReducer.reduce(frameCandidates, config)) {
+        is VisualEstimateCandidateReductionOutcome.Failure -> VisualEstimateSampleExtractionWithTrace(
             outcome = VisualEstimateSampleExtractionOutcome.Failure(
-                VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
-                "At least four usable detections are required for an estimate.",
+                reduction.reason,
+                reduction.message,
             ),
             trace = traceBuilder.build(),
         )
+        is VisualEstimateCandidateReductionOutcome.Success -> {
+            reduction.selected.forEach { (frame, blob) -> traceBuilder.markSelected(frame.compactPosition, blob) }
+            VisualEstimateSampleExtractionWithTrace(
+                outcome = VisualEstimateSampleExtractionOutcome.Success(reduction.samples),
+                trace = traceBuilder.build(),
+            )
+        }
     }
-    val selected = if (config.seedPoint != null) {
-        selectSeededMovingTrack(frameCandidates, config)
-    } else {
-        selectHighVelocityDirectionalTrack(frameCandidates, config)
-    }
-        ?: return VisualEstimateSampleExtractionWithTrace(
-            outcome = VisualEstimateSampleExtractionOutcome.Failure(
-                VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
-                "Multiple blobs did not form one coherent horizontal ball track or seeded moving ball track.",
-            ),
-            trace = traceBuilder.build(),
-        )
-    selected.forEach { (frame, blob) -> traceBuilder.markSelected(frame, blob) }
-    return VisualEstimateSampleExtractionWithTrace(
-        outcome = VisualEstimateSampleExtractionOutcome.Success(
-            selected.map { (frame, blob) ->
-                VisualEstimateTrackSample(
-                    timestampSeconds = frame.timestampSeconds,
-                    xPx = blob.centroid.xPx,
-                    yPx = blob.centroid.yPx,
-                    apparentDiameterPx = min(blob.bounds.width, blob.bounds.height).toDouble(),
-                )
-            },
-        ),
-        trace = traceBuilder.build(),
-    )
 }
 
 private fun selectSeededMovingTrack(
-    frameCandidates: List<Pair<RgbFrame, List<Blob>>>,
+    frameCandidates: List<VisualEstimateCandidateFrame>,
     config: TrackExtractionConfig,
-): List<Pair<RgbFrame, Blob>>? {
+): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
     val seedPoint = config.seedPoint ?: return selectHighVelocityDirectionalTrack(frameCandidates, config)
     val seedSearchRadius = config.seedSearchRadiusPx ?: DEFAULT_SEED_SEARCH_RADIUS_PX
     if (!seedSearchRadius.isFinite() || seedSearchRadius <= 0.0) return selectHighVelocityDirectionalTrack(frameCandidates, config)
     val first = frameCandidates.firstOrNull() ?: return null
-    val seedBlob = first.second
+    val seedBlob = first.blobs
         .filter { it.centroid.distanceTo(seedPoint) <= seedSearchRadius }
         .minByOrNull { it.centroid.distanceTo(seedPoint) }
         ?: return selectHighVelocityDirectionalTrack(frameCandidates, config)
 
-    val tracked = mutableListOf(first.first to seedBlob)
+    val tracked = mutableListOf(first to seedBlob)
     var previous = seedBlob
-    frameCandidates.drop(1).forEach { (frame, candidates) ->
-        val next = candidates
+    frameCandidates.drop(1).forEach { frame ->
+        val next = frame.blobs
             .filter { it.centroid.distanceTo(previous.centroid) <= config.maxFrameToFrameJumpPx }
             .minByOrNull { it.centroid.distanceTo(previous.centroid) }
             ?: return@forEach
@@ -265,17 +316,17 @@ private fun selectSeededMovingTrack(
 }
 
 private fun selectHighVelocityDirectionalTrack(
-    frameCandidates: List<Pair<RgbFrame, List<Blob>>>,
+    frameCandidates: List<VisualEstimateCandidateFrame>,
     config: TrackExtractionConfig,
-): List<Pair<RgbFrame, Blob>>? {
+): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
     selectRansacStraightFlightTrack(frameCandidates, config)?.let { return it }
 
     var bestPath: StraightFlightPath? = null
     for (startIndex in 1 until frameCandidates.size) {
-        val previousFrame = frameCandidates[startIndex - 1].first
-        val currentFrame = frameCandidates[startIndex].first
-        for (previousBlob in frameCandidates[startIndex - 1].second) {
-            for (currentBlob in frameCandidates[startIndex].second) {
+        val previousFrame = frameCandidates[startIndex - 1]
+        val currentFrame = frameCandidates[startIndex]
+        for (previousBlob in frameCandidates[startIndex - 1].blobs) {
+            for (currentBlob in frameCandidates[startIndex].blobs) {
                 val dx = currentBlob.centroid.xPx - previousBlob.centroid.xPx
                 val stepDistance = currentBlob.centroid.distanceTo(previousBlob.centroid)
                 if (stepDistance < HIGH_VELOCITY_STEP_DISTANCE_PX || abs(dx) < HIGH_VELOCITY_HORIZONTAL_STEP_PX) {
@@ -285,7 +336,7 @@ private fun selectHighVelocityDirectionalTrack(
                 val path = mutableListOf(previousFrame to previousBlob, currentFrame to currentBlob)
                 var lastBlob = currentBlob
                 for (next in frameCandidates.drop(startIndex + 1)) {
-                    val nextBlob = next.second
+                    val nextBlob = next.blobs
                         .filter { candidate ->
                             val candidateDx = (candidate.centroid.xPx - lastBlob.centroid.xPx) * direction
                             candidate.centroid.distanceTo(lastBlob.centroid) <= config.maxFrameToFrameJumpPx &&
@@ -297,7 +348,7 @@ private fun selectHighVelocityDirectionalTrack(
                             abs(candidateDx - stepDistance) + candidateDy * 0.5 + blobShapePenalty(candidate)
                         }
                         ?: break
-                    path += next.first to nextBlob
+                    path += next to nextBlob
                     lastBlob = nextBlob
                     if (path.size >= MAX_MOTION_WINDOW_SAMPLES) break
                 }
@@ -313,11 +364,11 @@ private fun selectHighVelocityDirectionalTrack(
 }
 
 private fun selectRansacStraightFlightTrack(
-    frameCandidates: List<Pair<RgbFrame, List<Blob>>>,
+    frameCandidates: List<VisualEstimateCandidateFrame>,
     config: TrackExtractionConfig,
-): List<Pair<RgbFrame, Blob>>? {
-    val candidates = frameCandidates.flatMapIndexed { frameOrder, (frame, blobs) ->
-        blobs.map { blob -> RansacBlobCandidate(frameOrder, frame, blob) }
+): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
+    val candidates = frameCandidates.flatMapIndexed { frameOrder, frame ->
+        frame.blobs.map { blob -> RansacBlobCandidate(frameOrder, frame, blob) }
     }
     var bestConsensus: RansacStraightFlightConsensus? = null
     for (firstIndex in candidates.indices) {
@@ -346,15 +397,15 @@ private fun selectRansacStraightFlightTrack(
 }
 
 private fun ransacConsensusPath(
-    frameCandidates: List<Pair<RgbFrame, List<Blob>>>,
+    frameCandidates: List<VisualEstimateCandidateFrame>,
     hypothesis: RansacLineHypothesis,
     config: TrackExtractionConfig,
-): List<Pair<RgbFrame, Blob>> {
-    val selected = frameCandidates.mapIndexedNotNull { frameOrder, (frame, blobs) ->
+): List<Pair<VisualEstimateCandidateFrame, Blob>> {
+    val selected = frameCandidates.mapIndexedNotNull { frameOrder, frame ->
         if (frameOrder < hypothesis.first.frameOrder || frameOrder > hypothesis.last.frameOrder) {
             return@mapIndexedNotNull null
         }
-        val bestInlier = blobs
+        val bestInlier = frame.blobs
             .filter { blob ->
                 hypothesis.distanceTo(blob.centroid) <= RANSAC_STRAIGHT_FLIGHT_INLIER_DISTANCE_PX &&
                     hypothesis.signedTravelFromStart(blob.centroid) >= -DIRECTION_REVERSAL_TOLERANCE_PX &&
@@ -373,12 +424,12 @@ private fun ransacConsensusPath(
 }
 
 private fun movingWindowFromSeededTrack(
-    tracked: List<Pair<RgbFrame, Blob>>,
-): List<Pair<RgbFrame, Blob>>? {
+    tracked: List<Pair<VisualEstimateCandidateFrame, Blob>>,
+): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
     val motionIndex = firstHighVelocityMotionIndex(tracked) ?: return null
     val windowStart = max(0, motionIndex - 1)
     val direction = horizontalDirection(tracked.drop(windowStart)) ?: return null
-    val candidate = mutableListOf<Pair<RgbFrame, Blob>>()
+    val candidate = mutableListOf<Pair<VisualEstimateCandidateFrame, Blob>>()
     var stationaryAfterMotion = 0
     var previous = tracked[windowStart].second
     for ((index, current) in tracked.drop(windowStart).withIndex()) {
@@ -404,13 +455,13 @@ private fun movingWindowFromSeededTrack(
 }
 
 private data class StraightFlightPath(
-    val path: List<Pair<RgbFrame, Blob>>,
+    val path: List<Pair<VisualEstimateCandidateFrame, Blob>>,
     val score: Double,
 )
 
 private data class RansacBlobCandidate(
     val frameOrder: Int,
-    val frame: RgbFrame,
+    val frame: VisualEstimateCandidateFrame,
     val blob: Blob,
 )
 
@@ -482,7 +533,7 @@ private data class RansacStraightFlightConsensus(
 }
 
 private fun listStraightFlightWindows(
-    path: List<Pair<RgbFrame, Blob>>,
+    path: List<Pair<VisualEstimateCandidateFrame, Blob>>,
     direction: Double,
 ): List<StraightFlightPath> {
     if (path.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return emptyList()
@@ -496,7 +547,7 @@ private fun listStraightFlightWindows(
 }
 
 private fun scoreStraightFlightWindow(
-    path: List<Pair<RgbFrame, Blob>>,
+    path: List<Pair<VisualEstimateCandidateFrame, Blob>>,
     direction: Double,
 ): StraightFlightPath? {
     if (path.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return null
@@ -545,7 +596,7 @@ private data class FlightStep(
         dx.isFinite() && dy.isFinite() && dt.isFinite() && dt > 0.0
 }
 
-private fun normalizedLineResidual(path: List<Pair<RgbFrame, Blob>>): Double {
+private fun normalizedLineResidual(path: List<Pair<VisualEstimateCandidateFrame, Blob>>): Double {
     val first = path.first().second.centroid
     val last = path.last().second.centroid
     val span = first.distanceTo(last)
@@ -569,7 +620,7 @@ private fun hypotLike(x: Double, y: Double): Double =
     kotlin.math.hypot(x, y)
 
 private fun firstHighVelocityMotionIndex(
-    tracked: List<Pair<RgbFrame, Blob>>,
+    tracked: List<Pair<VisualEstimateCandidateFrame, Blob>>,
 ): Int? {
     if (tracked.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return null
     for (index in 1 until tracked.size) {
@@ -594,7 +645,7 @@ private fun firstHighVelocityMotionIndex(
 }
 
 private fun horizontalDirection(
-    tracked: List<Pair<RgbFrame, Blob>>,
+    tracked: List<Pair<VisualEstimateCandidateFrame, Blob>>,
 ): Double? {
     if (tracked.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return null
     val seedX = tracked.first().second.centroid.xPx
@@ -771,6 +822,12 @@ private class VisualEstimateDetectorTraceBuilder(
 
     fun markSelected(frame: RgbFrame, blob: Blob) {
         val index = frameIndexesByIdentity[frame] ?: return
+        frames[index] = frames[index].copy(selectedBlob = blob)
+    }
+
+    fun markSelected(frameIndex: Int, blob: Blob) {
+        val index = frames.indexOfFirst { it.frameIndex == frameIndex }
+        if (index < 0) return
         frames[index] = frames[index].copy(selectedBlob = blob)
     }
 

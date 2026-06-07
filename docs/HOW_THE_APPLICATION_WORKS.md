@@ -66,11 +66,15 @@ screen; they show a bottom report with reason, action, message, and
 attempt-scoped capture proof while the setup preview remains visible after
 capture recovery. The proof is a bounded contact sheet of the processed frames
 the detector saw. For Run Mode `shoot`, those thumbnails come from the
-recorded-HFR source after bounded decode and downscale for display; the report
-also shows source size, detector working size, decoded frame count, unique
-`SENSOR_TIMESTAMP` count, extracted frame count, requested fps, and
-recorded-source drop/cadence gate verdicts. For the manual direct diagnostic
-path, proof thumbnails remain bounded low-resolution direct-readback frames.
+recorded-HFR source after streaming decode and downscale for display. Full
+recorded-frame pixels are discarded immediately after blob detection; retained
+candidate records carry only compact position, original decoded frame index,
+timestamp, dimensions, and blobs. The report also shows source size, detector
+working size, decoded metadata sample count, scanned decoded-frame count,
+candidate frame/blob counts, selected samples, unique `SENSOR_TIMESTAMP` count,
+requested fps, and recorded-source drop/cadence gate verdicts. For the manual
+direct diagnostic path, proof thumbnails remain bounded low-resolution
+direct-readback frames.
 Zero captured frames means the attempt produced no imagery. Zero candidate
 frames means the selected color/ROI matched no blobs in the processed frames.
 
@@ -212,12 +216,35 @@ capture. Manual document-picker import remains available for saved clips and
 debugging. Picker imports validate a `content://` URI;
 recorded estimates use the app-private file directly and do not store a media
 URI or raw path in saved evidence. The app deletes the app-owned recorded MP4
-after frame extraction/estimate processing. The app reads redacted metadata,
-probes monotonic presentation timestamps as estimate evidence only for
-user-selected imports, decodes a bounded set of frames, scales recorded-HFR
-shots to a detector working size no larger than 1280x720, and runs the same
-color detector, calibration state, and visual estimate pipeline used by live
-estimates. The Android import adapter
+after streaming estimate processing. The app reads redacted metadata, probes
+monotonic presentation timestamps as estimate evidence only for user-selected
+imports, and streams app-owned recorded-HFR shots one decoded frame at a time
+at a detector working size no larger than 1280x720. Each frame is scanned for
+color blobs while its full pixels are local, then the full pixels are dropped;
+only bounded candidate blob/index/timestamp records and bounded downscaled
+proof thumbnails survive. The same color detector, calibration state, and
+visual estimate reducer used by live/import estimates selects the straight hit
+window.
+
+The sound-triggered recorded-HFR window workstream is currently implemented only
+as batch-1 foundations. A loud impact pop is treated as a timestamp marker, not
+as sound classification. The pure detector returns only derived scalars
+(peak/RMS ratio, sample index, offset, and anchored monotonic time), and raw PCM
+does not leave memory. `AudioRecord.getTimestamp()` is the intended audio clock
+anchor; the first positive Camera2 `SENSOR_TIMESTAMP` is the video anchor.
+`ImpactWindowMapper` computes a bounded container presentation-time window
+(`windowStartUs`/`windowEndUs`) and keeps the sensor impact frame index
+diagnostic-only because encoded MediaRecorder frames can be dropped. A separate
+windowed recorded-HFR gate accepts a bounded subset only when capture cadence,
+metadata, in-window PTS, source validity, and proof imagery all pass; it does
+not weaken the existing full-burst `metadata == scanned == SENSOR_TIMESTAMP`
+gate. The streaming estimator has an opt-in container-PTS-delta timing mode for
+sound-window candidates, and proof reports can carry optional window, anchor,
+decode-time, and source-validity diagnostics. The live `shoot` route is not yet
+switched to this foundation; Android recorder/microphone orchestration and S10+
+device proof remain required.
+
+The Android import adapter
 prefers indexed frame extraction and falls back to timestamp extraction when the
 platform cannot return frames by index. Estimate-mode import can use a known
 capture frame interval for slow-motion files whose playback PTS has been
@@ -226,10 +253,11 @@ timing basis from the requested capture FPS. Recorded estimates are saved and
 exported as `RECORDED_ESTIMATE` with a LOW-confidence MediaRecorder
 frame-drop/coalescing caveat rather than import-only re-encode/VFR caveats. For
 Run Mode `shoot`, an estimate value is allowed only after the decoded sample
-count and extracted frame count both match the capture-side unique
+count and total scanned decoded-frame count both match the capture-side unique
 `SENSOR_TIMESTAMP` count and the capture-side sensor cadence stays in the
-requested high-speed band; otherwise the app returns a no-read with proof
-thumbnails and detector counts but no mph.
+requested high-speed band. Retained candidate count is detector evidence only
+and cannot satisfy this capture gate. Otherwise the app returns a no-read with
+proof thumbnails and detector counts but no mph.
 Import uses the sampled
 ball point to define the HSV color band, but does not force the track to start
 at that point; it skips leading frames before the ball enters the ROI, filters
@@ -368,8 +396,8 @@ The app must show "No read" rather than a wrong speed when:
 - fewer than three decoded frames are available;
 - recorded-HFR `shoot` cannot prove decoded-frame count equals the capture-side
   unique `SENSOR_TIMESTAMP` count;
-- recorded-HFR `shoot` cannot prove extracted-frame count equals decoded-frame
-  count and capture-side unique `SENSOR_TIMESTAMP` count;
+- recorded-HFR `shoot` cannot prove scanned decoded-frame count equals decoded
+  metadata sample count and capture-side unique `SENSOR_TIMESTAMP` count;
 - recorded-HFR `shoot` cannot prove capture-side sensor cadence stayed in the
   requested high-speed band;
 - decoded presentation timestamps are non-monotonic, have a median cadence

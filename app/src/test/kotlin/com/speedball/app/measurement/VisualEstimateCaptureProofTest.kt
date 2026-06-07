@@ -158,6 +158,13 @@ class VisualEstimateCaptureProofTest {
             requestedFps = 120,
             dropGateVerdict = "PASS",
             cadenceGateVerdict = "PASS",
+            windowStartUs = 1_000_000,
+            windowEndUs = 1_200_000,
+            impactFrameIndex = 120,
+            anchorErrorNanos = 8_000_000,
+            preImpactMarginFrames = 1,
+            decodeWallClockMillis = 90,
+            sourceValidityVerdict = "PASS",
         )
 
         assertEquals("RECORDED_HFR", proof.sourceKind)
@@ -169,8 +176,101 @@ class VisualEstimateCaptureProofTest {
         assertEquals(120, proof.requestedFps)
         assertEquals("PASS", proof.dropGateVerdict)
         assertEquals("PASS", proof.cadenceGateVerdict)
+        assertEquals(1_000_000, proof.windowStartUs)
+        assertEquals(1_200_000, proof.windowEndUs)
+        assertEquals(120, proof.impactFrameIndex)
+        assertEquals(8_000_000, proof.anchorErrorNanos)
+        assertEquals(1, proof.preImpactMarginFrames)
+        assertEquals(90, proof.decodeWallClockMillis)
+        assertEquals("PASS", proof.sourceValidityVerdict)
         assertTrue(proof.frames.all { it.thumbnailWidth <= VisualEstimateCaptureProofBuilder.DEFAULT_THUMBNAIL_MAX_WIDTH })
         assertTrue(proof.frames.all { it.thumbnailHeight <= VisualEstimateCaptureProofBuilder.DEFAULT_THUMBNAIL_MAX_HEIGHT })
+    }
+
+    @Test
+    fun recordedHfrProofMapsCompactThumbnailsToOriginalDecodedIndexes() {
+        val config = framePipelineConfig(allowDirectionalCandidateSelection = true)
+        val trace = VisualEstimateDetectorTrace(
+            detectorConfig = config.trackConfig.detectorConfig,
+            frames = listOf(
+                VisualEstimateDetectorFrameTrace(
+                    frameIndex = 0,
+                    originalFrameIndex = 40,
+                    timestampSeconds = 40.0 / 120.0,
+                    roi = RegionOfInterest(0, 0, FRAME_WIDTH, FRAME_HEIGHT),
+                    candidateCount = 1,
+                    candidates = listOf(testBlob(x = 2)),
+                    selectedBlob = testBlob(x = 2),
+                ),
+                VisualEstimateDetectorFrameTrace(
+                    frameIndex = 1,
+                    originalFrameIndex = 43,
+                    timestampSeconds = 43.0 / 120.0,
+                    roi = RegionOfInterest(0, 0, FRAME_WIDTH, FRAME_HEIGHT),
+                    candidateCount = 1,
+                    candidates = listOf(testBlob(x = 6)),
+                    selectedBlob = testBlob(x = 6),
+                ),
+            ),
+        )
+        val thumbnails = listOf(
+            VisualEstimateProofThumbnailFrame(
+                compactPosition = 0,
+                originalFrameIndex = 40,
+                timestampSeconds = 40.0 / 120.0,
+                sourceWidth = FRAME_WIDTH,
+                sourceHeight = FRAME_HEIGHT,
+                thumbnailWidth = FRAME_WIDTH,
+                thumbnailHeight = FRAME_HEIGHT,
+                thumbnailArgbPixels = IntArray(FRAME_WIDTH * FRAME_HEIGHT) { BLACK_ARGB },
+            ),
+            VisualEstimateProofThumbnailFrame(
+                compactPosition = 1,
+                originalFrameIndex = 43,
+                timestampSeconds = 43.0 / 120.0,
+                sourceWidth = FRAME_WIDTH,
+                sourceHeight = FRAME_HEIGHT,
+                thumbnailWidth = FRAME_WIDTH,
+                thumbnailHeight = FRAME_HEIGHT,
+                thumbnailArgbPixels = IntArray(FRAME_WIDTH * FRAME_HEIGHT) { BLACK_ARGB },
+            ),
+        )
+
+        val proof = VisualEstimateCaptureProofBuilder.buildFromThumbnails(
+            attemptId = 45L,
+            scannedFrameCount = 50,
+            frameAvailableCallbackCount = 50,
+            captureResultCallbackCount = 50,
+            uniqueSensorTimestampCount = 50,
+            readbackWidth = 1280,
+            readbackHeight = 720,
+            trace = trace,
+            thumbnails = thumbnails,
+            sourceKind = "RECORDED_HFR",
+            sourceWidth = 1280,
+            sourceHeight = 720,
+            workingWidth = 1280,
+            workingHeight = 720,
+            decodedFrameCount = 50,
+            requestedFps = 120,
+            dropGateVerdict = "PASS",
+            cadenceGateVerdict = "PASS",
+            windowStartUs = 500_000,
+            windowEndUs = 700_000,
+            impactFrameIndex = 60,
+            anchorErrorNanos = 4_000_000,
+            preImpactMarginFrames = 1,
+            decodeWallClockMillis = 45,
+            sourceValidityVerdict = "PASS",
+        )
+
+        assertEquals(50, proof.capturedFrameCount)
+        assertEquals(500_000, proof.windowStartUs)
+        assertEquals(700_000, proof.windowEndUs)
+        assertEquals(45, proof.decodeWallClockMillis)
+        assertEquals(listOf(0, 1), proof.frames.map { it.frameIndex })
+        assertEquals(listOf(40, 43), proof.frames.map { it.originalFrameIndex })
+        assertTrue(proof.frames.all { it.selected != null })
     }
 
     private fun framePipelineConfig(
@@ -218,6 +318,14 @@ class VisualEstimateCaptureProofTest {
             height = FRAME_HEIGHT,
             argbPixels = IntArray(FRAME_WIDTH * FRAME_HEIGHT) { BLACK_ARGB },
             timestampSeconds = timestampSeconds,
+        )
+
+    private fun testBlob(x: Int): Blob =
+        Blob(
+            areaPx = 1,
+            centroid = ImagePoint(x.toDouble(), BALL_Y.toDouble()),
+            bounds = PixelBounds(x, BALL_Y, x, BALL_Y),
+            compactness = 1.0,
         )
 
     private fun sourcePath(fileName: String): Path =

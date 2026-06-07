@@ -111,6 +111,87 @@ class ImportTimingReconcilerTest {
     }
 
     @Test
+    fun recordedCaptureFrameIndexesPreserveOriginalDecodeGaps() {
+        val consecutive = assertSuccess(
+            ImportTimingReconciler.reconcileRecordedCaptureFrameIndexes(
+                frameIndexes = listOf(40, 41, 42, 43),
+                frameIntervalSeconds = 1.0 / 120.0,
+            ),
+        )
+        val nonConsecutive = assertSuccess(
+            ImportTimingReconciler.reconcileRecordedCaptureFrameIndexes(
+                frameIndexes = listOf(40, 43, 46, 49),
+                frameIntervalSeconds = 1.0 / 120.0,
+            ),
+        )
+
+        assertEquals(listOf(1, 1, 1), consecutive.frameStepMultipliers)
+        assertEquals(listOf(3, 3, 3), nonConsecutive.frameStepMultipliers)
+        assertEquals(3.0 / 120.0, nonConsecutive.timestampGapSummary.medianGapSeconds, 1.0e-12)
+        assertEquals(listOf(0.0, 3.0 / 120.0, 6.0 / 120.0, 9.0 / 120.0), nonConsecutive.timestampsSeconds)
+        assertEquals(ImportTimingBasis.RECORDED_CAPTURE_FRAME_INTERVAL, nonConsecutive.basis)
+        assertEquals(VisualEstimateConfidence.LOW, nonConsecutive.confidence)
+        assertTrue(nonConsecutive.assumptions.any { it.contains("MediaRecorder") })
+    }
+
+    @Test
+    fun recordedWindowContainerPresentationTimestampsUsePtsDeltas() {
+        val result = assertSuccess(
+            ImportTimingReconciler.reconcileRecordedContainerPresentationTimestamps(
+                listOf(1_000_000_000L, 1_025_000_000L, 1_050_000_000L, 1_075_000_000L),
+            ),
+        )
+
+        assertEquals(ImportTimingBasis.RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS, result.basis)
+        assertEquals(listOf(0.0, 0.025, 0.05, 0.075), result.timestampsSeconds)
+        assertEquals(0.025, result.timestampGapSummary.medianGapSeconds, 1.0e-12)
+        assertTrue(result.assumptions.any { it.contains("container presentation timestamp deltas") })
+        assertTrue(result.assumptions.any { it.contains("MediaRecorder") })
+    }
+
+    @Test
+    fun recordedWindowContainerPresentationTimestampsFailLoudOnMissingOrNonMonotonicPts() {
+        assertNoRead(
+            ImportTimingReconciler.reconcileRecordedContainerPresentationTimestamps(
+                listOf(1_000_000_000L, null, 1_020_000_000L),
+            ),
+        )
+        assertNoRead(
+            ImportTimingReconciler.reconcileRecordedContainerPresentationTimestamps(
+                listOf(1_000_000_000L, 1_000_000_000L, 1_020_000_000L),
+            ),
+        )
+    }
+
+    @Test
+    fun recordedCaptureFrameIndexesFailLoudOnInvalidIndexesOrInterval() {
+        assertNoRead(
+            ImportTimingReconciler.reconcileRecordedCaptureFrameIndexes(
+                frameIndexes = listOf(40),
+                frameIntervalSeconds = 1.0 / 120.0,
+            ),
+        )
+        assertNoRead(
+            ImportTimingReconciler.reconcileRecordedCaptureFrameIndexes(
+                frameIndexes = listOf(-1, 0, 1),
+                frameIntervalSeconds = 1.0 / 120.0,
+            ),
+        )
+        assertNoRead(
+            ImportTimingReconciler.reconcileRecordedCaptureFrameIndexes(
+                frameIndexes = listOf(40, 40, 41),
+                frameIntervalSeconds = 1.0 / 120.0,
+            ),
+        )
+        assertNoRead(
+            ImportTimingReconciler.reconcileRecordedCaptureFrameIndexes(
+                frameIndexes = listOf(40, 41, 42),
+                frameIntervalSeconds = 0.0,
+            ),
+        )
+    }
+
+    @Test
     fun invalidKnownFrameIntervalNoReads() {
         assertNoRead(
             ImportTimingReconciler.reconcileKnownFrameInterval(
