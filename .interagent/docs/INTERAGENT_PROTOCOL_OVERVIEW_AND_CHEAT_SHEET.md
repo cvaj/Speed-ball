@@ -95,8 +95,9 @@ Review responses also require findings with file:line references, scans/tests
 actually run, and a completed `docs/REVIEW_CHECKLIST.md` section.
 
 Every response in a review loop must also tell the receiver to perform the next
-independent adversarial review pass under the consolidated protocol. Responses
-are part of the review cycle, not FYI messages.
+independent adversarial review pass under the consolidated protocol, except for
+the second reciprocal `APPROVED` response that closes the reviewed artifact.
+Responses are part of the review cycle, not FYI messages.
 
 ## Keep Busy Without Watchers
 
@@ -122,6 +123,14 @@ Reviewer:
 ## Close A Review
 
 One `APPROVED` is not enough. The other side must do a final independent pass and also return `APPROVED`.
+
+Two reciprocal `APPROVED` verdicts are enough. After the reviewer approves and
+the implementer sends an independent `APPROVED` concurrence for the same
+artifact, the review is closed by mutual exhaustion. The implementer owns
+progress/broker closure bookkeeping and proceeds to the next approved
+implementation step. Do not wait for the reviewer to send another terminal
+closure message; if broker state still says `awaiting` after reciprocal
+approval, fix the bookkeeping instead of treating it as a gate.
 
 ## Do Not Use
 

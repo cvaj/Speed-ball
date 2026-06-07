@@ -26,10 +26,13 @@ doorbell. A sender that writes a mailbox file and does not doorbell has not
 completed the protocol.
 
 Every response in an active review loop is itself a request for the receiver to
-continue the independent adversarial review cycle. Do not send a neutral "FYI"
-response in a review loop. The response must carry the consolidated protocol
-phrase and the doorbell must tell the receiver to perform the next independent
-adversarial review pass until mutual exhaustion closes the loop.
+continue the independent adversarial review cycle, unless that response is the
+second reciprocal `APPROVED` verdict for the same reviewed artifact. Do not send
+a neutral "FYI" response in a review loop. The response must carry the
+consolidated protocol phrase and the doorbell must tell the receiver to perform
+the next independent adversarial review pass until mutual exhaustion closes the
+loop. A reciprocal `APPROVED` closes the loop immediately; it does not require
+another "terminal closure" approval from the receiver.
 
 Doorbells remain pointers only. The full request or response still belongs in
 the mailbox file, not in the tmux message.
@@ -266,7 +269,13 @@ Two closure shapes are valid:
 
 The implementer-led shape is the normal path when Codex implements and Claude
 reviews: the original request records the implementation as `IMPLEMENTED`, then
-mutual exhaustion is proven by the final reciprocal `APPROVED` responses.
+mutual exhaustion is proven by the final reciprocal `APPROVED` responses. After
+the reviewer sends `APPROVED` and the implementer sends an independent
+`APPROVED` concurrence for the same reviewed artifact, the review is closed.
+The implementer owns closure bookkeeping and proceeds to the next approved
+implementation step. The reviewer does not need to send a second terminal
+closure message unless the implementer explicitly asks for broker recovery or a
+new finding is discovered.
 
 ## Session Names
 
@@ -386,7 +395,10 @@ Review artifacts must include a completed `docs/REVIEW_CHECKLIST.md` section.
 After writing a response, immediately run the matching response helper. The
 response is incomplete until the receiver has been doorbelled. In a review loop,
 that response must instruct the receiver to continue with an independent
-adversarial review pass under this consolidated protocol.
+adversarial review pass under this consolidated protocol, except when the
+response is the reciprocal `APPROVED` that closes mutual exhaustion. In that
+case, the sender must state that reciprocal approval closes the reviewed
+artifact and name the next owner/next step.
 
 ## Mailbox Safety
 
@@ -456,6 +468,14 @@ The loop closes only when:
 3. the other side also approves with no new findings.
 
 If either side finds a new issue, the loop continues.
+
+Reciprocal approval is closure. Once the reviewer has sent `APPROVED` and the
+implementer has sent an independent `APPROVED` concurrence for the same
+artifact, the implementer must not wait for the reviewer to send an additional
+terminal closure. The implementer records closure in the progress/broker state
+and continues to the next approved implementation step or the next queued task.
+If the broker still shows the reviewer as `awaiting` after reciprocal approval,
+treat that as bookkeeping state to fix, not as a review gate.
 
 ## Obsolete Surfaces
 
