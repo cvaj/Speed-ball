@@ -200,12 +200,18 @@ data class RecordedHfrWorkingResolution(
     val working: FrameDimensions,
 ) {
     val downscaledForDetection: Boolean get() = source != working
+    val scaleX: Double get() = working.width.toDouble() / source.width.toDouble()
+    val scaleY: Double get() = working.height.toDouble() / source.height.toDouble()
+
+    /** Scales a source-coordinate area threshold into the detector working space. */
+    fun scaleAreaPx(areaPx: Int): Int =
+        maxOf(1, kotlin.math.round(areaPx.toDouble() * scaleX * scaleY).toInt())
 }
 
 /** Chooses a CPU-bounded 16:9 detector working size for recorded-HFR frames. */
 object RecordedHfrWorkingResolutionSelector {
-    private const val MAX_WORKING_WIDTH = 1280
-    private const val MAX_WORKING_HEIGHT = 720
+    private const val MAX_WORKING_WIDTH = 640
+    private const val MAX_WORKING_HEIGHT = 360
 
     fun select(sourceWidth: Int, sourceHeight: Int): ImportValidationResult<RecordedHfrWorkingResolution> {
         if (sourceWidth <= 0 || sourceHeight <= 0) {

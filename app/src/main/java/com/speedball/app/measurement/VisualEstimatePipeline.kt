@@ -43,8 +43,35 @@ data class VisualEstimatePipelineConfig(
     val minBallDiameterSamples: Int = 3,
     val requireFittedPathProgression: Boolean = true,
     val minEstimateMilesPerHour: Double? = null,
+    val minimumSpeedGatePolicy: MinimumSpeedGatePolicy = MinimumSpeedGatePolicy.ALL_TRUSTED_SCALE,
+    val scaleMode: VisualEstimateScaleMode = VisualEstimateScaleMode.SamePlane,
     val levelReference: LevelReferenceSnapshot? = null,
 )
+
+/** Scale-plane model used before converting visual pixels per second to mph. */
+sealed interface VisualEstimateScaleMode {
+    /** Calibration points are on the ball travel plane. */
+    data object SamePlane : VisualEstimateScaleMode
+
+    /**
+     * Estimate-only perspective correction for a fixed camera.
+     *
+     * Depths are measured from camera to the ball travel plane and calibration
+     * plane. Monocular video cannot verify these entries or recover toward/away
+     * speed, so this mode is always LOW confidence.
+     */
+    data class DepthCorrected(
+        val ballPlaneDepthFeet: Double,
+        val calibrationPlaneDepthFeet: Double,
+    ) : VisualEstimateScaleMode
+}
+
+/** Policy for applying the configured minimum display speed. */
+enum class MinimumSpeedGatePolicy {
+    SAME_PLANE_ONLY,
+    ALL_TRUSTED_SCALE,
+    DISABLED,
+}
 
 /**
  * Converts ordered visual detections plus calibration into an estimate-only
@@ -175,15 +202,20 @@ object VisualEstimatePipeline {
                 diagnostics = noReadDiagnostics(samples.size, usedCount, gapSummary, measurement.fit.rmsResidualPx, timingBasis = timingBasis),
             )
         }
-        config.minEstimateMilesPerHour?.let { minimum ->
-            if (measurement.milesPerHour < minimum) {
-                return VisualEstimateOutcome.NoRead(
-                    VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
-                    "Selected motion is below the configured hit-ball speed threshold.",
-                    diagnostics = noReadDiagnostics(samples.size, usedCount, gapSummary, measurement.fit.rmsResidualPx, timingBasis = timingBasis),
-                )
+        val speedFloorSkippedWarning = config.minEstimateMilesPerHour
+            ?.takeUnless { shouldApplyMinimumSpeedGate(config.minimumSpeedGatePolicy, scale.basis) }
+            ?.let { "Minimum hit-speed gate was skipped because the scale basis is ${scale.basis}." }
+        config.minEstimateMilesPerHour
+            ?.takeIf { shouldApplyMinimumSpeedGate(config.minimumSpeedGatePolicy, scale.basis) }
+            ?.let { minimum ->
+                if (measurement.milesPerHour < minimum) {
+                    return VisualEstimateOutcome.NoRead(
+                        VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
+                        "Selected motion is below the configured hit-ball speed threshold.",
+                        diagnostics = noReadDiagnostics(samples.size, usedCount, gapSummary, measurement.fit.rmsResidualPx, timingBasis = timingBasis),
+                    )
+                }
             }
-        }
 
         val diagnostics = VisualEstimateDiagnostics(
             frameCount = samples.size,
@@ -191,7 +223,7 @@ object VisualEstimatePipeline {
             timingBasis = timingBasis,
             timestampGapSummary = gapSummary,
             fitResidualPx = measurement.fit.rmsResidualPx,
-            confidence = confidenceFor(samples.size, gapSummary, measurement.fit.rmsResidualPx, config, intervalCoherence),
+            confidence = confidenceFor(samples.size, gapSummary, measurement.fit.rmsResidualPx, config, intervalCoherence, scale.basis),
             scaleBasis = scale.basis,
             levelReference = config.levelReference,
             assumptions = assumptionsFor(timingBasis, scale.basis, config.levelReference),
@@ -204,6 +236,8 @@ object VisualEstimatePipeline {
                     add("Centroid displacement supports skipped/coalesced interval inference.")
                 }
                 scaleChangeWarning?.let(::add)
+                scale.warnings.forEach(::add)
+                speedFloorSkippedWarning?.let(::add)
             },
         )
         return VisualEstimateResultFactory.successOrNoRead(
@@ -235,6 +269,10 @@ private fun assumptionsFor(
         if (scaleBasis == EstimateScaleBasis.BALL_DIAMETER_SELF_CALIBRATION) {
             add(VisualEstimateDiagnostics.BALL_DIAMETER_SCALE_ASSUMPTION)
         }
+        if (scaleBasis == EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION) {
+            add(VisualEstimateDiagnostics.DEPTH_CORRECTED_SCALE_ASSUMPTION)
+            add(VisualEstimateDiagnostics.UNMEASURED_DEPTH_VELOCITY_ASSUMPTION)
+        }
     }
 
 private fun List<VisualEstimateTrackSample>.withoutStationaryPrefix(): List<VisualEstimateTrackSample> {
@@ -256,6 +294,7 @@ private sealed interface EstimateScaleResolution {
     data class Success(
         val pixelsPerFoot: Double,
         val basis: EstimateScaleBasis,
+        val warnings: List<String> = emptyList(),
     ) : EstimateScaleResolution
 
     data class Failure(val noRead: VisualEstimateOutcome.NoRead) : EstimateScaleResolution
@@ -269,18 +308,80 @@ private fun resolveEstimateScale(
     config: VisualEstimatePipelineConfig,
 ): EstimateScaleResolution =
     when (val calibrationResult = calibration.pixelsPerFoot()) {
-        is CalibrationResult.Success -> EstimateScaleResolution.Success(
-            pixelsPerFoot = calibrationResult.pixelsPerFoot,
-            basis = EstimateScaleBasis.DISTANCE_CALIBRATION,
-        )
+        is CalibrationResult.Success -> applyScaleMode(calibrationResult.pixelsPerFoot, samples, gapSummary, timingBasis, config)
         is CalibrationResult.Failure -> {
-            if (calibration.hasCompleteDistanceCalibrationInput() || config.knownBallDiameterFeet == null) {
+            if (
+                config.scaleMode is VisualEstimateScaleMode.DepthCorrected ||
+                calibration.hasCompleteDistanceCalibrationInput() ||
+                config.knownBallDiameterFeet == null
+            ) {
                 EstimateScaleResolution.Failure(calibrationResult.toEstimateNoRead(samples, gapSummary, timingBasis))
             } else {
                 resolveBallDiameterScale(samples, gapSummary, timingBasis, config)
             }
         }
     }
+
+private fun applyScaleMode(
+    calibratedPixelsPerFoot: Double,
+    samples: List<VisualEstimateTrackSample>,
+    gapSummary: TimestampGapSummary,
+    timingBasis: EstimateTimingBasis,
+    config: VisualEstimatePipelineConfig,
+): EstimateScaleResolution {
+    return when (val mode = config.scaleMode) {
+        VisualEstimateScaleMode.SamePlane -> EstimateScaleResolution.Success(
+            pixelsPerFoot = calibratedPixelsPerFoot,
+            basis = EstimateScaleBasis.DISTANCE_CALIBRATION,
+        )
+        is VisualEstimateScaleMode.DepthCorrected -> {
+            val ballDepth = mode.ballPlaneDepthFeet
+            val calibrationDepth = mode.calibrationPlaneDepthFeet
+            if (
+                !calibratedPixelsPerFoot.isFinite() ||
+                !ballDepth.isFinite() ||
+                !calibrationDepth.isFinite() ||
+                calibratedPixelsPerFoot <= 0.0 ||
+                ballDepth <= 0.0 ||
+                calibrationDepth <= 0.0
+            ) {
+                return EstimateScaleResolution.Failure(
+                    VisualEstimateOutcome.NoRead(
+                        VisualEstimateNoReadReason.BAD_CALIBRATION,
+                        "Depth-corrected scale requires finite positive calibration and camera-to-plane depths.",
+                        diagnostics = noReadDiagnostics(samples.size, samples.size, gapSummary, timingBasis = timingBasis),
+                    ),
+                )
+            }
+            val correctionFactor = calibrationDepth / ballDepth
+            val correctedPixelsPerFoot = calibratedPixelsPerFoot * correctionFactor
+            if (
+                !correctionFactor.isFinite() ||
+                !correctedPixelsPerFoot.isFinite() ||
+                correctionFactor !in MIN_DEPTH_SCALE_CORRECTION_FACTOR..MAX_DEPTH_SCALE_CORRECTION_FACTOR
+            ) {
+                return EstimateScaleResolution.Failure(
+                    VisualEstimateOutcome.NoRead(
+                        VisualEstimateNoReadReason.BAD_CALIBRATION,
+                        "Depth-corrected scale factor is outside the reviewed safe range.",
+                        diagnostics = noReadDiagnostics(samples.size, samples.size, gapSummary, timingBasis = timingBasis),
+                    ),
+                )
+            }
+            EstimateScaleResolution.Success(
+                pixelsPerFoot = correctedPixelsPerFoot,
+                basis = EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION,
+                warnings = buildList {
+                    add("LOW confidence: depth-corrected scale uses user-entered camera-to-plane depths.")
+                    add("Depth correction factor=${correctionFactor.formatScaleWarning()}.")
+                    if (correctionFactor < LOW_CONFIDENCE_DEPTH_SCALE_FACTOR_FLOOR || correctionFactor > LOW_CONFIDENCE_DEPTH_SCALE_FACTOR_CEILING) {
+                        add("LOW confidence: depth correction factor is far from same-plane calibration.")
+                    }
+                },
+            )
+        }
+    }
+}
 
 private fun MeasurementCalibrationState.hasCompleteDistanceCalibrationInput(): Boolean =
     pointA != null && pointB != null && knownDistanceFeet != null
@@ -452,6 +553,22 @@ private fun validateConfig(config: VisualEstimatePipelineConfig): VisualEstimate
             return configNoRead("Minimum estimate speed must be finite and non-negative when supplied.")
         }
     }
+    when (val scaleMode = config.scaleMode) {
+        VisualEstimateScaleMode.SamePlane -> Unit
+        is VisualEstimateScaleMode.DepthCorrected -> {
+            if (
+                !scaleMode.ballPlaneDepthFeet.isFinite() ||
+                !scaleMode.calibrationPlaneDepthFeet.isFinite() ||
+                scaleMode.ballPlaneDepthFeet <= 0.0 ||
+                scaleMode.calibrationPlaneDepthFeet <= 0.0
+            ) {
+                return VisualEstimateOutcome.NoRead(
+                    VisualEstimateNoReadReason.BAD_CALIBRATION,
+                    "Depth-corrected scale depths must be finite and positive.",
+                )
+            }
+        }
+    }
     return null
 }
 
@@ -594,8 +711,11 @@ private fun confidenceFor(
     residualPx: Double,
     config: VisualEstimatePipelineConfig,
     intervalCoherence: IntervalCoherenceOutcome,
+    scaleBasis: EstimateScaleBasis,
 ): VisualEstimateConfidence =
-    when {
+    if (scaleBasis == EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION) {
+        VisualEstimateConfidence.LOW
+    } else when {
         intervalCoherence is IntervalCoherenceOutcome.Coalesced -> VisualEstimateConfidence.LOW
         frameCount >= 6 &&
             gapSummary.maxToMedianRatio <= 1.25 &&
@@ -604,6 +724,16 @@ private fun confidenceFor(
             gapSummary.maxToMedianRatio <= 1.75 &&
             residualPx <= config.maxEstimateRmsResidualPx * 0.75 -> VisualEstimateConfidence.MEDIUM
         else -> VisualEstimateConfidence.LOW
+    }
+
+private fun shouldApplyMinimumSpeedGate(
+    policy: MinimumSpeedGatePolicy,
+    scaleBasis: EstimateScaleBasis,
+): Boolean =
+    when (policy) {
+        MinimumSpeedGatePolicy.DISABLED -> false
+        MinimumSpeedGatePolicy.SAME_PLANE_ONLY -> scaleBasis == EstimateScaleBasis.DISTANCE_CALIBRATION
+        MinimumSpeedGatePolicy.ALL_TRUSTED_SCALE -> scaleBasis != EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION
     }
 
 private fun CalibrationResult.Failure.toEstimateNoRead(
@@ -668,7 +798,14 @@ private fun List<Double>.median(): Double {
     }
 }
 
+private fun Double.formatScaleWarning(): String =
+    "%.3f".format(this)
+
 private const val ESTIMATE_MIN_USABLE_DETECTIONS = 4
+private const val MIN_DEPTH_SCALE_CORRECTION_FACTOR = 0.10
+private const val MAX_DEPTH_SCALE_CORRECTION_FACTOR = 10.0
+private const val LOW_CONFIDENCE_DEPTH_SCALE_FACTOR_FLOOR = 0.50
+private const val LOW_CONFIDENCE_DEPTH_SCALE_FACTOR_CEILING = 2.0
 private const val PROGRESSION_TOLERANCE_PX = 1.0e-6
 private const val ABSOLUTE_INTERVAL_RATIO_TOLERANCE = 0.5
 private const val VISUAL_DELTA_MIN_DISPLACEMENT_PX = 1.0e-6

@@ -5,6 +5,14 @@ import com.speedball.app.measurement.BlobCandidateDetectionOutcome
 import com.speedball.app.measurement.BlobDetector
 import com.speedball.app.measurement.EstimateTimingBasis
 import com.speedball.app.measurement.MeasurementCalibrationState
+import com.speedball.app.measurement.RecordedHfrPhysicalBallDetector
+import com.speedball.app.measurement.RecordedHfrPhysicalDetectionOutcome
+import com.speedball.app.measurement.RecordedHfrPhysicalDetectorConfig
+import com.speedball.app.measurement.RecordedHfrPhysicalFrameMask
+import com.speedball.app.measurement.RecordedHfrPhysicalFrameMaskOutcome
+import com.speedball.app.measurement.RecordedHfrMotionBallDetector
+import com.speedball.app.measurement.RecordedHfrMotionDetectionOutcome
+import com.speedball.app.measurement.RecordedHfrMotionDetectorConfig
 import com.speedball.app.measurement.RgbFrame
 import com.speedball.app.measurement.TrackExtractionConfig
 import com.speedball.app.measurement.VisualEstimateCandidateFrame
@@ -40,6 +48,9 @@ data class RecordedHfrStreamingEstimateConfig(
     val proofThumbnailMaxWidth: Int = VisualEstimateCaptureProofBuilder.DEFAULT_THUMBNAIL_MAX_WIDTH,
     val proofThumbnailMaxHeight: Int = VisualEstimateCaptureProofBuilder.DEFAULT_THUMBNAIL_MAX_HEIGHT,
     val timingMode: RecordedHfrStreamingTimingMode = RecordedHfrStreamingTimingMode.FRAME_INDEX_INTERVAL,
+    val proofOnly: Boolean = false,
+    val physicalDetectorConfig: RecordedHfrPhysicalDetectorConfig? = null,
+    val motionDetectorConfig: RecordedHfrMotionDetectorConfig? = null,
 )
 
 /** Estimate-only timing mode for recorded-HFR streaming candidates. */
@@ -70,7 +81,31 @@ data class RecordedHfrStreamingEstimateResult(
     val sourceHeight: Int,
     val workingWidth: Int,
     val workingHeight: Int,
+    val sourceValidity: RecordedHfrSourceValidity = RecordedHfrSourceValidity.NotEvaluated,
 )
+
+/** Bounded luma proof that the decoded source window is not black/near-black. */
+data class RecordedHfrSourceValidity(
+    val scannedFrameCount: Int,
+    val roiPixelCount: Long,
+    val meanLuma: Double,
+    val brightestFrameMeanLuma: Double,
+    val brightPixelFraction: Double,
+    val verdict: String,
+) {
+    val passes: Boolean get() = verdict == "PASS"
+
+    companion object {
+        val NotEvaluated = RecordedHfrSourceValidity(
+            scannedFrameCount = 0,
+            roiPixelCount = 0L,
+            meanLuma = 0.0,
+            brightestFrameMeanLuma = 0.0,
+            brightPixelFraction = 0.0,
+            verdict = "NO_READ_SOURCE_VALIDITY_NOT_EVALUATED",
+        )
+    }
+}
 
 /**
  * Streams decoded recorded-HFR frames through the existing blob detector and
@@ -88,6 +123,12 @@ object RecordedHfrStreamingEstimate {
         }
         val candidates = mutableListOf<VisualEstimateCandidateFrame>()
         val candidateThumbnails = mutableListOf<VisualEstimateProofThumbnailFrame>()
+        val sourceThumbnails = mutableListOf<VisualEstimateProofThumbnailFrame>()
+        val physicalMasks = mutableListOf<RecordedHfrPhysicalFrameMask>()
+        val motionFrames = mutableListOf<RgbFrame>()
+        val motionOriginalFrameIndexes = mutableListOf<Int>()
+        val motionPresentationTimestampNanos = mutableListOf<Long?>()
+        val sourceValidityAccumulator = SourceValidityAccumulator()
         var scannedFrameCount = 0
         var candidateBlobCount = 0
         var previousFrameIndex: Int? = null
@@ -127,6 +168,20 @@ object RecordedHfrStreamingEstimate {
                     )
                 }
                 val frame = source.nextFrame() ?: break
+                if (cancellationSignal.isCancelled()) {
+                    return resourceNoRead(
+                        message = "Recorded-HFR streaming decode was cancelled after frame decode.",
+                        config = config,
+                        candidates = candidates,
+                        candidateThumbnails = candidateThumbnails,
+                        scannedFrameCount = scannedFrameCount,
+                        candidateBlobCount = candidateBlobCount,
+                        sourceWidth = sourceWidth,
+                        sourceHeight = sourceHeight,
+                        workingWidth = workingWidth,
+                        workingHeight = workingHeight,
+                    )
+                }
                 validateFrame(frame, previousFrameIndex)?.let { noRead ->
                     return noReadResult(
                         outcome = noRead,
@@ -186,6 +241,70 @@ object RecordedHfrStreamingEstimate {
                     argbPixels = frame.argbPixels,
                     timestampSeconds = timestampSeconds,
                 )
+                sourceValidityAccumulator.add(frame, config.framePipelineConfig.trackConfig.detectorConfig.roi)
+                if (sourceThumbnails.size < config.maxProofFrames) {
+                    sourceThumbnails += frame.toProofThumbnail(
+                        compactPosition = scannedFrameCount - 1,
+                        timestampSeconds = timestampSeconds,
+                        maxWidth = config.proofThumbnailMaxWidth,
+                        maxHeight = config.proofThumbnailMaxHeight,
+                    )
+                }
+                if (config.proofOnly) continue
+                if (cancellationSignal.isCancelled()) {
+                    return resourceNoRead(
+                        message = "Recorded-HFR streaming decode was cancelled before candidate detection.",
+                        config = config,
+                        candidates = candidates,
+                        candidateThumbnails = candidateThumbnails,
+                        scannedFrameCount = scannedFrameCount,
+                        candidateBlobCount = candidateBlobCount,
+                        sourceWidth = sourceWidth,
+                        sourceHeight = sourceHeight,
+                        workingWidth = workingWidth,
+                        workingHeight = workingHeight,
+                    )
+                }
+                if (config.motionDetectorConfig != null) {
+                    motionFrames += RgbFrame(
+                        width = rgbFrame.width,
+                        height = rgbFrame.height,
+                        argbPixels = rgbFrame.argbPixels.copyOf(),
+                        timestampSeconds = rgbFrame.timestampSeconds,
+                    )
+                    motionOriginalFrameIndexes += frame.frameIndex
+                    motionPresentationTimestampNanos += frame.presentationTimestampNanos
+                    continue
+                }
+                if (config.physicalDetectorConfig != null) {
+                    when (
+                        val mask = RecordedHfrPhysicalBallDetector.buildFrameMask(
+                            frame = rgbFrame,
+                            compactPosition = scannedFrameCount - 1,
+                            originalFrameIndex = frame.frameIndex,
+                            presentationTimestampNanos = frame.presentationTimestampNanos,
+                            detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
+                        )
+                    ) {
+                        is RecordedHfrPhysicalFrameMaskOutcome.Failure -> {
+                            return noReadFromCandidates(
+                                reason = mask.reason,
+                                message = mask.message,
+                                config = config,
+                                candidates = candidates,
+                                candidateThumbnails = candidateThumbnails.ifEmpty { sourceThumbnails },
+                                scannedFrameCount = scannedFrameCount,
+                                candidateBlobCount = candidateBlobCount,
+                                sourceWidth = sourceWidth,
+                                sourceHeight = sourceHeight,
+                                workingWidth = workingWidth,
+                                workingHeight = workingHeight,
+                            )
+                        }
+                        is RecordedHfrPhysicalFrameMaskOutcome.Success -> physicalMasks += mask.value
+                    }
+                    continue
+                }
                 when (val detection = BlobDetector.detectCandidates(rgbFrame, config.framePipelineConfig.trackConfig.detectorConfig)) {
                     is BlobCandidateDetectionOutcome.Failure -> {
                         if (detection.reason == com.speedball.app.measurement.MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED) {
@@ -218,6 +337,35 @@ object RecordedHfrStreamingEstimate {
                     }
                     is BlobCandidateDetectionOutcome.Success -> {
                         if (detection.blobs.isNotEmpty()) {
+                            val budget = config.framePipelineConfig.trackConfig.candidateReductionBudget
+                            if (budget != null && detection.blobs.size > budget.maxBlobsPerFrame) {
+                                return resourceNoRead(
+                                    message = "Recorded-HFR frame ${frame.frameIndex} produced ${detection.blobs.size} candidate blobs, exceeding the per-frame cap ${budget.maxBlobsPerFrame}.",
+                                    config = config,
+                                    candidates = candidates,
+                                    candidateThumbnails = candidateThumbnails,
+                                    scannedFrameCount = scannedFrameCount,
+                                    candidateBlobCount = candidateBlobCount,
+                                    sourceWidth = sourceWidth,
+                                    sourceHeight = sourceHeight,
+                                    workingWidth = workingWidth,
+                                    workingHeight = workingHeight,
+                                )
+                            }
+                            if (budget != null && candidateBlobCount + detection.blobs.size > budget.maxTotalCandidateBlobs) {
+                                return resourceNoRead(
+                                    message = "Recorded-HFR window produced ${candidateBlobCount + detection.blobs.size} candidate blobs, exceeding the window cap ${budget.maxTotalCandidateBlobs}.",
+                                    config = config,
+                                    candidates = candidates,
+                                    candidateThumbnails = candidateThumbnails,
+                                    scannedFrameCount = scannedFrameCount,
+                                    candidateBlobCount = candidateBlobCount,
+                                    sourceWidth = sourceWidth,
+                                    sourceHeight = sourceHeight,
+                                    workingWidth = workingWidth,
+                                    workingHeight = workingHeight,
+                                )
+                            }
                             if (candidates.size >= config.maxRetainedCandidateFrames) {
                                 return resourceNoRead(
                                     message = "Recorded-HFR retained candidate frames exceeded the reviewed resource cap.",
@@ -253,16 +401,142 @@ object RecordedHfrStreamingEstimate {
                     }
                 }
             }
+            val sourceValidity = sourceValidityAccumulator.toSummary(scannedFrameCount)
+            if (config.motionDetectorConfig != null && !config.proofOnly) {
+                if (!sourceValidity.passes) {
+                    return sourceInvalidNoRead(
+                        config = config,
+                        sourceThumbnails = sourceThumbnails,
+                        sourceValidity = sourceValidity,
+                        scannedFrameCount = scannedFrameCount,
+                        candidateFrameCount = candidates.size,
+                        candidateBlobCount = candidateBlobCount,
+                        sourceWidth = sourceWidth,
+                        sourceHeight = sourceHeight,
+                        workingWidth = workingWidth,
+                        workingHeight = workingHeight,
+                    )
+                }
+                when (
+                    val motion = RecordedHfrMotionBallDetector.detect(
+                        frames = motionFrames,
+                        detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
+                        motionConfig = config.motionDetectorConfig,
+                        originalFrameIndexes = motionOriginalFrameIndexes,
+                        presentationTimestampNanos = motionPresentationTimestampNanos,
+                        isCancelled = cancellationSignal::isCancelled,
+                    )
+                ) {
+                    is RecordedHfrMotionDetectionOutcome.Failure -> {
+                        return noReadFromCandidates(
+                            reason = motion.reason,
+                            message = motion.message,
+                            config = config,
+                            candidates = candidates,
+                            candidateThumbnails = sourceThumbnails,
+                            scannedFrameCount = scannedFrameCount,
+                            candidateBlobCount = candidateBlobCount,
+                            sourceWidth = sourceWidth,
+                            sourceHeight = sourceHeight,
+                            workingWidth = workingWidth,
+                            workingHeight = workingHeight,
+                            sourceValidity = sourceValidity,
+                        )
+                    }
+                    is RecordedHfrMotionDetectionOutcome.Success -> {
+                        val budget = config.framePipelineConfig.trackConfig.candidateReductionBudget
+                        if (budget != null && motion.frames.any { it.blobs.size > budget.maxBlobsPerFrame }) {
+                            return resourceNoRead(
+                                message = "Recorded-HFR motion detector produced more blobs per frame than the reducer cap.",
+                                config = config,
+                                candidates = candidates,
+                                candidateThumbnails = sourceThumbnails,
+                                scannedFrameCount = scannedFrameCount,
+                                candidateBlobCount = candidateBlobCount,
+                                sourceWidth = sourceWidth,
+                                sourceHeight = sourceHeight,
+                                workingWidth = workingWidth,
+                                workingHeight = workingHeight,
+                            )
+                        }
+                        if (budget != null && motion.candidateBlobCount > budget.maxTotalCandidateBlobs) {
+                            return resourceNoRead(
+                                message = "Recorded-HFR motion detector produced ${motion.candidateBlobCount} candidate blobs, exceeding the window cap ${budget.maxTotalCandidateBlobs}.",
+                                config = config,
+                                candidates = candidates,
+                                candidateThumbnails = sourceThumbnails,
+                                scannedFrameCount = scannedFrameCount,
+                                candidateBlobCount = candidateBlobCount,
+                                sourceWidth = sourceWidth,
+                                sourceHeight = sourceHeight,
+                                workingWidth = workingWidth,
+                                workingHeight = workingHeight,
+                            )
+                        }
+                        if (motion.frames.size > config.maxRetainedCandidateFrames) {
+                            return resourceNoRead(
+                                message = "Recorded-HFR motion detector retained more candidate frames than the reviewed resource cap.",
+                                config = config,
+                                candidates = candidates,
+                                candidateThumbnails = sourceThumbnails,
+                                scannedFrameCount = scannedFrameCount,
+                                candidateBlobCount = candidateBlobCount,
+                                sourceWidth = sourceWidth,
+                                sourceHeight = sourceHeight,
+                                workingWidth = workingWidth,
+                                workingHeight = workingHeight,
+                            )
+                        }
+                        candidates += motion.frames
+                        candidateBlobCount = motion.candidateBlobCount
+                        candidateThumbnails += sourceThumbnails
+                    }
+                }
+            }
+            if (config.physicalDetectorConfig != null && !config.proofOnly) {
+                when (
+                    val physical = RecordedHfrPhysicalBallDetector.detect(
+                        masks = physicalMasks,
+                        detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
+                        physicalConfig = config.physicalDetectorConfig,
+                        isCancelled = cancellationSignal::isCancelled,
+                    )
+                ) {
+                    is RecordedHfrPhysicalDetectionOutcome.Failure -> {
+                        return noReadFromCandidates(
+                            reason = physical.reason,
+                            message = physical.message,
+                            config = config,
+                            candidates = candidates,
+                            candidateThumbnails = candidateThumbnails.ifEmpty { sourceThumbnails },
+                            scannedFrameCount = scannedFrameCount,
+                            candidateBlobCount = candidateBlobCount,
+                            sourceWidth = sourceWidth,
+                            sourceHeight = sourceHeight,
+                            workingWidth = workingWidth,
+                            workingHeight = workingHeight,
+                        )
+                    }
+                    is RecordedHfrPhysicalDetectionOutcome.Success -> {
+                        candidates += physical.frames
+                        candidateBlobCount = physical.candidateBlobCount
+                        candidateThumbnails += sourceThumbnails
+                    }
+                }
+            }
             finish(
                 config = config,
                 candidates = candidates,
                 candidateThumbnails = candidateThumbnails,
+                sourceThumbnails = sourceThumbnails,
+                sourceValidity = sourceValidity,
                 scannedFrameCount = scannedFrameCount,
                 candidateBlobCount = candidateBlobCount,
                 sourceWidth = sourceWidth,
                 sourceHeight = sourceHeight,
                 workingWidth = workingWidth,
                 workingHeight = workingHeight,
+                cancellationSignal = cancellationSignal,
             )
         } catch (_: RuntimeException) {
             resourceNoRead(
@@ -286,14 +560,63 @@ object RecordedHfrStreamingEstimate {
         config: RecordedHfrStreamingEstimateConfig,
         candidates: List<VisualEstimateCandidateFrame>,
         candidateThumbnails: List<VisualEstimateProofThumbnailFrame>,
+        sourceThumbnails: List<VisualEstimateProofThumbnailFrame>,
+        sourceValidity: RecordedHfrSourceValidity,
         scannedFrameCount: Int,
         candidateBlobCount: Int,
         sourceWidth: Int,
         sourceHeight: Int,
         workingWidth: Int,
         workingHeight: Int,
+        cancellationSignal: ImportCancellationSignal,
     ): RecordedHfrStreamingEstimateResult {
-        val reduction = VisualEstimateCandidateReducer.reduce(candidates, config.framePipelineConfig.trackConfig)
+        if (config.proofOnly) {
+            return proofOnlyNoRead(
+                config = config,
+                sourceThumbnails = sourceThumbnails,
+                sourceValidity = sourceValidity,
+                scannedFrameCount = scannedFrameCount,
+                candidateFrameCount = candidates.size,
+                candidateBlobCount = candidateBlobCount,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                workingWidth = workingWidth,
+                workingHeight = workingHeight,
+            )
+        }
+        if (!sourceValidity.passes) {
+            return sourceInvalidNoRead(
+                config = config,
+                sourceThumbnails = sourceThumbnails,
+                sourceValidity = sourceValidity,
+                scannedFrameCount = scannedFrameCount,
+                candidateFrameCount = candidates.size,
+                candidateBlobCount = candidateBlobCount,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                workingWidth = workingWidth,
+                workingHeight = workingHeight,
+            )
+        }
+        if (cancellationSignal.isCancelled()) {
+            return resourceNoRead(
+                message = "Recorded-HFR streaming decode was cancelled before candidate reduction.",
+                config = config,
+                candidates = candidates,
+                candidateThumbnails = candidateThumbnails,
+                scannedFrameCount = scannedFrameCount,
+                candidateBlobCount = candidateBlobCount,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                workingWidth = workingWidth,
+                workingHeight = workingHeight,
+            )
+        }
+        val reduction = VisualEstimateCandidateReducer.reduce(
+            frameCandidates = candidates,
+            config = config.framePipelineConfig.trackConfig,
+            isCancelled = cancellationSignal::isCancelled,
+        )
         if (reduction is VisualEstimateCandidateReductionOutcome.Failure) {
             return noReadFromCandidates(
                 reason = reduction.reason,
@@ -310,6 +633,23 @@ object RecordedHfrStreamingEstimate {
             )
         }
         reduction as VisualEstimateCandidateReductionOutcome.Success
+        config.physicalDetectorConfig?.let { physicalConfig ->
+            RecordedHfrPhysicalBallDetector.validateSelectedTrack(reduction.selected, physicalConfig)?.let { failure ->
+                return noReadFromCandidates(
+                    reason = failure.reason,
+                    message = failure.message,
+                    config = config,
+                    candidates = candidates,
+                    candidateThumbnails = candidateThumbnails,
+                    scannedFrameCount = scannedFrameCount,
+                    candidateBlobCount = candidateBlobCount,
+                    sourceWidth = sourceWidth,
+                    sourceHeight = sourceHeight,
+                    workingWidth = workingWidth,
+                    workingHeight = workingHeight,
+                )
+            }
+        }
         val timing = when (
             val reconciled = when (config.timingMode) {
                 RecordedHfrStreamingTimingMode.FRAME_INDEX_INTERVAL ->
@@ -398,6 +738,49 @@ object RecordedHfrStreamingEstimate {
         )
     }
 
+    private fun proofOnlyNoRead(
+        config: RecordedHfrStreamingEstimateConfig,
+        sourceThumbnails: List<VisualEstimateProofThumbnailFrame>,
+        sourceValidity: RecordedHfrSourceValidity,
+        scannedFrameCount: Int,
+        candidateFrameCount: Int,
+        candidateBlobCount: Int,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        workingWidth: Int,
+        workingHeight: Int,
+    ): RecordedHfrStreamingEstimateResult {
+        val noRead = candidateNoRead(
+            reason = VisualEstimateNoReadReason.EXCESSIVE_RESIDUAL,
+            message = "Recorded-HFR proof-only window skipped candidate detection.",
+            config = config,
+            frameCount = scannedFrameCount,
+            candidateFrameCount = candidateFrameCount,
+            candidateBlobCount = candidateBlobCount,
+            selectedSampleCount = 0,
+            timestampGapSummary = null,
+            confidence = null,
+        )
+        return noReadResult(
+            outcome = noRead,
+            trace = buildSourceTrace(
+                detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
+                thumbnails = sourceThumbnails,
+                outcome = noRead,
+            ),
+            proofThumbnails = sourceThumbnails,
+            scannedFrameCount = scannedFrameCount,
+            candidateFrameCount = candidateFrameCount,
+            candidateBlobCount = candidateBlobCount,
+            selectedSampleCount = 0,
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight,
+            workingWidth = workingWidth,
+            workingHeight = workingHeight,
+            sourceValidity = sourceValidity,
+        )
+    }
+
     private fun RecordedHfrStreamingEstimateConfig.validate(): RecordedHfrStreamingEstimateResult? {
         if (!frameIntervalSeconds.isFinite() || frameIntervalSeconds <= 0.0) {
             val noRead = basicNoRead("Recorded-HFR frame interval must be finite and positive.")
@@ -409,6 +792,14 @@ object RecordedHfrStreamingEstimate {
         }
         if (proofThumbnailMaxWidth <= 0 || proofThumbnailMaxHeight <= 0) {
             val noRead = basicNoRead("Recorded-HFR proof thumbnail limits must be positive.")
+            return emptyResult(this, noRead)
+        }
+        if (physicalDetectorConfig != null && motionDetectorConfig != null) {
+            val noRead = basicNoRead("Recorded-HFR detector configuration cannot enable both physical and fixed-camera motion detectors.")
+            return emptyResult(this, noRead)
+        }
+        motionDetectorConfig?.validate()?.let {
+            val noRead = basicNoRead(it.message)
             return emptyResult(this, noRead)
         }
         return null
@@ -431,6 +822,49 @@ object RecordedHfrStreamingEstimate {
             workingWidth = 0,
             workingHeight = 0,
         )
+
+    private fun sourceInvalidNoRead(
+        config: RecordedHfrStreamingEstimateConfig,
+        sourceThumbnails: List<VisualEstimateProofThumbnailFrame>,
+        sourceValidity: RecordedHfrSourceValidity,
+        scannedFrameCount: Int,
+        candidateFrameCount: Int,
+        candidateBlobCount: Int,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        workingWidth: Int,
+        workingHeight: Int,
+    ): RecordedHfrStreamingEstimateResult {
+        val noRead = candidateNoRead(
+            reason = VisualEstimateNoReadReason.DETECTION_FAILED,
+            message = "Recorded window source frames were black or invalid.",
+            config = config,
+            frameCount = scannedFrameCount,
+            candidateFrameCount = candidateFrameCount,
+            candidateBlobCount = candidateBlobCount,
+            selectedSampleCount = 0,
+            timestampGapSummary = null,
+            confidence = null,
+        )
+        return noReadResult(
+            outcome = noRead,
+            trace = buildSourceTrace(
+                detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
+                thumbnails = sourceThumbnails,
+                outcome = noRead,
+            ),
+            proofThumbnails = sourceThumbnails,
+            scannedFrameCount = scannedFrameCount,
+            candidateFrameCount = candidateFrameCount,
+            candidateBlobCount = candidateBlobCount,
+            selectedSampleCount = 0,
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight,
+            workingWidth = workingWidth,
+            workingHeight = workingHeight,
+            sourceValidity = sourceValidity,
+        )
+    }
 
     private fun validateFrame(
         frame: ImportVideoFrame,
@@ -490,6 +924,7 @@ object RecordedHfrStreamingEstimate {
         sourceHeight: Int,
         workingWidth: Int,
         workingHeight: Int,
+        sourceValidity: RecordedHfrSourceValidity = RecordedHfrSourceValidity.NotEvaluated,
     ): RecordedHfrStreamingEstimateResult {
         val noRead = candidateNoRead(
             reason = reason,
@@ -525,6 +960,7 @@ object RecordedHfrStreamingEstimate {
             sourceHeight = sourceHeight,
             workingWidth = workingWidth,
             workingHeight = workingHeight,
+            sourceValidity = sourceValidity,
         )
     }
 
@@ -540,6 +976,7 @@ object RecordedHfrStreamingEstimate {
         sourceHeight: Int,
         workingWidth: Int,
         workingHeight: Int,
+        sourceValidity: RecordedHfrSourceValidity = RecordedHfrSourceValidity.NotEvaluated,
     ): RecordedHfrStreamingEstimateResult =
         RecordedHfrStreamingEstimateResult(
             outcome = outcome,
@@ -555,6 +992,7 @@ object RecordedHfrStreamingEstimate {
             sourceHeight = sourceHeight,
             workingWidth = workingWidth,
             workingHeight = workingHeight,
+            sourceValidity = sourceValidity,
         )
 
     private fun candidateNoRead(
@@ -645,6 +1083,26 @@ object RecordedHfrStreamingEstimate {
             },
         ).withOutcome(outcome)
     }
+
+    private fun buildSourceTrace(
+        detectorConfig: com.speedball.app.measurement.BlobDetectionConfig,
+        thumbnails: List<VisualEstimateProofThumbnailFrame>,
+        outcome: VisualEstimateOutcome,
+    ): VisualEstimateDetectorTrace =
+        VisualEstimateDetectorTrace(
+            detectorConfig = detectorConfig,
+            frames = thumbnails.map { thumbnail ->
+                VisualEstimateDetectorFrameTrace(
+                    frameIndex = thumbnail.compactPosition,
+                    timestampSeconds = thumbnail.timestampSeconds,
+                    roi = detectorConfig.roi.clippedTo(thumbnail.sourceWidth, thumbnail.sourceHeight),
+                    candidateCount = 0,
+                    candidates = emptyList(),
+                    selectedBlob = null,
+                    originalFrameIndex = thumbnail.originalFrameIndex,
+                )
+            },
+        ).withOutcome(outcome)
 
     private fun selectProofThumbnails(
         thumbnails: List<VisualEstimateProofThumbnailFrame>,
@@ -785,6 +1243,72 @@ object RecordedHfrStreamingEstimate {
             thumbnailArgbPixels = targetPixels,
         )
     }
+
+    private class SourceValidityAccumulator {
+        private var roiPixelCount = 0L
+        private var lumaTotal = 0L
+        private var brightPixelCount = 0L
+        private var brightestFrameMeanLuma = 0.0
+
+        fun add(frame: ImportVideoFrame, roi: com.speedball.app.measurement.RegionOfInterest?) {
+            val clipped = roi?.clippedTo(frame.width, frame.height)
+                ?: com.speedball.app.measurement.RegionOfInterest(0, 0, frame.width, frame.height)
+            var frameLumaTotal = 0L
+            var framePixelCount = 0L
+            for (y in clipped.top until clipped.bottomExclusive) {
+                val row = y * frame.width
+                for (x in clipped.left until clipped.rightExclusive) {
+                    val luma = frame.argbPixels[row + x].luma()
+                    lumaTotal += luma
+                    frameLumaTotal += luma
+                    framePixelCount += 1
+                    if (luma >= SOURCE_VALIDITY_BRIGHT_LUMA_THRESHOLD) brightPixelCount += 1
+                }
+            }
+            roiPixelCount += framePixelCount
+            if (framePixelCount > 0L) {
+                brightestFrameMeanLuma = maxOf(brightestFrameMeanLuma, frameLumaTotal.toDouble() / framePixelCount)
+            }
+        }
+
+        fun toSummary(scannedFrameCount: Int): RecordedHfrSourceValidity {
+            if (scannedFrameCount <= 0 || roiPixelCount <= 0L) {
+                return RecordedHfrSourceValidity(
+                    scannedFrameCount = scannedFrameCount,
+                    roiPixelCount = roiPixelCount,
+                    meanLuma = 0.0,
+                    brightestFrameMeanLuma = brightestFrameMeanLuma,
+                    brightPixelFraction = 0.0,
+                    verdict = "NO_READ_SOURCE_EMPTY",
+                )
+            }
+            val meanLuma = lumaTotal.toDouble() / roiPixelCount
+            val brightPixelFraction = brightPixelCount.toDouble() / roiPixelCount
+            val passes = meanLuma >= SOURCE_VALIDITY_MIN_MEAN_LUMA ||
+                brightestFrameMeanLuma >= SOURCE_VALIDITY_MIN_FRAME_MEAN_LUMA ||
+                brightPixelFraction >= SOURCE_VALIDITY_MIN_BRIGHT_PIXEL_FRACTION
+            return RecordedHfrSourceValidity(
+                scannedFrameCount = scannedFrameCount,
+                roiPixelCount = roiPixelCount,
+                meanLuma = meanLuma,
+                brightestFrameMeanLuma = brightestFrameMeanLuma,
+                brightPixelFraction = brightPixelFraction,
+                verdict = if (passes) "PASS" else "NO_READ_BLACK_OR_INVALID_SOURCE",
+            )
+        }
+    }
+
+    private fun Int.luma(): Int {
+        val r = (this shr 16) and 0xff
+        val g = (this shr 8) and 0xff
+        val b = this and 0xff
+        return (77 * r + 150 * g + 29 * b) shr 8
+    }
+
+    private const val SOURCE_VALIDITY_BRIGHT_LUMA_THRESHOLD = 24
+    private const val SOURCE_VALIDITY_MIN_MEAN_LUMA = 8.0
+    private const val SOURCE_VALIDITY_MIN_FRAME_MEAN_LUMA = 12.0
+    private const val SOURCE_VALIDITY_MIN_BRIGHT_PIXEL_FRACTION = 0.001
 
     private const val MAX_TRACE_CANDIDATES_PER_FRAME = 16
 }

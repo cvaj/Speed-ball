@@ -93,6 +93,7 @@ enum class VisualEstimateConfidence {
 enum class EstimateScaleBasis {
     DISTANCE_CALIBRATION,
     BALL_DIAMETER_SELF_CALIBRATION,
+    DEPTH_CORRECTED_DISTANCE_CALIBRATION,
 }
 
 /** Fail-loud reason the estimate path cannot honestly display a speed. */
@@ -100,6 +101,11 @@ enum class VisualEstimateNoReadReason {
     BAD_CALIBRATION,
     BAD_TIMESTAMPS,
     DETECTION_FAILED,
+    NO_FOREGROUND_MOTION,
+    FOREGROUND_AMBIGUOUS,
+    BALL_NOT_ISOLATED,
+    GLOBAL_CAMERA_MOTION,
+    GLOBAL_LIGHTING_CHANGE,
     INSUFFICIENT_DETECTIONS,
     AMBIGUOUS_TRACK,
     EXCESSIVE_RESIDUAL,
@@ -162,6 +168,10 @@ data class VisualEstimateDiagnostics(
             "Estimate assumes the smallest observed frame gap is one native interval; uniformly dropped frames would bias speed high."
         const val BALL_DIAMETER_SCALE_ASSUMPTION: String =
             "Scale uses entered ball diameter and apparent short-axis diameter; wrong ball type or motion blur biases speed."
+        const val DEPTH_CORRECTED_SCALE_ASSUMPTION: String =
+            "Depth-corrected scale assumes user-entered camera-to-plane depths and fronto-parallel ball travel."
+        const val UNMEASURED_DEPTH_VELOCITY_ASSUMPTION: String =
+            "Monocular estimate does not measure toward-or-away velocity; depth-corrected speed is lower confidence."
     }
 }
 
@@ -290,6 +300,16 @@ private fun validateSuccessFields(
         return VisualEstimateOutcome.NoRead(
             reason = VisualEstimateNoReadReason.BAD_CALIBRATION,
             message = "Ball-diameter self-calibrated estimates must disclose the apparent-diameter scale assumption.",
+            diagnostics = diagnostics,
+        )
+    }
+    if (
+        diagnostics.scaleBasis == EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION &&
+        diagnostics.assumptions.none { it.contains("Depth-corrected scale", ignoreCase = true) }
+    ) {
+        return VisualEstimateOutcome.NoRead(
+            reason = VisualEstimateNoReadReason.BAD_CALIBRATION,
+            message = "Depth-corrected estimates must disclose the camera-to-plane depth assumption.",
             diagnostics = diagnostics,
         )
     }

@@ -27,8 +27,10 @@ data class RawHighSpeedRange(
 data class BurstOptions(
     val mode: HighSpeedMode,
     val durationMillis: Long = DEFAULT_BURST_DURATION_MILLIS,
-    val preferredExposureTimeNanos: Long? = DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS,
+    val preferredExposureTimeNanos: Long? = null,
     val companionSurfaceMode: BurstCompanionSurfaceMode = BurstCompanionSurfaceMode.VISIBLE_PREVIEW,
+    val stopMode: BurstStopMode = BurstStopMode.FixedDuration,
+    val onFirstFrameAnchor: ((BurstFrameAnchor) -> Unit)? = null,
 )
 
 /** Preview-class companion target used beside the recorder surface in constrained HFR sessions. */
@@ -36,6 +38,20 @@ enum class BurstCompanionSurfaceMode {
     VISIBLE_PREVIEW,
     OFFSCREEN_PREVIEW,
 }
+
+/** Controls whether the recorder stops itself or waits for an external marker. */
+enum class BurstStopMode {
+    FixedDuration,
+    ExternalStop,
+}
+
+/** First positive Camera2 timestamp observed after recording starts. */
+data class BurstFrameAnchor(
+    val sensorTimestampNanos: Long,
+    val elapsedRealtimeNanos: Long,
+    val recorderStartCommandElapsedNanos: Long,
+    val timestampSource: CameraTimestampSourceLabel,
+)
 
 /** Fail-loud reasons for every Phase 4 capture terminal path. */
 enum class BurstFailure {
@@ -103,7 +119,7 @@ class TerminalCompletionGate {
 }
 
 const val DEFAULT_BURST_DURATION_MILLIS: Long = 2_500L
-const val MAX_BURST_DURATION_MILLIS: Long = 3_000L
+const val MAX_BURST_DURATION_MILLIS: Long = 8_000L
 const val DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS: Long = 1_000_000L
 
 fun clampBurstDurationMillis(durationMillis: Long): Long =
@@ -111,6 +127,21 @@ fun clampBurstDurationMillis(durationMillis: Long): Long =
         durationMillis <= 0L -> DEFAULT_BURST_DURATION_MILLIS
         durationMillis > MAX_BURST_DURATION_MILLIS -> MAX_BURST_DURATION_MILLIS
         else -> durationMillis
+    }
+
+/**
+ * Duration failsafe for burst recording.
+ *
+ * [BurstStopMode.ExternalStop] may stop earlier from an external marker, but it
+ * still receives this hard cap so a stalled marker path cannot run HFR forever.
+ */
+fun resolveBurstDurationFailsafeMillis(
+    stopMode: BurstStopMode,
+    durationMillis: Long,
+): Long? =
+    when (stopMode) {
+        BurstStopMode.FixedDuration,
+        BurstStopMode.ExternalStop -> clampBurstDurationMillis(durationMillis)
     }
 
 fun mapHighSpeedModes(rawRanges: List<RawHighSpeedRange>): List<HighSpeedMode> {

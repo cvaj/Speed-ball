@@ -3,11 +3,9 @@
 A practical, end-to-end guide for building, installing, and operating the app on a
 Samsung Galaxy S10+ (or similar Camera2 high-speed device).
 
-> Status note: this guide describes the current in-progress **Setup Mode / Run
-> Mode** build. That two-mode UI is implemented in the working tree but is still
-> pending implementation review and is not committed, so exact labels may shift
-> slightly. Speed **accuracy** is not yet validated against a known reference
-> (a named open gate) — treat reported numbers as unproven.
+> Status note: this guide describes the current reviewed **Setup Mode / Run
+> Mode** build. Speed **accuracy** is not yet validated against a known
+> reference (a named open gate) — treat reported numbers as unproven.
 
 ---
 
@@ -18,9 +16,9 @@ Samsung Galaxy S10+ (or similar Camera2 high-speed device).
   `$ANDROID_HOME/platform-tools/adb`).
 - An Android phone with **Developer options + USB debugging** (and **Wireless
   debugging** if connecting over Wi-Fi).
-- A **neon / high-visibility ball** and a contrasting, well-lit background. The
-  detector is neon-color centroid tracking — dull or low-contrast balls will not
-  be detected.
+- A visible moving ball and a stable/tripod camera. The recorded-HFR detector is
+  fixed-camera median-background motion first; selected ball color is optional
+  evidence after motion is found.
 
 ---
 
@@ -74,8 +72,7 @@ Setup Mode keeps the **live camera preview** visible so you can aim and calibrat
 Open the tools via the translucent handle if controls are hidden. Complete every
 gate below; the status text always names the **specific** thing still missing
 (e.g. `Permission required`, `Mode required`, `Live feed required`,
-`Distance calibration required`, `Ball color required`,
-`Set the ball-flight ROI before measuring.`, `Level required`).
+`Distance calibration required`, `Level required`).
 
 1. **Permission** — tap **`Permission`** and grant **Camera** and **Microphone**.
 2. **Camera mode** — tap **`Modes`** if needed so a fixed high-speed mode is
@@ -89,12 +86,14 @@ gate below; the status text always names the **specific** thing still missing
      distance while keeping your A/B lines; clearing or invalid text blocks
      readiness (it will not silently reuse the old value).
    - (Alternative: **`Ball`** diameter fallback if you can't set A/B distance.)
-4. **Ball color** — tap **`Color`** to select the color target, then tap the
-   neon ball in the preview (or **`Sample`**) to sample its HSV color.
-5. **ROI (ball-flight region)** — tap **`ROI`**, then **tap on the preview** along
+4. **Ball color (optional discriminator)** — tap **`Color`** to select the color
+   target, then tap the ball in the preview (or **`Sample`**) to sample its HSV
+   color. Recorded-HFR Run Mode can arm without this.
+5. **ROI (optional setup aid / legacy region)** — tap **`ROI`**, then **tap on the preview** along
    the path the ball will travel to center the region box there; fine-tune with
    the **nudge** controls. (The box is a fixed-size rectangle you position; there
-   is no drag-resize.)
+   is no drag-resize.) Recorded-HFR Run Mode can scan the bounded full working
+   frame without this.
 6. **Level** — captured automatically once permission/mode are ready; tap
    **`Level`** to recapture while the phone is held still.
 
@@ -142,8 +141,22 @@ Two ways (both run the same recorded-HFR estimate path):
   Use this only as a fallback/proof path if the recognizer is genuinely
   unavailable or in repeated real-error state.
 
-Then **roll/throw the neon ball across the ROI** — the capture window is short
-(about 0.8 s), so time the throw to the trigger.
+After the command, wait for the armed **Ready/beep** cue. The app arms the
+impact mic first, starts HFR recording after the mic is actually listening,
+waits for the first valid video timestamp, then emits the Ready cue. Make the
+mouth pop / shouted pop / impact sound after that cue finishes while the neon
+ball crosses the ROI. The trigger is any loud ambient-relative spike; it does
+not classify sound type. The app ignores its own Ready cue, keeps about 200 ms
+after the accepted marker, and decodes only the bounded high-speed window around
+the marker.
+
+Current provisional impact-audio gates are field-tuned from S10+ proof:
+`minimumPeakDelta=100`, `thresholdMultiplier=2.5`, and
+`minimumBaselineRms=25.0`. These are intentionally treated as provisional. A
+post-Ready pop around delta `107` / ratio `3.0` should trigger, while
+near-silent breath/rustle and moderate sub-pop ambient should not. The audio
+detector is streaming/chunked, so no-impact should return promptly after the
+5-second actionable window instead of lagging far behind the recording.
 
 On S10+ the shot path records a bounded high-speed app-owned clip from the
 selected mode, normally `1280x720 @ 120`, with an offscreen companion preview
@@ -163,17 +176,25 @@ the preview returns afterward.
   detector counts with **no speed value** (e.g. `INSUFFICIENT_DETECTIONS` —
   "At least four usable detections are required"). This is the app correctly
   refusing to show a wrong number.
-- Proof thumbnails are the processed recorded-HFR candidate frames the detector
-  saw, downscaled for display. The app streams the recording one decoded frame
-  at a time, immediately discards full-frame pixels after detection, and keeps
-  only bounded thumbnail proof plus compact blob/index/timestamp records. The
+- Proof thumbnails are the processed recorded-HFR frames the detector saw,
+  downscaled for display. The app streams the recording one decoded frame at a
+  time, retains only the bounded impact window long enough to build a luma
+  median background, differences each frame against that background, and emits
+  isolated motion-ball candidates. Color/ROI may help diagnostics but do not
+  gate Run Mode readiness. The app keeps only bounded thumbnail proof plus
+  compact blob/index/timestamp records after detection. The
+  recorded-HFR window decoder uses MediaCodec byte-buffer output, not the
+  crashed `ImageReader`/plane route; S10+ proof measured NV12/format 21 with
+  `stride=1280` and `sliceHeight=720`. The
   report shows recorded source size, detector working size, decoded metadata
   sample count, scanned decoded-frame count, candidate frame/blob counts,
   selected samples, unique `SENSOR_TIMESTAMP` count, requested fps, and
   drop/cadence gate verdicts.
-- `candidateFrames=0` means the selected color/ROI matched no ball-like blobs
-  in the processed frames. `selectedSamples<4` means blobs existed but not
-  enough usable track samples were selected.
+- `candidateFrames=0` means the median-background motion detector found no
+  isolated moving ball candidate in the processed impact-window frames.
+  `BALL_NOT_ISOLATED` means foreground moved but was too merged/ambiguous to
+  treat as the ball. `selectedSamples<4` means motion candidates existed but
+  not enough usable track samples were selected.
 
 After the result, Run Mode returns to ready/listening. **Repeat `shoot` as many
 times as you like — no re-setup needed.** Clearing a report does not clear setup
@@ -189,9 +210,16 @@ adb logcat -c                                   # clear first
 # fire a shot, then:
 adb logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECODE_"
 ```
-- Expected for a `shoot`/`Shoot`: `RECORDED_HFR_START`, then
-  `RECORDED_HFR_CAPTURE_SUCCESS`, then `RECORDED_ESTIMATE_STAGE ...`, followed
-  by `RECORDED_HFR_ESTIMATE_COMPLETE` or `RECORDED_HFR_ESTIMATE_NO_READ`.
+- Expected for a `shoot`/`Shoot`: `RECORDED_HFR_AUDIO_ARMED`, then
+  `RECORDED_HFR_START`, `RECORDED_HFR_FIRST_FRAME_ANCHOR`,
+  `RECORDED_HFR_READY_CUE_EMITTED`,
+  `RECORDED_HFR_MARKER_ACCEPTANCE_ENABLED`,
+  `RECORDED_HFR_IMPACT_DETECTED`, `RECORDED_ESTIMATE_WINDOW ...`,
+  `RECORDED_HFR_CAPTURE_SUCCESS`, followed by
+  `RECORDED_HFR_ESTIMATE_COMPLETE` or `RECORDED_HFR_ESTIMATE_NO_READ`.
+- If no marker is accepted, `RECORDED_HFR_IMPACT_NO_READ` should arrive promptly
+  after the 5-second actionable window and include strongest delta/ratio plus
+  the configured gates. A 40-second delay indicates a regression.
 - A blocked shot logs `VOICE_SHOOT_NOT_READY reason=<specific>`.
 - **Must NOT appear** for the `shoot` path: `VOICE_RECORD_SUCCESS`. That marker
   belongs to the old queued voice-record path and indicates the wrong route.
@@ -203,7 +231,12 @@ adb logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECO
 | Symptom | Cause / fix |
 |---|---|
 | `Run` button unavailable | Setup incomplete — the status names the missing gate; finish it. |
-| Always "No read" | No neon ball cleanly crossing the ROI in the ~0.8 s window; improve lighting/contrast, re-check Color + ROI + distance, re-time the throw. |
+| Always "No read" | No ball cleanly crossing the decoded impact window, no post-Ready loud delta was accepted, the phone/background moved enough to trip the global-motion/lighting guard, foreground motion was not isolated as a ball, or the path/speed gates rejected it. Check the no-impact log fields first; if the sound marker was accepted, read the detector reason and proof thumbnails before changing setup. |
+| `Recorded-HFR window decode exceeded the wall-clock budget` | The sound marker was accepted and a video window was selected, but post-recording decode did not finish in time. The decode budget is 10 seconds; if this still appears, inspect `RECORDED_ESTIMATE_WINDOW decoded=... syncPrefix=... decodeMs=... timedOut=true`. |
+| False trigger before your pop | The provisional gate is too permissive for the ambient setting. Field proof must include realistic outdoor/noisy ambient with no user pop; if ambient transients meet the gate, revisit the gate model instead of only changing constants. |
+| `Recorded window source frames were black or invalid` | The bounded impact window decoded as black/near-black or otherwise unusable; this is source proof, not a ball-tracking failure. Reconnect/test camera recording and check lighting/aim before changing detector settings. |
+| `motion-blur-risk` or exposure above `2000000ns` | The clip was bright enough to decode but the actual median exposure was too long for a trustworthy high-speed estimate. Add light or use a reviewed explicit manual exposure only for diagnostics; the app must not show mph from this path. |
+| You need proof imagery after no-read | In debug builds the app retains up to three app-private failed `speed_ball_...mp4` files, capped at 25 MB total. The UI proof panel should show bounded thumbnails whenever any in-window frame decoded; logs show only sanitized filename and bytes. |
 | Repeated `VOICE_RECORD_LISTEN_IDLE code=7` or timeout logs | Normal idle listening cycle; the recognizer did not hear `shoot` yet and should keep restarting. Speak clearly near the phone after Run Mode is green. |
 | `VOICE ERROR <code> - MANUAL READY` | Repeated non-idle recognizer failure; leave/re-enter Run Mode or relaunch, and use manual **`Shoot`** only as a fallback. |
 | Black screen persists after a shot | Should self-recover; if not, leave/re-enter Run Mode or relaunch. |
@@ -219,6 +252,9 @@ adb logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECO
 - **Capture-proof imagery is diagnostic, not accuracy proof.** It shows what
   the current attempt captured and what the detector selected, but the
   ground-truth speed validation gate remains open.
+- **Recorded-HFR uses AE by default.** Actual exposure min/median/max appears in
+  logs/report when Camera2 reports it; median exposure above 2 ms no-reads as
+  motion-blur risk.
 - **IMU level-sign** and the **human live-voice "shoot"** path are still open
   physical validation gates.
 - Voice recognition reliability varies by device/firmware, but Run Mode is
@@ -243,5 +279,7 @@ $ADB shell am start -n com.speedball.app/.MainActivity
 # 4) (optional) watch logs while you shoot
 $ADB logcat -c && $ADB logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECODE_"
 ```
-Then on the phone: **Setup** (permission → distance A/B + feet → color → ROI →
-level) → **Run** → **Shoot** (or say "shoot") with the neon ball crossing the ROI.
+Then on the phone: **Setup** (permission -> distance A/B + feet -> color ->
+optional ROI -> level) -> **Run** -> **Shoot** (or say "shoot") with the neon
+ball crossing the camera frame. Recorded-HFR can process without ROI; ROI is a
+setup/diagnostic aid, not a per-shot blocker.

@@ -274,6 +274,91 @@ class VisualEstimatePipelineTest {
     }
 
     @Test
+    fun depthCorrectedScaleAppliesPerspectiveRatioAndReportsLowConfidence() {
+        val samePlane = VisualEstimatePipeline.estimate(
+            samples = cleanSamples(),
+            calibration = calibration(pixels = 10.0, feet = 10.0),
+        )
+        val depthCorrected = VisualEstimatePipeline.estimate(
+            samples = cleanSamples(),
+            calibration = calibration(pixels = 10.0, feet = 10.0),
+            config = VisualEstimatePipelineConfig(
+                scaleMode = VisualEstimateScaleMode.DepthCorrected(
+                    ballPlaneDepthFeet = 1.0,
+                    calibrationPlaneDepthFeet = 7.0,
+                ),
+            ),
+        )
+
+        val samePlaneSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, samePlane)
+        val correctedSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, depthCorrected)
+        assertEquals(samePlaneSuccess.milesPerHour / 7.0, correctedSuccess.milesPerHour, 0.0001)
+        assertEquals(EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION, correctedSuccess.diagnostics.scaleBasis)
+        assertEquals(VisualEstimateConfidence.LOW, correctedSuccess.diagnostics.confidence)
+        assertTrue(correctedSuccess.diagnostics.assumptions.any { it.contains("Depth-corrected scale") })
+        assertTrue(correctedSuccess.diagnostics.assumptions.any { it.contains("toward-or-away") })
+        assertTrue(correctedSuccess.diagnostics.warnings.any { it.contains("factor=7.000") })
+    }
+
+    @Test
+    fun depthCorrectedScaleFailsLoudOnInvalidOrExtremeDepths() {
+        assertNoRead(
+            VisualEstimatePipeline.estimate(
+                samples = cleanSamples(),
+                calibration = validCalibration(),
+                config = VisualEstimatePipelineConfig(
+                    scaleMode = VisualEstimateScaleMode.DepthCorrected(
+                        ballPlaneDepthFeet = 0.0,
+                        calibrationPlaneDepthFeet = 7.0,
+                    ),
+                ),
+            ),
+            VisualEstimateNoReadReason.BAD_CALIBRATION,
+        )
+        assertNoRead(
+            VisualEstimatePipeline.estimate(
+                samples = cleanSamples(),
+                calibration = validCalibration(),
+                config = VisualEstimatePipelineConfig(
+                    scaleMode = VisualEstimateScaleMode.DepthCorrected(
+                        ballPlaneDepthFeet = 1.0,
+                        calibrationPlaneDepthFeet = 20.0,
+                    ),
+                ),
+            ),
+            VisualEstimateNoReadReason.BAD_CALIBRATION,
+        )
+    }
+
+    @Test
+    fun speedFloorHardRejectsOnlyWhenPolicyAppliesToScaleBasis() {
+        val samePlane = VisualEstimatePipeline.estimate(
+            samples = cleanSamples(),
+            calibration = calibration(pixels = 10.0, feet = 10.0),
+            config = VisualEstimatePipelineConfig(
+                minEstimateMilesPerHour = 80.0,
+                minimumSpeedGatePolicy = MinimumSpeedGatePolicy.SAME_PLANE_ONLY,
+            ),
+        )
+        val depthCorrected = VisualEstimatePipeline.estimate(
+            samples = cleanSamples(),
+            calibration = calibration(pixels = 10.0, feet = 10.0),
+            config = VisualEstimatePipelineConfig(
+                minEstimateMilesPerHour = 80.0,
+                minimumSpeedGatePolicy = MinimumSpeedGatePolicy.SAME_PLANE_ONLY,
+                scaleMode = VisualEstimateScaleMode.DepthCorrected(
+                    ballPlaneDepthFeet = 10.0,
+                    calibrationPlaneDepthFeet = 10.0,
+                ),
+            ),
+        )
+
+        assertNoRead(samePlane, VisualEstimateNoReadReason.AMBIGUOUS_TRACK)
+        val correctedSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, depthCorrected)
+        assertTrue(correctedSuccess.diagnostics.warnings.any { it.contains("Minimum hit-speed gate was skipped") })
+    }
+
+    @Test
     fun nonProgressingTrackNoReads() {
         assertNoRead(
             VisualEstimatePipeline.estimate(

@@ -34,8 +34,10 @@ appear only with the summoned operation controls, not as permanent camera
 clutter. The user enters the known distance in feet, slides the two vertical
 lines onto the measured field markers with smooth finger drag, uses the drawer
 toggle for coarse/fine drag precision, samples the ball color from camera
-pixels, and places the ROI around the
-expected hit path before running a live visual estimate or import estimate. The
+pixels, and may place an ROI around the expected hit path for setup visibility
+and legacy live/import diagnostics. Run Mode recorded-HFR does not require an
+ROI; when no valid ROI is present it scans the bounded 640x360 working frame
+and lets candidate/RANSAC caps plus trajectory gates reject background blobs. The
 distance field is replacement state: editing it after A/B lines are set
 overwrites the active known-distance feet value while preserving the current A/B
 line positions. The field remains raw user text while editing: clearing it stays
@@ -43,8 +45,9 @@ empty, partial text is allowed, and accepted numeric values are parsed separatel
 from the displayed text. Invalid distance text makes setup not ready instead of letting
 the next live or import estimate reuse an older distance. If `shoot` is
 recognized while setup is blocked, the app shows and logs the specific missing
-gate, such as missing color sample, invalid sampled HSV, missing/invalid ROI,
-missing distance setup, or invalid distance text. The
+gate, such as missing distance setup, invalid distance text, invalid level, or
+missing permission. Color remains an optional recorded-HFR discriminator; invalid
+or absent color does not block Run Mode recorded-HFR capture. The
 app can request camera permission, enumerate Camera2 high-speed modes from the
 device HAL, listen for voice commands, release the setup feed so the
 high-speed recorder can own the camera, start a bounded 120 fps MediaRecorder
@@ -54,10 +57,22 @@ through the Android picker.
 In the setup drawer, `Record 120` is a manual MediaRecorder diagnostic. `Est
 120` is the separate direct live diagnostic estimate path: it still uses the
 selected fixed 120 fps Camera2 high-speed mode, but it reads direct frames
-instead of recording an MP4. Run Mode `shoot` is different: after setup passes
-and the Ready/three-beep cue completes, it starts the recorded-HFR estimate path
-so the phone records a bounded app-owned high-speed clip and then processes that
-clip.
+instead of recording an MP4. Run Mode `shoot` is different: after setup passes,
+the app stops speech recognition, arms impact audio first, starts recorded HFR
+after the mic is listening, waits for the first video timestamp, and only then
+emits the Ready/three-beep cue. A post-Ready mouth pop, shouted pop, or impact
+sound is accepted as a loud ambient-relative timestamp marker; the app does not
+classify the sound type.
+Impact audio is processed as a stream. The Android mic worker feeds chunks into
+`ImpactAudioStreamingDetector`; the detector advances a monotonic scan cursor
+and evaluates each finalized baseline/window position once with the same
+fixed-window arithmetic as the batch compatibility API. This keeps the
+ready-after-arm phase gates intact while removing the previous repeated
+copy/rescan path that made no-impact take far longer than the 5-second
+actionable window. The current provisional S10+ gates are
+`thresholdMultiplier=2.5`, `minimumPeakDelta=100`, and
+`minimumBaselineRms=25.0`; they must be field-validated against both repeated
+pop detection and realistic outdoor/noisy ambient no-pop windows.
 When an estimate succeeds, the camera preview is covered by a black result
 screen with large bold white velocity, launch-angle, and carry-distance text.
 The `CLEAR` button dismisses the result screen and returns to the camera view.
@@ -67,31 +82,38 @@ attempt-scoped capture proof while the setup preview remains visible after
 capture recovery. The proof is a bounded contact sheet of the processed frames
 the detector saw. For Run Mode `shoot`, those thumbnails come from the
 recorded-HFR source after streaming decode and downscale for display. Full
-recorded-frame pixels are discarded immediately after blob detection; retained
-candidate records carry only compact position, original decoded frame index,
-timestamp, dimensions, and blobs. The report also shows source size, detector
-working size, decoded metadata sample count, scanned decoded-frame count,
-candidate frame/blob counts, selected samples, unique `SENSOR_TIMESTAMP` count,
-requested fps, and recorded-source drop/cadence gate verdicts. For the manual
-direct diagnostic path, proof thumbnails remain bounded low-resolution
+recorded-frame pixels are retained only for the bounded impact window long enough
+to build a luma median background, foreground masks, and isolated motion-ball
+candidates; then they are discarded. The recorded-HFR route retains only compact
+position, original decoded frame index, timestamp, dimensions, and motion-ball
+candidate blobs with foreground metrics. The report also shows source size,
+detector working size, decoded metadata sample count, scanned decoded-frame
+count, candidate frame/blob counts, selected samples, unique `SENSOR_TIMESTAMP`
+count, requested fps, and recorded-source drop/cadence gate verdicts. For the
+manual direct diagnostic path, proof thumbnails remain bounded low-resolution
 direct-readback frames.
 Zero captured frames means the attempt produced no imagery. Zero candidate
-frames means the selected color/ROI matched no blobs in the processed frames.
+frames means the median-background motion detector found no isolated usable ball
+candidate in the processed frames. `BALL_NOT_ISOLATED` means foreground moved,
+but it was too merged with a hand/body/bat or otherwise too ambiguous to become
+a ball candidate, or the frame contained too many isolated moving fragments to
+identify a single ball safely.
 
 The app now separates the visible workflow into two app-level modes:
 
 - **Setup Mode** is for configuring camera permission, high-speed mode, A/B
-  distance calipers, raw distance text, ball color, ROI, level, fallback, import,
+  distance calipers, raw distance text, ball color, optional ROI, level, fallback, import,
   and diagnostics. The live preview remains visible so the user can align setup.
 - **Run Mode** is for executing shots. It does not present setup editing as the
   normal surface. It shows the camera view, command readiness, a manual `Shoot`
   control, and a way back to Setup Mode.
 
 Setup is expected to happen once per physical setup. Repeated shots preserve A/B
-lines, distance text, color, ROI, and level unless the user explicitly changes
+lines, distance text, optional color, optional ROI, and level unless the user explicitly changes
 or recalibrates them. Entering Run Mode and every `shoot` re-checks the setup
-gates, so a lost preview, invalid distance, missing color, invalid ROI, missing
-level, or missing permission blocks the next capture with the specific reason.
+gates, so a lost preview, invalid distance, missing level, or
+missing permission blocks the next capture with the specific reason. Invalid ROI
+does not block recorded-HFR; it falls back to the full bounded working frame.
 Green ready/listening means the setup is valid and a command path is available.
 If Android speech recognition is unavailable or repeatedly errors, Run Mode
 shows a degraded/manual-ready state instead of green listening; manual `Shoot`
@@ -208,41 +230,99 @@ readiness-gated ready/beep sequence before the recorded-HFR estimate path.
 Explicit "record" variants and the `Record 120` button remain manual diagnostic
 recording paths, while Run Mode `shoot` uses the same high-speed recorder as
 the primary source. The recorded file is fed directly into the import/recorded
-estimate pipeline. The high-speed recorder
-requests a fast 1/1000s shutter through Camera2 manual exposure when the device
-and constrained high-speed session allow it; if that manual request is rejected,
-recording falls back to the device's auto-exposure path rather than failing the
-capture. Manual document-picker import remains available for saved clips and
-debugging. Picker imports validate a `content://` URI;
+estimate pipeline. The high-speed recorder now uses Camera2 auto-exposure by
+default so indoor 120 fps clips do not silently go black from a forced 1 ms
+shutter. Manual fast shutter remains an explicit diagnostic option. Each burst
+records requested exposure mode plus actual `CaptureResult.SENSOR_EXPOSURE_TIME`
+min/median/max when the device reports it; a recorded-HFR estimate no-reads
+instead of showing mph when the actual median exposure exceeds the coarse
+2 ms blur-risk gate. That gate is field-tunable and does not replace the
+existing residual and track-quality gates.
+Manual document-picker import remains available for saved clips and debugging.
+Picker imports validate a `content://` URI;
 recorded estimates use the app-private file directly and do not store a media
-URI or raw path in saved evidence. The app deletes the app-owned recorded MP4
-after streaming estimate processing. The app reads redacted metadata, probes
+URI or raw path in saved evidence. Successful recorded estimates delete the
+app-owned MP4 after proof/report construction. Failed recorded-HFR attempts in
+debug builds retain only bounded app-private proof clips: at most three matching
+`speed_ball_...mp4` files and at most 25 MB total, with logs limited to display
+name and byte count. Release builds clean failed clips instead of retaining
+debug proof media. The app reads redacted metadata, probes
 monotonic presentation timestamps as estimate evidence only for user-selected
 imports, and streams app-owned recorded-HFR shots one decoded frame at a time
-at a detector working size no larger than 1280x720. Each frame is scanned for
-color blobs while its full pixels are local, then the full pixels are dropped;
-only bounded candidate blob/index/timestamp records and bounded downscaled
-proof thumbnails survive. The same color detector, calibration state, and
-visual estimate reducer used by live/import estimates selects the straight hit
-window.
+at a detector working size no larger than 640x360 for the recorded-HFR route.
+Calibration points, optional ROI, motion-candidate gates, and max jump are transformed
+into that working coordinate space before detection. If the optional ROI is
+missing or invalid for recorded-HFR, the detector uses the whole bounded working
+frame. The sound-triggered recorded-HFR route builds a luma median background
+from the bounded impact window, differences each frame against that static
+background, applies bounded morphology, and emits only isolated motion-ball
+candidates. Large foreground masses are not treated as ball centroids; they
+no-read as `BALL_NOT_ISOLATED` unless a later reviewed isolation mechanism can
+separate a ball sub-candidate. Frames with too many isolated moving fragments
+also no-read as `BALL_NOT_ISOLATED`; they are not allowed to feed a plausible
+mph through RANSAC. The phone is
+expected to be stationary on a tripod or stable mount during the short window;
+dominant background motion fails loud instead of becoming a fake ball.
+Recorded-HFR adds config-scoped candidate limits of 32 blobs per frame, 90
+total blobs, 90 RANSAC candidates, and 4096 pair hypotheses. Exceeding those
+limits returns a
+resource no-read with proof instead of silently dropping blobs or continuing to
+a speed. The existing visual estimate reducer still selects the straight hit
+window, but it now receives recorded-HFR motion candidates instead of raw
+color-threshold islands on the Run Mode sound-window route. The candidate track
+must be smooth, mostly straight over the short impact window, size/shape
+consistent across frames, and above the same-plane hit-speed floor before mph
+can be reported. Sibling live/import paths keep their existing behavior unless
+they explicitly opt in.
 
-The sound-triggered recorded-HFR window workstream is currently implemented only
-as batch-1 foundations. A loud impact pop is treated as a timestamp marker, not
-as sound classification. The pure detector returns only derived scalars
-(peak/RMS ratio, sample index, offset, and anchored monotonic time), and raw PCM
-does not leave memory. `AudioRecord.getTimestamp()` is the intended audio clock
-anchor; the first positive Camera2 `SENSOR_TIMESTAMP` is the video anchor.
+The sound-triggered recorded-HFR window route is now the live Run Mode `shoot`
+path. A loud ambient-relative pop is treated as a timestamp marker, not as sound
+classification. The detector returns only derived scalars (peak/RMS ratio, peak
+delta, sample index, offset, and anchored monotonic time), and raw PCM does not
+leave memory. On the S10+ probe run from 2026-06-07, the back camera reported
+`SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME`, so the Android route anchors audio with
+`AudioRecord.getTimestamp(AudioTimestamp.TIMEBASE_BOOTTIME)`. The impact mic is
+armed before HFR starts, but accepted detections stay disabled until the first
+positive Camera2 `SENSOR_TIMESTAMP` exists and the app's own Ready cue has been
+blanked by audio sample index.
+
 `ImpactWindowMapper` computes a bounded container presentation-time window
 (`windowStartUs`/`windowEndUs`) and keeps the sensor impact frame index
-diagnostic-only because encoded MediaRecorder frames can be dropped. A separate
-windowed recorded-HFR gate accepts a bounded subset only when capture cadence,
-metadata, in-window PTS, source validity, and proof imagery all pass; it does
-not weaken the existing full-burst `metadata == scanned == SENSOR_TIMESTAMP`
-gate. The streaming estimator has an opt-in container-PTS-delta timing mode for
-sound-window candidates, and proof reports can carry optional window, anchor,
-decode-time, and source-validity diagnostics. The live `shoot` route is not yet
-switched to this foundation; Android recorder/microphone orchestration and S10+
-device proof remain required.
+diagnostic-only because encoded MediaRecorder frames can be dropped. The Android
+decoder uses `MediaExtractor.seekTo(windowStartUs, SEEK_TO_CLOSEST_SYNC)` and a
+`MediaCodec` byte-buffer decode with no render surface, emits only frames whose
+PTS lands in the requested window, and stops on the configured frame cap or
+wall-clock deadline. The production route intentionally forbids `ImageReader`,
+`MediaCodec.getOutputImage()`, and plane APIs because the S10+ crash was an
+uncatchable native failure in that API family. On the S10+ proof run from
+2026-06-07, byte-buffer output was `COLOR_FormatYUV420SemiPlanar` (`21`) with
+`stride=1280`, `sliceHeight=720`, and a convertible NV12 layout; the replacement
+source drained 24 frames from `0..191433 us` without a crash. A separate
+windowed recorded-HFR gate accepts this bounded subset only when capture
+cadence, metadata, in-window PTS, source validity, and proof imagery all pass.
+Source validity is computed from the optional ROI or full-frame decoded impact
+window, so an all-black or near-black window returns a
+source-invalid no-read with proof diagnostics before the detector can mislabel
+it as only insufficient detections. This does not weaken the existing full-burst
+`metadata == scanned == SENSOR_TIMESTAMP` gate used by non-windowed paths. The
+streaming estimator uses one wall-clock deadline for source open, decode,
+proof-only thumbnail passes, color detection, candidate reduction, and report
+assembly. It uses container-PTS-delta timing mode for sound-window candidates,
+and proof reports carry window, anchor, decode-time, candidate count, resource
+cap, exposure, and source-validity diagnostics. If capture diagnostics already
+show median exposure above the blur-risk gate, the estimator runs only a bounded
+proof-thumbnail pass and returns motion-blur no-read; it does not run candidate
+detection or RANSAC. If the decoder emits partial frames and then times out,
+the partial frames still build proof thumbnails and source-validity before the
+attempt returns no-read. If those partial frames are black, the report says
+source invalid/underexposed ahead of generic timing failure.
+
+`BurstStopMode.ExternalStop` means the marker path may stop recording early, not
+that recording can run indefinitely. The recorder still applies a duration
+failsafe long enough for the HFR start budget, Ready cue, 5-second actionable
+window, and 200 ms post-impact margin. If the audio path stalls or no marker is
+accepted, HFR is capped and the result fails loud instead of recording until the
+audio worker eventually returns.
 
 The Android import adapter
 prefers indexed frame extraction and falls back to timestamp extraction when the
@@ -260,8 +340,9 @@ and cannot satisfy this capture gate. Otherwise the app returns a no-read with
 proof thumbnails and detector counts but no mph.
 Import uses the sampled
 ball point to define the HSV color band, but does not force the track to start
-at that point; it skips leading frames before the ball enters the ROI, filters
-tiny color speckles, and uses RANSAC-style straight-line consensus to select a
+at that point; it skips leading frames before the ball enters the optional
+spatial region or full-frame scan, filters tiny color speckles, and uses
+RANSAC-style straight-line consensus to select a
 short high-velocity one-directional yellow-ball window. The accepted window
 must have enough inliers, low line residual, low slope change, and hit-like
 speed so a struck ball is distinguished from a slower toss/pitch arc. The
@@ -306,9 +387,9 @@ a typed failure, or bounded logcat diagnostics.
    Editing the feet value later replaces the active distance calibration and
    keeps the A/B points; invalid text blocks readiness without reformatting the
    field text.
-3. In Setup Mode, the user taps the live feed at the hanging ball/start reference so the app
-   samples the actual camera pixels for the HSV color band, then sets the ROI
-   around the expected ball path.
+3. In Setup Mode, the user may tap the live feed to sample the ball HSV color
+   and may set an ROI around the expected path. These help diagnostics and
+   legacy/import paths, but recorded-HFR Run Mode can arm without color or ROI.
 4. In Setup Mode, the app captures a still-phone IMU level snapshot and shows the horizon
    overlay; voice recording captures this automatically if it is missing.
 5. Once setup is valid, the user enters Run Mode. Run Mode shows ready/listening
@@ -400,6 +481,15 @@ The app must show "No read" rather than a wrong speed when:
   metadata sample count and capture-side unique `SENSOR_TIMESTAMP` count;
 - recorded-HFR `shoot` cannot prove capture-side sensor cadence stayed in the
   requested high-speed band;
+- recorded-HFR `shoot` exceeds the configured window-processing deadline,
+  candidate blob caps, RANSAC candidate caps, or pair-hypothesis cap;
+- recorded-HFR `shoot` detects no foreground motion, detects global
+  camera/background/lighting motion, cannot isolate the ball from merged
+  foreground, or finds a motion-candidate track that is not smooth,
+  high-velocity, and size/shape-consistent across frames;
+- recorded-HFR `shoot` has median actual exposure above the blur-risk gate,
+  in which case it may decode proof thumbnails but must not run full
+  detection/RANSAC or show mph;
 - decoded presentation timestamps are non-monotonic, have a median cadence
   outside the requested fps band, or contain a gap larger than `1.5 *
   expectedGap`;
@@ -572,8 +662,10 @@ Phase 10 workflow/result behavior:
 - Calibration state stores two image points and a known distance, but readiness
   always delegates to measurement-time `pixelsPerFoot()` validation.
 - Color state stores HSV sample, clamped tolerance, and optional ROI. The ROI is
-  clipped to frame bounds before detector use; missing sample, invalid HSV, bad
-  frame dimensions, or empty ROI stays not-ready/no-read.
+  clipped to frame bounds before detector use. Missing sample, invalid HSV, or
+  bad frame dimensions stays not-ready/no-read for paths that explicitly require
+  color. Recorded-HFR Run Mode treats color as optional evidence and falls back
+  to the full bounded working frame when ROI is absent.
 - Result formatting accepts only `MeasurementRunOutcome`. No calibration,
   color, preview, or readiness formatter can synthesize mph, launch angle,
   trajectory, carry, apex, or hang time.
@@ -602,18 +694,23 @@ Phase 10 workflow/result behavior:
   that draws from a local active-drag override and commits the final fraction
   at gesture end, editable distance in feet on the setup drawer page,
   on-screen drawer status for applied setup actions,
-  tap-to-sample live ball color from preview pixels, ROI rectangle only while
+  optional tap-to-sample live ball color from preview pixels, ROI rectangle only while
   setup controls are visible, and full tool hiding while caliper drag remains
   active on the camera image. Failed live color sampling
-  leaves color not-ready instead of using a hidden yellow default.
-  The `shoot` voice command checks readiness, prints `Ready to shoot`, speaks
-  `Ready`, plays three beeps, and then starts the recorded-HFR estimate path
-  only when the setup readiness gate passes. The visible preview is required for
-  setup. During recorded capture, the recorder owns the camera and uses an
-  offscreen companion preview surface, so the visible preview may temporarily go
-  black. Estimate proof frames come from the bounded recorded-HFR decode at the
-  configured detector working resolution, and the setup preview restarts after
-  completion, failure, or no-read.
+  leaves the optional color discriminator unavailable instead of using a hidden
+  yellow default.
+  The `shoot` voice command checks readiness, stops speech recognition, arms
+  impact audio first, starts recorded HFR after the mic is listening, waits for
+  the first video timestamp, speaks/plays the Ready cue, and enables marker
+  acceptance only after actual cue completion maps to an audio sample index. The
+  visible preview is required for setup. During recorded capture, the recorder
+  owns the camera and uses an offscreen companion preview surface, so the
+  visible preview may temporarily go black. Estimate proof frames come from the
+  bounded recorded-HFR decode at the 640x360 detector working resolution.
+  Recorded-HFR does not require an ROI for a shot; optional ROI improves setup
+  visibility and can narrow diagnostics, but full-frame candidate generation
+  remains bounded by the recorded-HFR blob and RANSAC budgets. The setup preview
+  restarts after completion, failure, or no-read.
   Successful estimates cover the preview with a black full-screen result
   overlay showing velocity, angle, and carry distance in large bold white text
   until the user taps `CLEAR`. The overlay is gated to current successful

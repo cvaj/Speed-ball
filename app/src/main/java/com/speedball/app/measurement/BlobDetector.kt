@@ -20,6 +20,39 @@ data class Blob(
     val centroid: ImagePoint,
     val bounds: PixelBounds,
     val compactness: Double,
+    val physicalMetrics: PhysicalBallCandidateMetrics? = null,
+    val motionMetrics: MotionBallCandidateMetrics? = null,
+)
+
+/** Motion-background evidence for a recorded-HFR candidate. */
+data class MotionBallCandidateMetrics(
+    val parentAreaPx: Int,
+    val parentAreaRatio: Double,
+    val foregroundAreaFraction: Double,
+    val touchesFrameEdge: Boolean,
+)
+
+/**
+ * Branch-specific physical-ball shape evidence for recorded-HFR candidates.
+ *
+ * `solidity`, `principalAxisRatio`, `roundness`, and `capsuleScore` are
+ * orientation-invariant detector metrics used before legacy bbox compactness.
+ * Mean HSV values and color standard deviations summarize the merged threshold
+ * pixels for cross-frame coherence checks, and `touchesFrameEdge` marks
+ * entry/exit candidates that are exempt from whole-track size-collapse checks.
+ */
+data class PhysicalBallCandidateMetrics(
+    val solidity: Double,
+    val principalAxisRatio: Double,
+    val roundness: Double,
+    val capsuleScore: Double,
+    val meanHueDegrees: Double,
+    val meanSaturation: Double,
+    val meanValue: Double,
+    val saturationStdDev: Double,
+    val valueStdDev: Double,
+    val touchesFrameEdge: Boolean,
+    val reason: RecordedHfrPhysicalDetectorReason? = null,
 )
 
 /** Detection settings for one ball-like colored blob. */

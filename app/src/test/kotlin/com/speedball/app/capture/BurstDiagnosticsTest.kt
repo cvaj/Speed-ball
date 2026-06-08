@@ -4,6 +4,7 @@ import com.speedball.app.decode.buildTimestampDiagnostics
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import kotlin.math.roundToLong
@@ -181,7 +182,44 @@ class BurstDiagnosticsTest {
     fun durationClampUsesSafeBounds() {
         assertEquals(DEFAULT_BURST_DURATION_MILLIS, clampBurstDurationMillis(-1L))
         assertEquals(1_000L, clampBurstDurationMillis(1_000L))
-        assertEquals(MAX_BURST_DURATION_MILLIS, clampBurstDurationMillis(4_000L))
+        assertEquals(7_700L, clampBurstDurationMillis(7_700L))
+        assertEquals(MAX_BURST_DURATION_MILLIS, clampBurstDurationMillis(10_000L))
+    }
+
+    @Test
+    fun burstOptionsDefaultToAutoExposure() {
+        val mode = HighSpeedMode(1280, 720, 120, 120, 120, recordSupported = true)
+
+        assertNull(BurstOptions(mode).preferredExposureTimeNanos)
+    }
+
+    @Test
+    fun exposureDiagnosticsSummarizeRequestedModeAndActualSamples() {
+        val diagnostics = buildBurstDiagnostics(
+            timestampsNanos = List(5) { index -> timestampNanos(index * 8.33) },
+            callbackCount = 5,
+            requestedDurationMillis = 40L,
+            fps = 120,
+            outputPath = "/private/path/burst.mp4",
+            fileBytes = 123L,
+            requestedExposureTimeNanos = 1_000_000L,
+            actualExposureTimeNanos = listOf(4_000_000L, 2_000_000L, 6_000_000L, 0L),
+        )
+
+        assertEquals("MANUAL", diagnostics.requestedExposureMode)
+        assertEquals(1_000_000L, diagnostics.requestedExposureTimeNanos)
+        assertEquals(3, diagnostics.actualExposureSampleCount)
+        assertEquals(2_000_000L, diagnostics.actualExposureMinNanos)
+        assertEquals(4_000_000L, diagnostics.actualExposureMedianNanos)
+        assertEquals(6_000_000L, diagnostics.actualExposureMaxNanos)
+        assertTrue(diagnostics.exposureSummary().contains("actualExposureNs=2000000/4000000/6000000"))
+    }
+
+    @Test
+    fun externalStopStillResolvesDurationFailsafe() {
+        assertEquals(7_700L, resolveBurstDurationFailsafeMillis(BurstStopMode.ExternalStop, 7_700L))
+        assertEquals(7_700L, resolveBurstDurationFailsafeMillis(BurstStopMode.FixedDuration, 7_700L))
+        assertEquals(MAX_BURST_DURATION_MILLIS, resolveBurstDurationFailsafeMillis(BurstStopMode.ExternalStop, 10_000L))
     }
 
     private fun diagnosticsWithUniqueCount(count: Int, gapMillis: Double): BurstDiagnostics =

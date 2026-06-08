@@ -168,7 +168,6 @@ data class Phase14WorkflowState(
         permissionReady &&
             geometry != null &&
             hasReadyScaleSetup() &&
-            hasReadyColorSetup() &&
             hasReadyLevelReference()
 
     fun buildCalibrationForActiveReadback(): CalibrationWorkflowState {

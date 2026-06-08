@@ -14,10 +14,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import android.view.PixelCopy
 import android.view.Surface
@@ -32,9 +34,13 @@ import androidx.compose.runtime.setValue
 import com.speedball.app.capture.BurstDiagnostics
 import com.speedball.app.capture.BurstCompanionSurfaceMode
 import com.speedball.app.capture.BurstFailure
+import com.speedball.app.capture.BurstFrameAnchor
 import com.speedball.app.capture.BurstOptions
 import com.speedball.app.capture.BurstOutcome
+import com.speedball.app.capture.BurstStopMode
 import com.speedball.app.capture.CameraLiveFeedController
+import com.speedball.app.capture.AudioVideoClockAnchor
+import com.speedball.app.capture.ContainerTimeWindow
 import com.speedball.app.capture.DirectCompanionTimingProofCapture
 import com.speedball.app.capture.DirectPixelProofConfig
 import com.speedball.app.capture.DirectPreviewControlReport
@@ -54,6 +60,9 @@ import com.speedball.app.capture.HighSpeedBurstRecorder
 import com.speedball.app.capture.HighSpeedCamera
 import com.speedball.app.capture.HighSpeedMode
 import com.speedball.app.capture.HighSpeedModesResult
+import com.speedball.app.capture.ImpactWindowMapper
+import com.speedball.app.capture.ImpactWindowMapping
+import com.speedball.app.capture.ImpactWindowRequest
 import com.speedball.app.capture.PreviewFrameOutcome
 import com.speedball.app.capture.DEFAULT_DIRECT_VISUAL_ESTIMATE_MAX_FRAMES
 import com.speedball.app.capture.DEFAULT_DIRECT_VISUAL_ESTIMATE_READBACK_HEIGHT
@@ -64,6 +73,12 @@ import com.speedball.app.capture.plannedDirectProofVariants
 import com.speedball.app.capture.previewFrameDiagnosticLogLines
 import com.speedball.app.capture.selectDefaultMode
 import com.speedball.app.capture.timestampSourceLogLine
+import com.speedball.app.capture.exposureSummary
+import com.speedball.app.audio.AndroidImpactAudioTrigger
+import com.speedball.app.audio.ImpactAudioArmedSession
+import com.speedball.app.audio.ImpactAudioEvent
+import com.speedball.app.audio.ImpactAudioTriggerConfig
+import com.speedball.app.audio.ImpactAudioTriggerResult
 import com.speedball.app.decode.BurstVideoDecoder
 import com.speedball.app.decode.DecodeCompletionGate
 import com.speedball.app.decode.DecodeFailure
@@ -74,8 +89,10 @@ import com.speedball.app.decode.buildDecodeWorkBounds
 import com.speedball.app.decode.runDecodeWithTimeout
 import com.speedball.app.decode.timestampAnchorDiagnosticLogLines
 import com.speedball.app.importing.AndroidImportVideoFrameSource
+import com.speedball.app.importing.AndroidRecordedHfrWindowFrameSource
 import com.speedball.app.importing.ImportContentAccess
 import com.speedball.app.importing.ImportContentSelection
+import com.speedball.app.importing.ImportCancellationSignal
 import com.speedball.app.importing.ImportEstimatePipeline
 import com.speedball.app.importing.ImportEvidenceExporter
 import com.speedball.app.importing.ImportEvidenceSummary
@@ -91,9 +108,15 @@ import com.speedball.app.importing.ImportVideoMetadata
 import com.speedball.app.importing.ImportVideoFrameSequence
 import com.speedball.app.importing.ImportWorkflowEvent
 import com.speedball.app.importing.ImportWorkflowState
+import com.speedball.app.importing.RecordedHfrByteBufferViabilityProbe
 import com.speedball.app.importing.RecordedHfrCaptureGate
+import com.speedball.app.importing.RecordedHfrDecodedWindowProof
+import com.speedball.app.importing.RecordedHfrDecodedWindowValidator
 import com.speedball.app.importing.RecordedHfrStreamingEstimate
 import com.speedball.app.importing.RecordedHfrStreamingEstimateConfig
+import com.speedball.app.importing.RecordedHfrStreamingTimingMode
+import com.speedball.app.importing.RecordedHfrRetentionPolicy
+import com.speedball.app.importing.RecordedHfrWindowCaptureGate
 import com.speedball.app.importing.RecordedHfrWorkingResolution
 import com.speedball.app.importing.RecordedHfrWorkingResolutionSelector
 import com.speedball.app.importing.SavedResultHistory
@@ -101,18 +124,21 @@ import com.speedball.app.importing.SavedResultSummary
 import com.speedball.app.importing.SavedResultSummaryStore
 import com.speedball.app.measurement.CalibrationWorkflowState
 import com.speedball.app.measurement.BlobDetectionConfig
+import com.speedball.app.measurement.CandidateReductionBudget
 import com.speedball.app.measurement.ColorWorkflowReadiness
 import com.speedball.app.measurement.ColorWorkflowState
 import com.speedball.app.measurement.ColorMath
 import com.speedball.app.measurement.FrameProcessingBounds
 import com.speedball.app.measurement.FrameDimensions
 import com.speedball.app.measurement.HsvColor
+import com.speedball.app.measurement.HsvThreshold
 import com.speedball.app.measurement.HsvTolerance
 import com.speedball.app.measurement.LevelReferenceDisplayRotation
 import com.speedball.app.measurement.LevelReferenceOutcome
 import com.speedball.app.measurement.LevelReferenceSnapshot
 import com.speedball.app.measurement.LevelReferenceSource
 import com.speedball.app.measurement.MeasurementCalibrationState
+import com.speedball.app.measurement.MinimumSpeedGatePolicy
 import com.speedball.app.measurement.MeasurementWorkflowState
 import com.speedball.app.measurement.NormalizedFramePoint
 import com.speedball.app.measurement.NormalizedFrameRect
@@ -122,6 +148,8 @@ import com.speedball.app.measurement.Phase14WorkflowEvent
 import com.speedball.app.measurement.Phase14WorkflowState
 import com.speedball.app.measurement.PreviewFrameTransform
 import com.speedball.app.measurement.PreviewScaleMode
+import com.speedball.app.measurement.RegionOfInterest
+import com.speedball.app.measurement.RecordedHfrMotionDetectorConfig
 import com.speedball.app.measurement.TrackExtractionConfig
 import com.speedball.app.measurement.VisualEstimateCaptureProof
 import com.speedball.app.measurement.VisualEstimateCaptureProofBuilder
@@ -165,6 +193,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var directVisualEstimateCapture: DirectVisualEstimateCapture
     private lateinit var levelReferenceCapture: DeviceLevelReferenceCapture
     private lateinit var cameraLiveFeedController: CameraLiveFeedController
+    private lateinit var impactAudioTrigger: AndroidImpactAudioTrigger
     private val burstVideoDecoder = BurstVideoDecoder()
     private val decodeCompletionGate = DecodeCompletionGate()
     private val decodeSupervisorExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -219,6 +248,11 @@ class MainActivity : ComponentActivity() {
     private var visualEstimateAttemptId = 0L
     private var currentVisualEstimateReport: VisualEstimateReport? = null
     private var dismissedVisualEstimateAttemptId: Long? = null
+    @Volatile private var activeImpactMapping: ImpactWindowMapping? = null
+    @Volatile private var activeImpactEvent: ImpactAudioEvent? = null
+    @Volatile private var activeImpactNoRead: String? = null
+    @Volatile private var activeImpactAudioSession: ImpactAudioArmedSession? = null
+    @Volatile private var activeImpactVideoAnchor: BurstFrameAnchor? = null
 
     private val requestCameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         updateShellState(status = if (it) "Permission granted" else "Permission denied")
@@ -254,6 +288,7 @@ class MainActivity : ComponentActivity() {
         directVisualEstimateCapture = DirectVisualEstimateCapture(this)
         levelReferenceCapture = DeviceLevelReferenceCapture(this)
         cameraLiveFeedController = CameraLiveFeedController(this)
+        impactAudioTrigger = AndroidImpactAudioTrigger(this)
         readySpeech = TextToSpeech(this) { status ->
             readySpeechReady = status == TextToSpeech.SUCCESS
             if (readySpeechReady) {
@@ -323,8 +358,10 @@ class MainActivity : ComponentActivity() {
             )
         }
         logTimestampSourceIfRequested()
+        startRecordedHfrByteBufferProbeIfRequested()
+        startRecordedHfrWindowSourceProbeIfRequested()
         startDebugImportIfRequested()
-        if (hasCameraPermission() || autoStartPending || autoStartPreviewPending || autoStartDirectProofPending || autoStartDirectVisualEstimatePending) {
+        if (!hasRecordedHfrDebugProbeIntent() && (hasCameraPermission() || autoStartPending || autoStartPreviewPending || autoStartDirectProofPending || autoStartDirectVisualEstimatePending)) {
             refreshModes()
         }
     }
@@ -377,6 +414,7 @@ class MainActivity : ComponentActivity() {
         cameraLiveFeedController.stop()
         stopLiveLevelReference()
         stopVoiceRecordListener()
+        impactAudioTrigger.cancel()
         readySpeech?.shutdown()
         readySpeech = null
         readySpeechReady = false
@@ -553,7 +591,7 @@ class MainActivity : ComponentActivity() {
                 } else if (heard.any(::isRecordCommand)) {
                     Log.i(logTag, "VOICE_RECORD_COMMAND recognized")
                     stopVoiceRecordListener()
-                    startTimedRecordingEstimate()
+                    handleShootCommand()
                 } else {
                     Log.i(logTag, "VOICE_RECORD_IGNORED alternatives=${heard.size}")
                     updateShellState(status = "Say shoot or record")
@@ -571,7 +609,7 @@ class MainActivity : ComponentActivity() {
                 } else if (heard.any(::isRecordCommand)) {
                     Log.i(logTag, "VOICE_RECORD_COMMAND partial")
                     stopVoiceRecordListener()
-                    startTimedRecordingEstimate()
+                    handleShootCommand()
                 }
             }
 
@@ -608,8 +646,8 @@ class MainActivity : ComponentActivity() {
         }
         stopVoiceRecordListener()
         runCommandState = SpeedBallRunCommandState.Capturing
-        updateShellState(status = "Ready to shoot")
-        playReadySignalThenRecordedHfrEstimate()
+        updateShellState(status = "Arming impact audio")
+        startSoundTriggeredRecordingEstimate()
     }
 
     private fun shootNotReadyStatus(): String? {
@@ -622,12 +660,8 @@ class MainActivity : ComponentActivity() {
         val calibrationNoRead = calibrationWorkflowState.noReadOrNull()
         val hasBallFallback = phase14WorkflowState.knownBallDiameterFeet != null
         if (calibrationNoRead != null && !hasBallFallback) return calibrationNoRead.message
-        val geometry = phase14WorkflowState.geometry ?: return "Camera geometry required"
-        phase14ColorNotReadyStatus()?.let { return it }
-        val colorReadiness = colorWorkflowState.readiness(geometry.readback.width, geometry.readback.height)
-        if (colorReadiness is ColorWorkflowReadiness.NotReady) return colorReadiness.message
         if (phase14WorkflowState.levelReference?.hasOnlyFiniteValues() != true) return "Level required"
-        return if (phase14WorkflowState.canArm()) null else "Setup not ready"
+        return null
     }
 
     private fun phase14ColorNotReadyStatus(): String? {
@@ -643,28 +677,88 @@ class MainActivity : ComponentActivity() {
         ) {
             return "Sampled ball color is outside the valid HSV range."
         }
-        val roi = phase14WorkflowState.regionOfInterest ?: return "Set the ball-flight ROI before measuring."
-        return if (roi.isInFrame()) null else "Color region does not overlap the frame."
+        return null
     }
 
-    private fun playReadySignalThenRecordedHfrEstimate() {
-        readySignalPending = true
-        speakReady()
+    private fun playReadySignalAfterArmed(onComplete: (Long, String) -> Unit) {
+        var ttsCompleteNanos: Long? = null
+        var ttsCompletionSource = "beeps_only"
+        var beepsCompleteNanos: Long? = null
+        var completed = false
+
+        fun completeIfReady() {
+            val tts = ttsCompleteNanos ?: return
+            val beeps = beepsCompleteNanos ?: return
+            if (completed) return
+            completed = true
+            onComplete(maxOf(tts, beeps), ttsCompletionSource)
+        }
+
+        fun markTtsComplete(source: String) {
+            mainHandler.post {
+                if (ttsCompleteNanos == null) {
+                    ttsCompletionSource = source
+                    ttsCompleteNanos = SystemClock.elapsedRealtimeNanos()
+                    completeIfReady()
+                }
+            }
+        }
+
+        val utteranceId = "$READY_TTS_UTTERANCE_ID-$visualEstimateAttemptId"
+        val speech = readySpeech
+        if (readySpeechReady && speech != null) {
+            speech.setOnUtteranceProgressListener(
+                object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) = Unit
+
+                    override fun onDone(utteranceId: String?) {
+                        if (utteranceId?.startsWith(READY_TTS_UTTERANCE_ID) == true) {
+                            markTtsComplete("tts_done")
+                        }
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        if (utteranceId?.startsWith(READY_TTS_UTTERANCE_ID) == true) {
+                            markTtsComplete("tts_error")
+                        }
+                    }
+
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        if (utteranceId?.startsWith(READY_TTS_UTTERANCE_ID) == true) {
+                            markTtsComplete("tts_error_$errorCode")
+                        }
+                    }
+                },
+            )
+            val speakResult = speech.speak("Ready", TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+            if (speakResult == TextToSpeech.ERROR) {
+                markTtsComplete("tts_error")
+            } else {
+                mainHandler.postDelayed(
+                    {
+                        if (ttsCompleteNanos == null) {
+                            readySpeech?.stop()
+                            markTtsComplete("tts_timeout_stop")
+                        }
+                    },
+                    READY_TTS_MAX_WAIT_MILLIS,
+                )
+            }
+        } else {
+            ttsCompleteNanos = SystemClock.elapsedRealtimeNanos()
+        }
+
         repeat(READY_BEEP_COUNT) { index ->
             mainHandler.postDelayed({ playReadyBeep() }, index * READY_BEEP_SPACING_MILLIS)
         }
         mainHandler.postDelayed(
             {
-                readySignalPending = false
-                startTimedRecordingEstimate()
+                beepsCompleteNanos = SystemClock.elapsedRealtimeNanos()
+                completeIfReady()
             },
-            READY_SIGNAL_TO_ESTIMATE_DELAY_MILLIS,
+            readyBeepSequenceMillis(),
         )
-    }
-
-    private fun speakReady() {
-        if (!readySpeechReady) return
-        readySpeech?.speak("Ready", TextToSpeech.QUEUE_FLUSH, null, "ready-to-shoot")
     }
 
     private fun playReadyBeep() {
@@ -677,6 +771,11 @@ class MainActivity : ComponentActivity() {
             (READY_BEEP_DURATION_MILLIS + READY_BEEP_RELEASE_PADDING_MILLIS).toLong(),
         )
     }
+
+    private fun readyBeepSequenceMillis(): Long =
+        (READY_BEEP_COUNT - 1).coerceAtLeast(0) * READY_BEEP_SPACING_MILLIS +
+            READY_BEEP_DURATION_MILLIS +
+            READY_BEEP_RELEASE_PADDING_MILLIS
 
     private fun isShootCommand(text: String): Boolean =
         text.lowercase(Locale.US)
@@ -814,6 +913,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopBurst() {
+        impactAudioTrigger.cancel()
         burstRecorder.stopActive()
         cancelDecodeProof()
         restartLiveCameraFeedIfReady()
@@ -895,6 +995,360 @@ class MainActivity : ComponentActivity() {
         captureStatus.contains("record", ignoreCase = true) ||
             captureStatus.contains("running", ignoreCase = true)
 
+    private fun startSoundTriggeredRecordingEstimate() {
+        readySignalPending = true
+        if (!hasCameraPermission()) {
+            readySignalPending = false
+            lastFailure = BurstOutcome.Failure(BurstFailure.CAMERA_PERMISSION_DENIED, "Camera permission is required.")
+            updateShellState(status = "Permission required")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            readySignalPending = false
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = "Microphone permission is required for impact-triggered recording.",
+                failure = true,
+                proof = null,
+                status = "Recorded HFR no-read",
+            )
+            return
+        }
+        if (modes.isEmpty()) refreshModes()
+        val mode = selectedMode
+        if (mode == null) {
+            readySignalPending = false
+            lastFailure = BurstOutcome.Failure(BurstFailure.UNSUPPORTED_MODE, "A 120 fps mode is required.")
+            updateShellState(status = "Voice capture unavailable")
+            return
+        }
+        updatePhase14Geometry()
+        if (phase14WorkflowState.levelReference?.hasOnlyFiniteValues() != true) {
+            readySignalPending = false
+            captureLevelReference(status = "Leveling before record", onSuccess = { startSoundTriggeredRecordingEstimate() })
+            return
+        }
+        beginVisualEstimateAttempt()
+        val attemptId = visualEstimateAttemptId
+        activeImpactMapping = null
+        activeImpactEvent = null
+        activeImpactNoRead = null
+        activeImpactAudioSession = null
+        activeImpactVideoAnchor = null
+        phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.StartCapture)
+        stopVoiceRecordListener()
+        stopLiveLevelReference()
+        lastFailure = null
+        lastDecodeOutcome = null
+        lastPreviewOutcome = null
+        lastDirectProofResult = null
+        lastDirectVisualEstimateOutcome = null
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = null
+        lastImportExportText = null
+        importWorkflowState = ImportWorkflowState()
+        captureStatus = "Impact audio arming"
+        runCommandState = SpeedBallRunCommandState.Capturing
+        Log.i(logTag, "RECORDED_HFR_AUDIO_ARMING attempt=$attemptId mode=${mode.label.compactForLog()} source=SOUND_TRIGGERED_WINDOW")
+        updateShellState(status = captureStatus)
+        cameraLiveFeedController.stop()
+        impactAudioTrigger.start(
+            config = soundTriggerConfig(mode),
+            onArmed = { session ->
+                mainHandler.post {
+                    if (attemptId == visualEstimateAttemptId) {
+                        handleImpactAudioArmed(attemptId, mode, session)
+                    }
+                }
+            },
+            onResult = { result ->
+                mainHandler.post {
+                    if (attemptId == visualEstimateAttemptId) {
+                        handleImpactAudioResult(attemptId, mode, result)
+                    }
+                }
+            },
+        )
+    }
+
+    private fun handleImpactAudioArmed(
+        attemptId: Long,
+        mode: HighSpeedMode,
+        session: ImpactAudioArmedSession,
+    ) {
+        activeImpactAudioSession = session
+        captureStatus = "Impact audio armed"
+        Log.i(
+            logTag,
+            "RECORDED_HFR_AUDIO_ARMED attempt=$attemptId audioFrame=${session.anchor.framePosition} sampleRate=${session.anchor.sampleRateHz}",
+        )
+        updateShellState(status = captureStatus)
+        startRecordedHfrAfterImpactAudioArmed(attemptId, mode, session)
+    }
+
+    private fun startRecordedHfrAfterImpactAudioArmed(
+        attemptId: Long,
+        mode: HighSpeedMode,
+        session: ImpactAudioArmedSession,
+    ) {
+        captureStatus = "Recorded HFR starting"
+        Log.i(logTag, "RECORDED_HFR_START attempt=$attemptId mode=${mode.label.compactForLog()} source=SOUND_TRIGGERED_WINDOW")
+        updateShellState(status = captureStatus)
+        val immediateFailure = burstRecorder.start(
+            BurstOptions(
+                mode = mode,
+                durationMillis = SOUND_TRIGGER_TOTAL_RECORDING_MILLIS,
+                companionSurfaceMode = BurstCompanionSurfaceMode.OFFSCREEN_PREVIEW,
+                stopMode = BurstStopMode.ExternalStop,
+                onFirstFrameAnchor = { anchor ->
+                    mainHandler.post {
+                        if (attemptId == visualEstimateAttemptId) {
+                            handleRecordedHfrFirstFrameAnchor(attemptId, mode, session, anchor)
+                        }
+                    }
+                },
+            ),
+            previewSurface,
+            modes,
+        ) { outcome ->
+            runOnUiThread {
+                when (outcome) {
+                    is BurstOutcome.Success -> {
+                        lastDiagnostics = outcome.diagnostics
+                        lastFailure = null
+                        captureStatus = "Recorded HFR window decoding"
+                        Log.i(
+                            logTag,
+                            "RECORDED_HFR_CAPTURE_SUCCESS attempt=$visualEstimateAttemptId callbacks=${outcome.diagnostics.callbackCount} " +
+                                "uniqueSensorTs=${outcome.diagnostics.uniqueTimestampCount} medianGapPass=${outcome.diagnostics.medianGapPassesRateBand} " +
+                                "captureProofPass=${outcome.diagnostics.captureProofPasses} source=${outcome.width}x${outcome.height}@${outcome.requestedFps} " +
+                                "companion=${outcome.companionSurfaceMode} file=${outcome.diagnostics.displayOutputName} bytes=${outcome.diagnostics.fileBytes} " +
+                                outcome.diagnostics.exposureSummary(),
+                        )
+                        updateShellState(status = captureStatus)
+                        startRecordedWindowEstimate(outcome)
+                    }
+                    is BurstOutcome.Failure -> {
+                        readySignalPending = false
+                        impactAudioTrigger.cancel()
+                        lastFailure = outcome
+                        Log.e(logTag, "RECORDED_HFR_CAPTURE_FAILURE attempt=$visualEstimateAttemptId reason=${outcome.reason} message=${outcome.message.compactForLog()}")
+                        finishRecordedVisualEstimateNoRead(
+                            reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                            message = outcome.message,
+                            failure = true,
+                            proof = null,
+                            status = "Recorded HFR capture failed",
+                        )
+                    }
+                }
+            }
+        }
+        if (immediateFailure != null) {
+            readySignalPending = false
+            impactAudioTrigger.cancel()
+            lastFailure = immediateFailure
+            Log.e(logTag, "RECORDED_HFR_CAPTURE_FAILURE attempt=$visualEstimateAttemptId reason=${immediateFailure.reason} message=${immediateFailure.message.compactForLog()}")
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = immediateFailure.message,
+                failure = true,
+                proof = null,
+                status = "Recorded HFR capture failed",
+            )
+        }
+    }
+
+    private fun handleRecordedHfrFirstFrameAnchor(
+        attemptId: Long,
+        mode: HighSpeedMode,
+        session: ImpactAudioArmedSession,
+        anchor: BurstFrameAnchor,
+    ) {
+        activeImpactVideoAnchor = anchor
+        val videoReadySampleIndex = session.anchor.sampleIndexForElapsedRealtime(anchor.elapsedRealtimeNanos)
+        if (videoReadySampleIndex == null) {
+            readySignalPending = false
+            activeImpactNoRead = "BAD_AUDIO_VIDEO_ANCHOR"
+            impactAudioTrigger.cancel()
+            burstRecorder.stopActive()
+            Log.i(logTag, "RECORDED_HFR_IMPACT_NO_READ reason=BAD_AUDIO_VIDEO_ANCHOR")
+            return
+        }
+        session.markVideoReady(videoReadySampleIndex)
+        captureStatus = "Recorded HFR cueing"
+        Log.i(
+            logTag,
+            "RECORDED_HFR_FIRST_FRAME_ANCHOR attempt=$attemptId source=${anchor.timestampSource.logLabel} videoReadySample=$videoReadySampleIndex",
+        )
+        updateShellState(status = captureStatus)
+        playReadySignalAfterArmed { cueCompleteElapsedNanos, cueCompletionSource ->
+            val acceptElapsedNanos = cueCompleteElapsedNanos + READY_CUE_ACCEPT_MARGIN_MILLIS * 1_000_000L
+            val acceptAfterSampleIndex = session.anchor.sampleIndexForElapsedRealtime(acceptElapsedNanos)
+            if (acceptAfterSampleIndex == null) {
+                readySignalPending = false
+                activeImpactNoRead = "BAD_READY_CUE_AUDIO_ANCHOR"
+                impactAudioTrigger.cancel()
+                burstRecorder.stopActive()
+                Log.i(logTag, "RECORDED_HFR_IMPACT_NO_READ reason=BAD_READY_CUE_AUDIO_ANCHOR")
+                return@playReadySignalAfterArmed
+            }
+            session.enableAcceptance(acceptAfterSampleIndex)
+            readySignalPending = false
+            captureStatus = "Recorded HFR ready"
+            Log.i(
+                logTag,
+                "RECORDED_HFR_READY_CUE_EMITTED attempt=$attemptId completionSource=$cueCompletionSource acceptAfterSample=$acceptAfterSampleIndex",
+            )
+            Log.i(logTag, "RECORDED_HFR_MARKER_ACCEPTANCE_ENABLED attempt=$attemptId sampleIndex=$acceptAfterSampleIndex")
+            updateShellState(status = captureStatus)
+        }
+    }
+
+    private fun handleImpactAudioResult(
+        attemptId: Long,
+        mode: HighSpeedMode,
+        result: ImpactAudioTriggerResult,
+    ) {
+        when (result) {
+            is ImpactAudioTriggerResult.Detected -> handleImpactAudioDetected(attemptId, mode, result)
+            is ImpactAudioTriggerResult.NoImpact -> {
+                readySignalPending = false
+                activeImpactNoRead = "NO_IMPACT_SOUND_DETECTED"
+                Log.i(
+                    logTag,
+                    "RECORDED_HFR_IMPACT_NO_READ reason=NO_IMPACT_SOUND_DETECTED armed=${activeImpactAudioSession != null} " +
+                        "samples=${result.scannedSamples} actionableSamples=${result.actionableSamples} " +
+                        "preReady=${result.preReadyTransientCount} blanked=${result.blankedTransientCount} belowThreshold=${result.belowThresholdTransientCount} " +
+                        "strongestDelta=${result.strongestPostReadyPeakDelta.format(2)} strongestRatio=${result.strongestPostReadyRatio.format(2)} " +
+                        "minimumDelta=${result.minimumPeakDelta} minimumBaselineRms=${result.minimumBaselineRms.format(2)}",
+                )
+                if (activeImpactVideoAnchor == null) {
+                    finishRecordedVisualEstimateNoRead(
+                        reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                        message = "Impact audio did not detect a post-ready marker before HFR produced a usable video anchor.",
+                        failure = false,
+                        proof = null,
+                        status = "Recorded HFR no-read",
+                    )
+                } else {
+                    burstRecorder.stopActive()
+                }
+            }
+            is ImpactAudioTriggerResult.PermissionDenied -> {
+                readySignalPending = false
+                activeImpactNoRead = result.message
+                Log.i(logTag, "RECORDED_HFR_IMPACT_NO_READ reason=MIC_PERMISSION")
+                finishOrStopAfterImpactAudioFailure(
+                    message = result.message,
+                    failure = true,
+                )
+            }
+            is ImpactAudioTriggerResult.ResourceFailure -> {
+                readySignalPending = false
+                activeImpactNoRead = result.message
+                Log.i(logTag, "RECORDED_HFR_IMPACT_NO_READ reason=RESOURCE_FAILURE message=${result.message.compactForLog()}")
+                finishOrStopAfterImpactAudioFailure(
+                    message = result.message,
+                    failure = true,
+                )
+            }
+        }
+    }
+
+    private fun finishOrStopAfterImpactAudioFailure(
+        message: String,
+        failure: Boolean,
+    ) {
+        if (activeImpactVideoAnchor == null) {
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = message,
+                failure = failure,
+                proof = null,
+                status = "Recorded HFR no-read",
+            )
+        } else {
+            burstRecorder.stopActive()
+        }
+    }
+
+    private fun handleImpactAudioDetected(
+        attemptId: Long,
+        mode: HighSpeedMode,
+        result: ImpactAudioTriggerResult.Detected,
+    ) {
+        val anchor = activeImpactVideoAnchor
+        if (anchor == null) {
+            readySignalPending = false
+            activeImpactNoRead = "BAD_AUDIO_VIDEO_ANCHOR"
+            Log.i(logTag, "RECORDED_HFR_IMPACT_NO_READ reason=BAD_AUDIO_VIDEO_ANCHOR")
+            burstRecorder.stopActive()
+            return
+        }
+        val clockAnchor = AudioVideoClockAnchor(
+            firstFrameSensorTimestampNanos = anchor.sensorTimestampNanos,
+            firstFrameElapsedRealtimeNanos = anchor.elapsedRealtimeNanos,
+            recorderStartCommandElapsedNanos = anchor.recorderStartCommandElapsedNanos,
+            timestampSource = anchor.timestampSource,
+            endToEndAnchorErrorNanos = defaultSoundWindowAnchorErrorNanos(mode),
+        )
+        when (
+            val mapped = ImpactWindowMapper.map(
+                anchor = clockAnchor,
+                request = ImpactWindowRequest(
+                    impactElapsedRealtimeNanos = result.event.elapsedRealtimeNanos,
+                    requestedFps = mode.fps,
+                    postImpactMillis = SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS,
+                    maxPreImpactMarginFrames = SOUND_TRIGGER_MAX_PRE_IMPACT_FRAMES,
+                ),
+            )
+        ) {
+            is ImportValidationResult.NoRead -> {
+                readySignalPending = false
+                activeImpactNoRead = mapped.message
+                Log.i(logTag, "RECORDED_HFR_IMPACT_NO_READ reason=${mapped.message.compactForLog()}")
+                burstRecorder.stopActive()
+            }
+            is ImportValidationResult.Success -> {
+                readySignalPending = false
+                activeImpactEvent = result.event
+                activeImpactMapping = mapped.value
+                Log.i(
+                    logTag,
+                    "RECORDED_HFR_IMPACT_DETECTED attempt=$attemptId offsetMs=${result.event.offsetMillis.format(2)} " +
+                        "impactFrame=${mapped.value.sensorDiagnosticFrameIndex} anchorErrorMs=${(mapped.value.endToEndAnchorErrorNanos / 1_000_000.0).format(2)} " +
+                        "peakDelta=${result.event.peakDelta.format(2)} ratio=${result.event.triggerRatio.format(2)}",
+                )
+                Log.i(
+                    logTag,
+                    "RECORDED_ESTIMATE_WINDOW windowStartUs=${mapped.value.window.windowStartUs} windowEndUs=${mapped.value.window.windowEndUs} " +
+                        "postFrames=${mapped.value.window.postImpactFrameCount} preMarginFrames=${mapped.value.window.preImpactMarginFrames} " +
+                        "totalFrames=${mapped.value.window.maxFrames} fps=${mode.fps}",
+                )
+                mainHandler.postDelayed({ burstRecorder.stopActive() }, SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS)
+            }
+        }
+    }
+
+    private fun soundTriggerConfig(mode: HighSpeedMode): ImpactAudioTriggerConfig =
+        ImpactAudioTriggerConfig(
+            sampleRateHz = SOUND_TRIGGER_SAMPLE_RATE_HZ,
+            baselineSampleCount = SOUND_TRIGGER_BASELINE_SAMPLES,
+            triggerWindowSampleCount = SOUND_TRIGGER_WINDOW_SAMPLES,
+            thresholdMultiplier = SOUND_TRIGGER_THRESHOLD_MULTIPLIER,
+            minimumPeakDelta = SOUND_TRIGGER_MINIMUM_PEAK_DELTA,
+            minimumBaselineRms = SOUND_TRIGGER_MINIMUM_BASELINE_RMS,
+            cooldownSampleCount = SOUND_TRIGGER_COOLDOWN_SAMPLES,
+            maxArmSamples = (SOUND_TRIGGER_SAMPLE_RATE_HZ * (SOUND_TRIGGER_TOTAL_AUDIO_BUFFER_MILLIS / 1_000.0)).toInt()
+                .coerceAtLeast(mode.fps),
+            actionableSampleCount = (SOUND_TRIGGER_SAMPLE_RATE_HZ * (SOUND_TRIGGER_USER_ACTIONABLE_MILLIS / 1_000.0)).toInt()
+                .coerceAtLeast(mode.fps),
+        )
+
+    private fun defaultSoundWindowAnchorErrorNanos(mode: HighSpeedMode): Long =
+        1_000_000_000L / mode.fps
+
     private fun startTimedRecordingEstimate() {
         readySignalPending = false
         if (!hasCameraPermission()) {
@@ -951,7 +1405,8 @@ class MainActivity : ComponentActivity() {
                             "RECORDED_HFR_CAPTURE_SUCCESS attempt=$visualEstimateAttemptId callbacks=${outcome.diagnostics.callbackCount} " +
                                 "uniqueSensorTs=${outcome.diagnostics.uniqueTimestampCount} medianGapPass=${outcome.diagnostics.medianGapPassesRateBand} " +
                                 "captureProofPass=${outcome.diagnostics.captureProofPasses} source=${outcome.width}x${outcome.height}@${outcome.requestedFps} " +
-                                "companion=${outcome.companionSurfaceMode} file=${outcome.diagnostics.displayOutputName} bytes=${outcome.diagnostics.fileBytes}",
+                                "companion=${outcome.companionSurfaceMode} file=${outcome.diagnostics.displayOutputName} bytes=${outcome.diagnostics.fileBytes} " +
+                                outcome.diagnostics.exposureSummary(),
                         )
                         updateShellState(status = captureStatus)
                         startRecordedEstimate(outcome)
@@ -1006,6 +1461,60 @@ class MainActivity : ComponentActivity() {
                 finishImportRunOutcome(estimate, completePrefix = "Recorded")
             }
         }
+    }
+
+    private fun startRecordedWindowEstimate(outcome: BurstOutcome.Success) {
+        val file = outcome.outputFile
+        val fps = outcome.requestedFps ?: selectedMode?.fps
+        val mapping = activeImpactMapping
+        if (file == null || fps == null || !file.isFile || file.length() <= 0L) {
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                message = "Recorded capture did not produce a usable video file.",
+                failure = true,
+                proof = null,
+                status = "Recorded HFR no-read",
+            )
+            return
+        }
+        if (mapping == null) {
+            val message = activeImpactNoRead ?: "NO_IMPACT_SOUND_DETECTED"
+            retainRecordedHfrFailure(file, "no-impact")
+            finishRecordedVisualEstimateNoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                message = message,
+                failure = false,
+                proof = null,
+                status = "Recorded HFR no-read",
+            )
+            return
+        }
+        decodeWorkerExecutor.execute {
+            val estimate = runRecordedWindowEstimate(file, fps, outcome.diagnostics, mapping)
+            applyRecordedHfrRetention(file, estimate)
+            runOnUiThread {
+                finishImportRunOutcome(estimate, completePrefix = "Recorded")
+            }
+        }
+    }
+
+    private fun applyRecordedHfrRetention(file: File, outcome: ImportRunOutcome) {
+        when (outcome) {
+            is ImportRunOutcome.Estimate -> {
+                RecordedHfrRetentionPolicy.cleanupSuccess(file)
+                Log.i(logTag, "RECORDED_HFR_RETAIN retained=false reason=success file=${RecordedHfrRetentionPolicy.displayName(file)}")
+            }
+            is ImportRunOutcome.NoRead -> retainRecordedHfrFailure(file, outcome.reason.name)
+        }
+    }
+
+    private fun retainRecordedHfrFailure(file: File, reason: String) {
+        val retention = RecordedHfrRetentionPolicy.retainFailure(file, debugBuild = isDebuggableBuild())
+        Log.i(
+            logTag,
+            "RECORDED_HFR_RETAIN retained=${retention.retained} reason=${reason.compactForLog()} " +
+                "file=${retention.displayName} bytes=${retention.bytes}",
+        )
     }
 
     private fun startPreviewSpike() {
@@ -1452,6 +1961,97 @@ class MainActivity : ComponentActivity() {
         if (!autoLogTimestampSourcePending) return
         autoLogTimestampSourcePending = false
         Log.i(logTag, timestampSourceLogLine(highSpeedCamera.readBackCameraTimestampSource()))
+    }
+
+    private fun startRecordedHfrByteBufferProbeIfRequested() {
+        if (!intent.getBooleanExtra("autoProbeRecordedHfrByteBuffer", false) || !isDebuggableBuild()) return
+        val explicitPath = intent.getStringExtra("recordedHfrProbePath")
+        val file = explicitPath?.let(::File) ?: latestRecordedHfrMovieFile()
+        if (file == null) {
+            Log.e(logTag, "RECORDED_HFR_BYTEBUFFER_SPIKE_NO_READ reason=missing_file")
+            return
+        }
+        decodeWorkerExecutor.execute {
+            when (val result = RecordedHfrByteBufferViabilityProbe.run(file)) {
+                is ImportValidationResult.NoRead -> Log.e(
+                    logTag,
+                    "RECORDED_HFR_BYTEBUFFER_SPIKE_NO_READ file=${file.displayNameOnly()} reason=${result.reason} message=${result.message.compactForLog()}",
+                )
+                is ImportValidationResult.Success -> Log.i(
+                    logTag,
+                    "RECORDED_HFR_BYTEBUFFER_SPIKE_RESULT file=${file.displayNameOnly()} ${result.value.toLogFields()}",
+                )
+            }
+        }
+    }
+
+    private fun latestRecordedHfrMovieFile(): File? =
+        getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES)
+            ?.listFiles { candidate -> candidate.isFile && candidate.extension.equals("mp4", ignoreCase = true) }
+            ?.maxByOrNull { it.lastModified() }
+
+    private fun hasRecordedHfrDebugProbeIntent(): Boolean =
+        isDebuggableBuild() &&
+            (
+                intent.getBooleanExtra("autoProbeRecordedHfrByteBuffer", false) ||
+                    intent.getBooleanExtra("autoProbeRecordedHfrWindowSource", false)
+            )
+
+    private fun startRecordedHfrWindowSourceProbeIfRequested() {
+        if (!intent.getBooleanExtra("autoProbeRecordedHfrWindowSource", false) || !isDebuggableBuild()) return
+        val explicitPath = intent.getStringExtra("recordedHfrProbePath")
+        val file = explicitPath?.let(::File) ?: latestRecordedHfrMovieFile()
+        if (file == null) {
+            Log.e(logTag, "RECORDED_HFR_WINDOW_SOURCE_SPIKE_NO_READ reason=missing_file")
+            return
+        }
+        val window = ContainerTimeWindow(
+            windowStartUs = intent.getLongExtra("recordedHfrProbeWindowStartUs", 0L),
+            windowEndUs = intent.getLongExtra("recordedHfrProbeWindowEndUs", 200_000L),
+            preImpactMarginFrames = 0,
+            postImpactFrameCount = intent.intExtraOrNull("recordedHfrProbeMaxFrames") ?: 24,
+            maxFrames = intent.intExtraOrNull("recordedHfrProbeMaxFrames") ?: 24,
+        )
+        val targetWidth = intent.intExtraOrNull("recordedHfrProbeTargetWidth") ?: 1280
+        val targetHeight = intent.intExtraOrNull("recordedHfrProbeTargetHeight") ?: 720
+        decodeWorkerExecutor.execute {
+            when (
+                val validation = AndroidRecordedHfrWindowFrameSource.create(
+                    file = file,
+                    window = window,
+                    targetWidth = targetWidth,
+                    targetHeight = targetHeight,
+                    maxDecodeWallClockMillis = RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS,
+                )
+            ) {
+                is ImportValidationResult.NoRead -> Log.e(
+                    logTag,
+                    "RECORDED_HFR_WINDOW_SOURCE_SPIKE_NO_READ file=${file.displayNameOnly()} reason=${validation.reason} message=${validation.message.compactForLog()}",
+                )
+                is ImportValidationResult.Success -> {
+                    val source = validation.value
+                    try {
+                        while (source.nextFrame() != null) {
+                            // Drain one bounded window to prove the pull source on device.
+                        }
+                    } finally {
+                        source.close()
+                    }
+                    val proof = source.proof
+                    val terminal = source.terminalNoReadMessage()
+                    val logLine = "file=${file.displayNameOnly()} decoded=${proof.emittedFrameCount} " +
+                        "syncPrefix=${proof.syncPrefixFrameCount} firstPtsUs=${proof.emittedFirstPtsUs ?: -1} " +
+                        "lastPtsUs=${proof.emittedLastPtsUs ?: -1} decodeMs=${proof.decodeWallClockMillis} " +
+                        "timedOut=${proof.timedOut} colorFormat=${source.outputColorFormat ?: -1} " +
+                        "stride=${source.outputStride ?: -1} sliceHeight=${source.outputSliceHeight ?: -1}"
+                    if (terminal == null) {
+                        Log.i(logTag, "RECORDED_HFR_WINDOW_SOURCE_SPIKE_RESULT $logLine")
+                    } else {
+                        Log.e(logTag, "RECORDED_HFR_WINDOW_SOURCE_SPIKE_NO_READ $logLine message=${terminal.compactForLog()}")
+                    }
+                }
+            }
+        }
     }
 
     private fun applyDebugVisualEstimateSetupFromIntent() {
@@ -2144,7 +2744,7 @@ class MainActivity : ComponentActivity() {
         val runtimeConfig = buildRecordedEstimateConfig(metadata, workingResolution)
             ?: return ImportRunOutcome.NoRead(
                 reason = ImportNoReadReason.INVALID_METADATA,
-                message = "Recorded estimate needs distance setup, color sample, and ROI before processing.",
+                message = "Recorded estimate needs valid distance setup before processing.",
                 metadata = metadata,
                 sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
             )
@@ -2178,6 +2778,7 @@ class MainActivity : ComponentActivity() {
                 maxProofFrames = VisualEstimateCaptureProofBuilder.DEFAULT_MAX_PROOF_FRAMES,
                 proofThumbnailMaxWidth = RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH,
                 proofThumbnailMaxHeight = RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT,
+                motionDetectorConfig = RecordedHfrMotionDetectorConfig(),
             ),
         )
         val gateValidation = RecordedHfrCaptureGate.validate(
@@ -2319,6 +2920,318 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun runRecordedWindowEstimate(
+        file: File,
+        fps: Int,
+        diagnostics: BurstDiagnostics,
+        mapping: ImpactWindowMapping,
+    ): ImportRunOutcome {
+        val importFrameCount = mapping.window.maxFrames
+        Log.i(logTag, "RECORDED_ESTIMATE_STAGE metadata frameCount=$importFrameCount window=true")
+        val metadata = when (
+            val validation = AndroidImportVideoFrameSource.readMetadata(
+                file = file,
+                maxSamplesToProbe = (diagnostics.uniqueTimestampCount + 1).coerceAtLeast(DEFAULT_IMPORT_MAX_FRAMES),
+            )
+        ) {
+            is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
+                validation.reason,
+                validation.message,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            )
+            is ImportValidationResult.Success -> validation.value
+        }
+        val workingResolution = when (
+            val selected = RecordedHfrWorkingResolutionSelector.select(
+                sourceWidth = if (metadata.rotationDegrees == 90 || metadata.rotationDegrees == 270) metadata.height else metadata.width,
+                sourceHeight = if (metadata.rotationDegrees == 90 || metadata.rotationDegrees == 270) metadata.width else metadata.height,
+            )
+        ) {
+            is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
+                selected.reason,
+                selected.message,
+                metadata,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            )
+            is ImportValidationResult.Success -> selected.value
+        }
+        val runtimeConfig = buildRecordedEstimateConfig(metadata, workingResolution)
+            ?: return ImportRunOutcome.NoRead(
+                reason = ImportNoReadReason.INVALID_METADATA,
+                message = "Recorded estimate needs valid distance setup before processing.",
+                metadata = metadata,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            )
+        val windowStartedAtNanos = System.nanoTime()
+        val windowDeadlineNanos = windowStartedAtNanos + RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS * 1_000_000L
+        val windowCancellation = ImportCancellationSignal { System.nanoTime() > windowDeadlineNanos }
+        val earlyExposureNoRead = buildRecordedHfrExposureNoRead(diagnostics, null)
+        Log.i(logTag, "RECORDED_ESTIMATE_STAGE source window=true")
+        val source = when (
+            val validation = AndroidRecordedHfrWindowFrameSource.create(
+                file = file,
+                window = mapping.window,
+                targetWidth = workingResolution.working.width,
+                targetHeight = workingResolution.working.height,
+                maxDecodeWallClockMillis = RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS,
+            )
+        ) {
+            is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
+                validation.reason,
+                validation.message,
+                metadata,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            )
+            is ImportValidationResult.Success -> validation.value
+        }
+        Log.i(logTag, "RECORDED_ESTIMATE_STAGE streaming window=true proofOnly=${earlyExposureNoRead != null}")
+        val estimate = RecordedHfrStreamingEstimate.estimate(
+            source = source,
+            config = RecordedHfrStreamingEstimateConfig(
+                frameIntervalSeconds = 1.0 / fps.toDouble(),
+                calibration = runtimeConfig.calibration,
+                framePipelineConfig = runtimeConfig.framePipelineConfig,
+                maxScannedFrames = mapping.window.maxFrames,
+                maxRetainedCandidateFrames = RECORDED_HFR_MAX_RETAINED_CANDIDATE_FRAMES.coerceAtMost(mapping.window.maxFrames),
+                maxProofFrames = VisualEstimateCaptureProofBuilder.DEFAULT_MAX_PROOF_FRAMES,
+                proofThumbnailMaxWidth = RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH,
+                proofThumbnailMaxHeight = RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT,
+                timingMode = RecordedHfrStreamingTimingMode.CONTAINER_PTS_DELTAS,
+                proofOnly = earlyExposureNoRead != null,
+                motionDetectorConfig = RecordedHfrMotionDetectorConfig(),
+            ),
+            cancellationSignal = windowCancellation,
+        )
+        val decodeProof = source.proof
+        val terminalNoReadMessage = source.terminalNoReadMessage()
+        Log.i(
+            logTag,
+            "RECORDED_ESTIMATE_WINDOW decoded=${decodeProof.emittedFrameCount} syncPrefix=${decodeProof.syncPrefixFrameCount} " +
+                "firstPtsUs=${decodeProof.emittedFirstPtsUs ?: -1} lastPtsUs=${decodeProof.emittedLastPtsUs ?: -1} " +
+                "decodeMs=${decodeProof.decodeWallClockMillis} timedOut=${decodeProof.timedOut} " +
+                "colorFormat=${source.outputColorFormat ?: -1} stride=${source.outputStride ?: -1} sliceHeight=${source.outputSliceHeight ?: -1} " +
+                diagnostics.exposureSummary(),
+        )
+        val decodedWindowValidation = RecordedHfrDecodedWindowValidator.validate(
+            proof = decodeProof,
+            requestedMaxFrames = mapping.window.maxFrames,
+            minUsableFrames = RECORDED_HFR_WINDOW_MIN_USABLE_FRAMES,
+            maxDecodeWallClockMillis = RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS,
+        )
+        val gateValidation = RecordedHfrWindowCaptureGate.validate(
+            metadataSampleCount = metadata.sampleCount,
+            decodedWindowFrameCount = estimate.scannedFrameCount,
+            requestedWindowFrameCount = mapping.window.maxFrames,
+            minUsableFrameCount = RECORDED_HFR_WINDOW_MIN_USABLE_FRAMES,
+            diagnostics = diagnostics,
+            metadata = metadata,
+            windowStartUs = mapping.window.windowStartUs,
+            windowEndUs = mapping.window.windowEndUs,
+            emittedFirstPtsUs = decodeProof.emittedFirstPtsUs,
+            emittedLastPtsUs = decodeProof.emittedLastPtsUs,
+            sourceWidth = workingResolution.source.width,
+            sourceHeight = workingResolution.source.height,
+            proofFrameCount = estimate.retainedProofFrameCount,
+            sourceValidityPasses = estimate.sourceValidity.passes,
+        )
+        val gate = (gateValidation as? ImportValidationResult.Success)?.value
+        val gateNoRead = if (gateValidation is ImportValidationResult.NoRead) {
+            VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                message = gateValidation.message,
+                diagnostics = when (val outcome = estimate.outcome) {
+                    is VisualEstimateOutcome.Success -> outcome.diagnostics
+                    is VisualEstimateOutcome.NoRead -> outcome.diagnostics
+                },
+            )
+        } else {
+            null
+        }
+        val exposureNoRead = earlyExposureNoRead ?: buildRecordedHfrExposureNoRead(diagnostics, estimate.outcome)
+        val proofTrace = when (val outcome = estimate.outcome) {
+            is VisualEstimateOutcome.NoRead -> estimate.detectorTrace.withOutcome(exposureNoRead ?: outcome)
+            is VisualEstimateOutcome.Success -> (exposureNoRead ?: gateNoRead)?.let { estimate.detectorTrace.withOutcome(it) } ?: estimate.detectorTrace
+        }
+        val proof = VisualEstimateCaptureProofBuilder.buildFromThumbnails(
+            attemptId = visualEstimateAttemptId,
+            scannedFrameCount = estimate.scannedFrameCount,
+            frameAvailableCallbackCount = estimate.scannedFrameCount,
+            captureResultCallbackCount = diagnostics.callbackCount,
+            uniqueSensorTimestampCount = diagnostics.uniqueTimestampCount,
+            readbackWidth = workingResolution.working.width,
+            readbackHeight = workingResolution.working.height,
+            trace = proofTrace,
+            thumbnails = estimate.proofThumbnails,
+            sourceKind = "RECORDED_HFR_WINDOW",
+            sourceWidth = workingResolution.source.width,
+            sourceHeight = workingResolution.source.height,
+            workingWidth = workingResolution.working.width,
+            workingHeight = workingResolution.working.height,
+            decodedFrameCount = metadata.sampleCount,
+            requestedFps = fps,
+            dropGateVerdict = gate?.windowVerdict ?: "NO_READ",
+            cadenceGateVerdict = gate?.cadenceVerdict ?: if (diagnostics.medianGapPassesRateBand && diagnostics.captureProofPasses) "PASS" else "NO_READ",
+            windowStartUs = mapping.window.windowStartUs,
+            windowEndUs = mapping.window.windowEndUs,
+            impactFrameIndex = mapping.sensorDiagnosticFrameIndex,
+            preImpactMarginFrames = mapping.window.preImpactMarginFrames,
+            anchorErrorNanos = mapping.endToEndAnchorErrorNanos,
+            decodeWallClockMillis = decodeProof.decodeWallClockMillis,
+            sourceValidityVerdict = gate?.sourceValidityVerdict ?: estimate.sourceValidity.verdict,
+        )
+        terminalNoReadMessage?.let { terminalMessage ->
+            val noRead = VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                message = terminalMessage,
+            )
+            return ImportRunOutcome.NoRead(
+                ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+                terminalMessage,
+                metadata,
+                frameCount = decodeProof.emittedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = noRead,
+            )
+        }
+        if (exposureNoRead != null) {
+            Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId window=true source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${decodeProof.emittedFrameCount} " +
+                    "scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "sourceValidity=${proof.sourceValidityVerdict} reason=${exposureNoRead.reason} ${diagnostics.exposureSummary()}",
+            )
+            return ImportRunOutcome.NoRead(
+                ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+                exposureNoRead.message,
+                metadata,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = exposureNoRead,
+            )
+        }
+        if (decodedWindowValidation is ImportValidationResult.NoRead) {
+            val sourceInvalidMessage = if (!estimate.sourceValidity.passes && estimate.scannedFrameCount > 0) {
+                "Recorded window source frames were black or invalid."
+            } else {
+                decodedWindowValidation.message
+            }
+            val noRead = VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                message = sourceInvalidMessage,
+            )
+            return ImportRunOutcome.NoRead(
+                decodedWindowValidation.reason,
+                sourceInvalidMessage,
+                metadata,
+                frameCount = decodeProof.emittedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = noRead,
+            )
+        }
+        if (estimate.outcome is VisualEstimateOutcome.NoRead) {
+            val noRead = estimate.outcome
+            Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId window=true source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${decodeProof.emittedFrameCount} " +
+                    "scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "uniqueSensorTs=${diagnostics.uniqueTimestampCount} window=${gate?.windowVerdict ?: "NO_READ"} cadence=${proof.cadenceGateVerdict} " +
+                    "sourceValidity=${proof.sourceValidityVerdict} " +
+                    "reason=${noRead.reason}",
+            )
+            return ImportRunOutcome.NoRead(
+                reason = if (noRead.reason == VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED) {
+                    ImportNoReadReason.RESOURCE_LIMIT_EXCEEDED
+                } else {
+                    ImportNoReadReason.NO_TRUSTWORTHY_TIMING
+                },
+                message = noRead.message,
+                metadata = metadata,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = noRead,
+            )
+        }
+        if (gateNoRead != null || gateValidation is ImportValidationResult.NoRead) {
+            val validation = gateValidation as ImportValidationResult.NoRead
+            Log.i(
+                logTag,
+                "RECORDED_HFR_ESTIMATE_NO_READ attempt=$visualEstimateAttemptId window=true source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                    "working=${workingResolution.working.width}x${workingResolution.working.height} decoded=${decodeProof.emittedFrameCount} " +
+                    "scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} selected=${estimate.selectedSampleCount} " +
+                    "uniqueSensorTs=${diagnostics.uniqueTimestampCount} window=NO_READ cadence=${proof.cadenceGateVerdict}",
+            )
+            return ImportRunOutcome.NoRead(
+                validation.reason,
+                validation.message,
+                metadata,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = gateNoRead,
+            )
+        }
+        if (estimate.timing == null) {
+            val noRead = VisualEstimateOutcome.NoRead(
+                VisualEstimateNoReadReason.BAD_TIMESTAMPS,
+                "Recorded-HFR window estimate did not produce retained-frame timing.",
+            )
+            return ImportRunOutcome.NoRead(
+                ImportNoReadReason.NO_TRUSTWORTHY_TIMING,
+                noRead.message,
+                metadata,
+                timing = estimate.timing,
+                frameCount = estimate.scannedFrameCount,
+                sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+                captureProof = proof,
+                visualNoRead = noRead,
+            )
+        }
+        Log.i(
+            logTag,
+            "RECORDED_HFR_ESTIMATE_COMPLETE attempt=$visualEstimateAttemptId window=true source=${workingResolution.source.width}x${workingResolution.source.height} " +
+                "working=${workingResolution.working.width}x${workingResolution.working.height} metadataSamples=${gate?.metadataSampleCount ?: 0} " +
+                "decoded=${decodeProof.emittedFrameCount} scanned=${estimate.scannedFrameCount} candidates=${estimate.retainedCandidateFrameCount} " +
+                "selected=${estimate.selectedSampleCount} proofFrames=${estimate.retainedProofFrameCount} uniqueSensorTs=${diagnostics.uniqueTimestampCount} " +
+                "window=${gate?.windowVerdict ?: "PASS"} cadence=${gate?.cadenceVerdict ?: "PASS"} decodeMs=${decodeProof.decodeWallClockMillis}",
+        )
+        return ImportRunOutcome.Estimate(
+            metadata = metadata,
+            frames = ImportVideoFrameSequence(emptyList()),
+            timing = estimate.timing,
+            estimate = estimate.outcome,
+            sourceKind = ImportResultSourceKind.RECORDED_ESTIMATE,
+            captureProof = proof,
+            frameCount = estimate.scannedFrameCount,
+        )
+    }
+
+    private fun buildRecordedHfrExposureNoRead(
+        diagnostics: BurstDiagnostics,
+        outcome: VisualEstimateOutcome?,
+    ): VisualEstimateOutcome.NoRead? {
+        val medianExposure = diagnostics.actualExposureMedianNanos ?: return null
+        if (medianExposure <= RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS) return null
+        val visualDiagnostics = when (outcome) {
+            is VisualEstimateOutcome.Success -> outcome.diagnostics
+            is VisualEstimateOutcome.NoRead -> outcome.diagnostics
+            null -> null
+        }
+        return VisualEstimateOutcome.NoRead(
+            reason = VisualEstimateNoReadReason.EXCESSIVE_RESIDUAL,
+            message = "Recorded-HFR median exposure ${medianExposure}ns exceeds the ${RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS}ns blur-risk gate. This is a coarse field-tunable pre-filter; residual and track-quality gates remain the fine accuracy check.",
+            diagnostics = visualDiagnostics,
+        )
+    }
+
     private fun reconcileImportTiming(frames: ImportVideoFrameSequence): ImportValidationResult<ImportTimingReconciliation> {
         val knownFrameRateFps = debugImportKnownFrameRateFps
         return if (knownFrameRateFps != null && knownFrameRateFps.isFinite() && knownFrameRateFps > 0.0) {
@@ -2407,11 +3320,17 @@ class MainActivity : ComponentActivity() {
             readback = workingResolution.working,
         )
         val calibration = buildImportCalibration(importGeometry)
-        val colorReadiness = buildImportColor(importGeometry).readiness(
+        val colorReadiness = buildImportColor(importGeometry, requireRegionOfInterest = false).readiness(
             workingResolution.working.width,
             workingResolution.working.height,
         )
-        if (colorReadiness !is ColorWorkflowReadiness.Ready) return null
+        val detectorThreshold = (colorReadiness as? ColorWorkflowReadiness.Ready)?.threshold
+            ?: HsvThreshold(
+                center = HsvColor(120.0, 1.0, 1.0),
+                tolerance = HsvTolerance(180.0, 1.0, 1.0),
+            )
+        val detectorRoi = (colorReadiness as? ColorWorkflowReadiness.Ready)?.regionOfInterest
+            ?: RegionOfInterest(0, 0, workingResolution.working.width, workingResolution.working.height)
         val knownBallDiameterFeet = if (phase14WorkflowState.setupMode == Phase14SetupMode.BallDiameterFallback) {
             phase14WorkflowState.knownBallDiameterFeet
         } else {
@@ -2424,9 +3343,9 @@ class MainActivity : ComponentActivity() {
             framePipelineConfig = VisualEstimateFramePipelineConfig(
                 trackConfig = TrackExtractionConfig(
                     detectorConfig = BlobDetectionConfig(
-                        threshold = colorReadiness.threshold,
-                        roi = colorReadiness.regionOfInterest,
-                        minAreaPx = IMPORT_ESTIMATE_MIN_BLOB_AREA_PX,
+                        threshold = detectorThreshold,
+                        roi = detectorRoi,
+                        minAreaPx = workingResolution.scaleAreaPx(IMPORT_ESTIMATE_MIN_BLOB_AREA_PX),
                         maxAreaPx = max(8, workingPixels / 4),
                         minCompactness = 0.0,
                         bounds = FrameProcessingBounds(
@@ -2442,6 +3361,13 @@ class MainActivity : ComponentActivity() {
                     maxFrameToFrameJumpPx = workingResolution.working.width.toDouble(),
                     maxInteriorMisses = 1,
                     allowDirectionalCandidateSelection = true,
+                    candidateReductionBudget = CandidateReductionBudget(
+                        maxBlobsPerFrame = RECORDED_HFR_MAX_BLOBS_PER_FRAME,
+                        maxTotalCandidateBlobs = RECORDED_HFR_MAX_TOTAL_CANDIDATE_BLOBS,
+                        maxRansacCandidates = RECORDED_HFR_MAX_RANSAC_CANDIDATES,
+                        maxRansacPairHypotheses = RECORDED_HFR_MAX_RANSAC_PAIR_HYPOTHESES,
+                        ransacCancellationCheckInterval = RECORDED_HFR_RANSAC_CANCELLATION_CHECK_INTERVAL,
+                    ),
                 ),
                 estimateConfig = VisualEstimatePipelineConfig(
                     maxEstimateRmsResidualPx = if (knownBallDiameterFeet != null) BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX else IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX,
@@ -2450,7 +3376,8 @@ class MainActivity : ComponentActivity() {
                     knownBallDiameterFeet = knownBallDiameterFeet,
                     allowApparentScaleChangeEstimate = knownBallDiameterFeet != null,
                     requireFittedPathProgression = false,
-                    minEstimateMilesPerHour = HIT_BALL_MIN_ESTIMATE_MPH,
+                    minEstimateMilesPerHour = RECORDED_HFR_MOTION_MIN_ESTIMATE_MPH,
+                    minimumSpeedGatePolicy = MinimumSpeedGatePolicy.SAME_PLANE_ONLY,
                     levelReference = phase14WorkflowState.levelReference,
                 ),
                 timing = VisualEstimateFrameTiming.RequireRealTimestamps,
@@ -2474,12 +3401,20 @@ class MainActivity : ComponentActivity() {
     private fun emptyCalibration(): MeasurementCalibrationState =
         MeasurementCalibrationState(pointA = null, pointB = null, knownDistanceFeet = null)
 
-    private fun buildImportColor(geometry: Phase14Geometry): ColorWorkflowState {
+    private fun buildImportColor(
+        geometry: Phase14Geometry,
+        requireRegionOfInterest: Boolean = true,
+    ): ColorWorkflowState {
         val point = phase14WorkflowState.colorSamplePoint ?: return ColorWorkflowState(tolerance = phase14WorkflowState.colorTolerance)
         val sample = phase14WorkflowState.colorSample ?: return ColorWorkflowState(tolerance = phase14WorkflowState.colorTolerance)
-        val roi = phase14WorkflowState.regionOfInterest ?: return ColorWorkflowState(tolerance = phase14WorkflowState.colorTolerance)
         val transform = com.speedball.app.measurement.DetectionReadbackTransform(geometry.source, geometry.readback)
-        val readbackRoi = transform.normalizedToReadbackRoi(roi) ?: return ColorWorkflowState(tolerance = phase14WorkflowState.colorTolerance)
+        val readbackRoi = phase14WorkflowState.regionOfInterest
+            ?.let { transform.normalizedToReadbackRoi(it) }
+            ?: if (requireRegionOfInterest) {
+                return ColorWorkflowState(tolerance = phase14WorkflowState.colorTolerance)
+            } else {
+                null
+            }
         return ColorWorkflowState(tolerance = phase14WorkflowState.colorTolerance).selectSample(
             sample = sample.takeIf { point.isInFrame() } ?: sample,
             tolerance = phase14WorkflowState.colorTolerance,
@@ -2767,6 +3702,7 @@ class MainActivity : ComponentActivity() {
             "callbacks=$callbackCount uniqueTs=$uniqueTimestampCount expected=$expectedUniqueTimestampCount min=$minimumUniqueTimestampCount",
             "medianGapMs=${medianGapMillis?.format(2) ?: "n/a"} band=${medianGapLowerBoundMillis.format(2)}..${medianGapUpperBoundMillis.format(2)} pass=$medianGapPassesRateBand",
             "proof=$captureProofPasses file=$displayOutputName bytes=$fileBytes",
+            exposureSummary(),
         )
 
     private fun logDecodeOutcome(file: File, outcome: DecodeOutcome) {
@@ -2994,11 +3930,44 @@ class MainActivity : ComponentActivity() {
         const val RECORDED_HFR_MAX_RETAINED_CANDIDATE_FRAMES = 360
         const val RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH = 96
         const val RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT = 54
+        const val RECORDED_HFR_WINDOW_MIN_USABLE_FRAMES = 4
+        const val RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS = 10_000L
+        const val RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS = 2_000_000L
+        const val RECORDED_HFR_MAX_BLOBS_PER_FRAME = 32
+        const val RECORDED_HFR_MAX_TOTAL_CANDIDATE_BLOBS = 90
+        const val RECORDED_HFR_MAX_RANSAC_CANDIDATES = 90
+        const val RECORDED_HFR_MAX_RANSAC_PAIR_HYPOTHESES = 4_096
+        const val RECORDED_HFR_RANSAC_CANCELLATION_CHECK_INTERVAL = 128
         const val BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX = 24.0
         const val IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX = 8.0
         const val IMPORT_ESTIMATE_MIN_BLOB_AREA_PX = 4
         const val HIT_BALL_MIN_ESTIMATE_MPH = 25.0
+        const val RECORDED_HFR_MOTION_MIN_ESTIMATE_MPH = 35.0
         const val AUTO_RECORD_ESTIMATE_DURATION_MILLIS = 3_000L
+        const val SOUND_TRIGGER_SAMPLE_RATE_HZ = 48_000
+        const val SOUND_TRIGGER_BASELINE_SAMPLES = 960
+        const val SOUND_TRIGGER_WINDOW_SAMPLES = 96
+        const val SOUND_TRIGGER_THRESHOLD_MULTIPLIER = 2.5
+        const val SOUND_TRIGGER_MINIMUM_PEAK_DELTA = 100
+        const val SOUND_TRIGGER_MINIMUM_BASELINE_RMS = 25.0
+        const val SOUND_TRIGGER_COOLDOWN_SAMPLES = 4_800
+        const val SOUND_TRIGGER_USER_ACTIONABLE_MILLIS = 5_000L
+        const val SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS = 200L
+        const val SOUND_TRIGGER_AUDIO_ARM_BUDGET_MILLIS = 1_500L
+        const val SOUND_TRIGGER_HFR_START_BUDGET_MILLIS = 2_500L
+        const val SOUND_TRIGGER_READY_CUE_BUDGET_MILLIS = 2_000L
+        const val SOUND_TRIGGER_TOTAL_AUDIO_BUFFER_MILLIS =
+            SOUND_TRIGGER_AUDIO_ARM_BUDGET_MILLIS +
+                SOUND_TRIGGER_HFR_START_BUDGET_MILLIS +
+                SOUND_TRIGGER_READY_CUE_BUDGET_MILLIS +
+                SOUND_TRIGGER_USER_ACTIONABLE_MILLIS +
+                SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS
+        const val SOUND_TRIGGER_TOTAL_RECORDING_MILLIS =
+            SOUND_TRIGGER_HFR_START_BUDGET_MILLIS +
+                SOUND_TRIGGER_READY_CUE_BUDGET_MILLIS +
+                SOUND_TRIGGER_USER_ACTIONABLE_MILLIS +
+                SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS
+        const val SOUND_TRIGGER_MAX_PRE_IMPACT_FRAMES = 12
         const val VOICE_IDLE_RESTART_DELAY_MILLIS = 250L
         const val VOICE_RESTART_DELAY_MILLIS = 350L
         const val VOICE_RESTART_MAX_DELAY_MILLIS = 2_800L
@@ -3008,7 +3977,9 @@ class MainActivity : ComponentActivity() {
         const val READY_BEEP_SPACING_MILLIS = 170L
         const val READY_BEEP_RELEASE_PADDING_MILLIS = 50L
         const val READY_BEEP_VOLUME_PERCENT = 90
-        const val READY_SIGNAL_TO_ESTIMATE_DELAY_MILLIS = 850L
+        const val READY_TTS_MAX_WAIT_MILLIS = 1_500L
+        const val READY_CUE_ACCEPT_MARGIN_MILLIS = 150L
+        const val READY_TTS_UTTERANCE_ID = "ready-to-shoot"
         val VOICE_SHOOT_COMMANDS = setOf(
             "shoot",
             "shot",

@@ -207,7 +207,7 @@ class RecordedHfrEstimateContractsTest {
     }
 
     @Test
-    fun workingResolutionKeeps720pAndDownscales1080pToBoundedDetectorSize() {
+    fun workingResolutionDownscalesRecordedHfr720pAnd1080pTo640x360() {
         val full720 = assertInstanceOf(RecordedHfrWorkingResolution::class.java, assertInstanceOf(
             ImportValidationResult.Success::class.java,
             RecordedHfrWorkingResolutionSelector.select(sourceWidth = 1280, sourceHeight = 720),
@@ -219,13 +219,19 @@ class RecordedHfrEstimateContractsTest {
 
         assertEquals(1280, full720.source.width)
         assertEquals(720, full720.source.height)
-        assertEquals(full720.source, full720.working)
-        assertFalse(full720.downscaledForDetection)
+        assertEquals(640, full720.working.width)
+        assertEquals(360, full720.working.height)
+        assertTrue(full720.downscaledForDetection)
+        assertEquals(0.5, full720.scaleX, 0.0)
+        assertEquals(0.5, full720.scaleY, 0.0)
+        assertEquals(1, full720.scaleAreaPx(4))
         assertEquals(1920, bounded1080.source.width)
         assertEquals(1080, bounded1080.source.height)
-        assertEquals(1280, bounded1080.working.width)
-        assertEquals(720, bounded1080.working.height)
+        assertEquals(640, bounded1080.working.width)
+        assertEquals(360, bounded1080.working.height)
         assertTrue(bounded1080.downscaledForDetection)
+        assertEquals(1.0 / 3.0, bounded1080.scaleX, 0.0001)
+        assertEquals(1.0 / 3.0, bounded1080.scaleY, 0.0001)
     }
 
     private fun diagnosticsWithUniqueCount(count: Int, gapMillis: Double): BurstDiagnostics =

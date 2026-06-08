@@ -19,7 +19,53 @@ data class TrackExtractionConfig(
     val seedPoint: ImagePoint? = null,
     val seedSearchRadiusPx: Double? = null,
     val allowStationaryPrefix: Boolean = false,
+    val candidateReductionBudget: CandidateReductionBudget? = null,
 )
+
+/**
+ * Optional work budget for candidate-heavy estimate reducers.
+ *
+ * The default `null` budget preserves legacy direct/import behavior. Recorded
+ * HFR opts into this because a sound-triggered full-frame window can contain
+ * many color components, and over-budget evidence must fail loudly instead of
+ * creating an unbounded RANSAC/allocation workload.
+ */
+data class CandidateReductionBudget(
+    val maxBlobsPerFrame: Int,
+    val maxTotalCandidateBlobs: Int,
+    val maxRansacCandidates: Int,
+    val maxRansacPairHypotheses: Int,
+    val ransacCancellationCheckInterval: Int,
+) {
+    fun validate(): MeasurementRunOutcome.NoRead? {
+        if (
+            maxBlobsPerFrame <= 0 ||
+            maxTotalCandidateBlobs <= 0 ||
+            maxRansacCandidates <= 0 ||
+            maxRansacPairHypotheses <= 0 ||
+            ransacCancellationCheckInterval <= 0
+        ) {
+            return MeasurementRunOutcome.NoRead(
+                MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
+                "Candidate-reduction budget values must be positive.",
+            )
+        }
+        if (maxRansacCandidates > maxTotalCandidateBlobs) {
+            return MeasurementRunOutcome.NoRead(
+                MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
+                "RANSAC candidate budget cannot exceed total candidate budget.",
+            )
+        }
+        val fullPairCount = maxRansacCandidates.toLong() * (maxRansacCandidates - 1L) / 2L
+        if (fullPairCount > maxRansacPairHypotheses.toLong()) {
+            return MeasurementRunOutcome.NoRead(
+                MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
+                "RANSAC pair budget must cover the configured candidate budget.",
+            )
+        }
+        return null
+    }
+}
 
 sealed interface TrackExtractionOutcome {
     data class Success(val detections: List<Detection>) : TrackExtractionOutcome

@@ -185,10 +185,14 @@ class ImportContractsTest {
         assertTrue(manifestText.contains("android.permission.RECORD_AUDIO"))
         assertTrue(source.contains("SpeechRecognizer"))
         assertTrue(source.contains("VOICE_RECORD_COMMAND"))
-        assertTrue(source.contains("AUTO_RECORD_ESTIMATE_DURATION_MILLIS"))
-        assertTrue(source.contains("startTimedRecordingEstimate()"))
-        assertTrue(source.contains("runRecordedEstimate(file, fps, outcome.diagnostics)"))
-        assertTrue(source.contains("AndroidImportVideoFrameSource.create("))
+        assertTrue(source.contains("SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS"))
+        assertTrue(source.contains("startSoundTriggeredRecordingEstimate()"))
+        assertTrue(source.contains("handleImpactAudioArmed(attemptId, mode, session)"))
+        assertTrue(source.contains("startRecordedHfrAfterImpactAudioArmed(attemptId, mode, session)"))
+        assertTrue(source.contains("handleRecordedHfrFirstFrameAnchor(attemptId, mode, session, anchor)"))
+        assertTrue(source.contains("session.enableAcceptance(acceptAfterSampleIndex)"))
+        assertTrue(source.contains("runRecordedWindowEstimate(file, fps, outcome.diagnostics, mapping)"))
+        assertTrue(source.contains("AndroidRecordedHfrWindowFrameSource.create("))
         assertTrue(source.contains("file = file"))
         assertTrue(source.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
         assertTrue(source.contains("RecordedHfrStreamingEstimate.estimate("))
@@ -197,14 +201,43 @@ class ImportContractsTest {
 
         val importPath = source.substringAfter("private fun runImportEstimate(")
             .substringBefore("private fun runRecordedEstimate(")
-        val recordedPath = source.substringAfter("private fun runRecordedEstimate(")
+        val recordedPath = source.substringAfter("private fun runRecordedWindowEstimate(")
             .substringBefore("private fun reconcileImportTiming(")
+        val liveShootPath = source.substringAfter("private fun startSoundTriggeredRecordingEstimate(")
+            .substringBefore("private fun startTimedRecordingEstimate(")
+        val constantsPath = source.substringAfter("companion object")
         assertFalse(importPath.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
         assertTrue(recordedPath.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
+        assertTrue(liveShootPath.contains("stopMode = BurstStopMode.ExternalStop"))
+        assertTrue(liveShootPath.contains("durationMillis = SOUND_TRIGGER_TOTAL_RECORDING_MILLIS"))
+        assertTrue(constantsPath.contains("SOUND_TRIGGER_TOTAL_RECORDING_MILLIS"))
+        assertTrue(constantsPath.contains("SOUND_TRIGGER_USER_ACTIONABLE_MILLIS"))
+        assertFalse(liveShootPath.contains("onFirstFrameAnchor = { anchor -> startImpactAudioMarker(anchor, mode) }"))
+        assertTrue(liveShootPath.indexOf("impactAudioTrigger.start(") < liveShootPath.indexOf("burstRecorder.start("))
+        assertTrue(liveShootPath.contains("onArmed = { session ->"))
+        assertTrue(liveShootPath.contains("onFirstFrameAnchor = { anchor ->"))
+        assertTrue(liveShootPath.contains("startRecordedWindowEstimate(outcome)"))
+        assertFalse(liveShootPath.contains("startRecordedEstimate(outcome)"))
         assertTrue(recordedPath.contains("RecordedHfrStreamingEstimate.estimate("))
         assertTrue(recordedPath.contains("RecordedHfrStreamingEstimateConfig("))
-        assertTrue(recordedPath.contains("RecordedHfrCaptureGate.validate("))
-        assertTrue(recordedPath.indexOf("RecordedHfrStreamingEstimate.estimate(") < recordedPath.indexOf("RecordedHfrCaptureGate.validate("))
+        assertTrue(recordedPath.contains("motionDetectorConfig = RecordedHfrMotionDetectorConfig()"))
+        assertFalse(recordedPath.contains("physicalDetectorConfig = RecordedHfrPhysicalDetectorConfig()"))
+        assertTrue(recordedPath.contains("RecordedHfrWindowCaptureGate.validate("))
+        assertTrue(recordedPath.contains("val decodedWindowValidation = RecordedHfrDecodedWindowValidator.validate("))
+        assertTrue(constantsPath.contains("RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS = 10_000L"))
+        assertTrue(constantsPath.contains("RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS = 2_000_000L"))
+        assertTrue(source.contains("RECORDED_HFR_BYTEBUFFER_SPIKE_RESULT"))
+        assertTrue(source.contains("!intent.getBooleanExtra(\"autoProbeRecordedHfrByteBuffer\", false) || !isDebuggableBuild()"))
+        assertTrue(source.contains("latestRecordedHfrMovieFile()"))
+        assertTrue(source.contains("RECORDED_HFR_WINDOW_SOURCE_SPIKE_RESULT"))
+        assertTrue(source.contains("!intent.getBooleanExtra(\"autoProbeRecordedHfrWindowSource\", false) || !isDebuggableBuild()"))
+        assertTrue(source.contains("while (source.nextFrame() != null)"))
+        assertTrue(source.contains("!hasRecordedHfrDebugProbeIntent() && (hasCameraPermission()"))
+        assertTrue(recordedPath.indexOf("RecordedHfrStreamingEstimate.estimate(") < recordedPath.indexOf("RecordedHfrWindowCaptureGate.validate("))
+        assertTrue(recordedPath.indexOf("VisualEstimateCaptureProofBuilder.buildFromThumbnails(") < recordedPath.indexOf("if (decodedWindowValidation is ImportValidationResult.NoRead)"))
+        assertTrue(recordedPath.contains("captureProof = proof"))
+        assertTrue(recordedPath.contains("sourceInvalidMessage"))
+        assertTrue(source.contains("RecordedHfrRetentionPolicy.retainFailure(file, debugBuild = isDebuggableBuild())"))
         assertFalse(recordedPath.contains("ImportFrameExtractor.extract("))
         assertFalse(recordedPath.contains("ImportEstimatePipeline.estimateWithTrace("))
         assertFalse(recordedPath.contains("reconcileRecordedCaptureFrameInterval"))
@@ -214,7 +247,20 @@ class ImportContractsTest {
     }
 
     @Test
-    fun highSpeedRecorderRequestsFastShutterWithAutoExposureFallback() {
+    fun externalStopBurstStillUsesDurationFailsafeHelper() {
+        val recorder = listOf(
+            Path.of("app/src/main/java/com/speedball/app/capture/HighSpeedBurstRecorder.kt"),
+            Path.of("src/main/java/com/speedball/app/capture/HighSpeedBurstRecorder.kt"),
+        ).first { Files.exists(it) }
+        val source = Files.readAllLines(recorder).joinToString("\n")
+
+        assertTrue(source.contains("resolveBurstDurationFailsafeMillis("))
+        assertFalse(source.contains("stopMode != BurstStopMode.ExternalStop"))
+        assertFalse(source.contains("stopMode == BurstStopMode.ExternalStop"))
+    }
+
+    @Test
+    fun highSpeedRecorderDefaultsToAutoExposureAndKeepsExplicitManualSupport() {
         val recorder = listOf(
             Path.of("app/src/main/java/com/speedball/app/capture/HighSpeedBurstRecorder.kt"),
             Path.of("src/main/java/com/speedball/app/capture/HighSpeedBurstRecorder.kt"),
@@ -227,11 +273,13 @@ class ImportContractsTest {
         val modeSource = Files.readAllLines(mode).joinToString("\n")
 
         assertTrue(modeSource.contains("DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS"))
-        assertTrue(modeSource.contains("preferredExposureTimeNanos"))
+        assertTrue(modeSource.contains("preferredExposureTimeNanos: Long? = null"))
+        assertTrue(recorderSource.contains("CaptureRequest.CONTROL_AE_MODE_ON"))
         assertTrue(recorderSource.contains("REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR"))
         assertTrue(recorderSource.contains("SENSOR_INFO_EXPOSURE_TIME_RANGE"))
         assertTrue(recorderSource.contains("CaptureRequest.CONTROL_AE_MODE_OFF"))
         assertTrue(recorderSource.contains("CaptureRequest.SENSOR_EXPOSURE_TIME"))
+        assertTrue(recorderSource.contains("CaptureResult.SENSOR_EXPOSURE_TIME"))
         assertTrue(recorderSource.contains("createHighSpeedRequestListWithFallback"))
     }
 

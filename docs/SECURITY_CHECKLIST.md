@@ -8,7 +8,7 @@ Run this on every code change before review and before commit.
 - [ ] Logs do not expose private media paths except redacted display names in developer-only diagnostics.
 - [ ] User-selected imported files are accessed through validated Android URI/content APIs.
 - [ ] App-owned recorded clips stay app-private and saved/exported evidence does not store raw file paths.
-- [ ] App-owned recorded clips are deleted after estimate processing or no-read completion.
+- [ ] Successful app-owned recorded clips are deleted after estimate processing; failed debug recorded-HFR clips are retained only under the bounded app-private retention policy.
 - [ ] Recorded-HFR processing does not persist or export raw decoded frames, thumbnail bytes, or media identifiers.
 
 ## Camera And Permissions
@@ -29,7 +29,8 @@ Run this on every code change before review and before commit.
 - [ ] User-entered calibration distances are finite, positive, and unit-validated.
 - [ ] Editing calibration distance replaces the active value and invalid current
       distance cannot reuse stale feet for live or import estimates.
-- [ ] HSV tolerances and ROI bounds are clamped.
+- [ ] HSV tolerances and ROI bounds are clamped, and recorded-HFR full-frame
+      fallback remains bounded when ROI is absent or invalid.
 - [ ] Video metadata and frame counts are validated before processing.
 - [ ] Timestamp sequences are monotonic and reconciled to frames.
 
@@ -49,9 +50,9 @@ Run this on every code change before review and before commit.
 - [ ] Thermal/resource guards exist for sustained high-speed capture.
 - [ ] Pure Kotlin frame processing has width, height, total-pixel, frame-count,
       threshold-pixel, connected-component, and operation-count caps.
-- [ ] Recorded-HFR estimate processing has scanned-frame, retained-candidate,
-      proof-thumbnail, and cancellation bounds; resource no-read is explicit
-      and does not rely on catching `OutOfMemoryError`.
+- [ ] Recorded-HFR estimate processing has scanned-frame, candidate-blob,
+      RANSAC-pair, proof-thumbnail, and cancellation bounds; resource no-read
+      is explicit and does not rely on catching `OutOfMemoryError`.
 
 ## Supply Chain
 
@@ -204,16 +205,39 @@ Run this on every code change before review and before commit.
   pixels; the Android frame source releases retriever/extractor resources on
   success and no-read paths.
 - App-owned recorded-HFR estimate processing streams one decoded frame at a
-  time, scans every frame for the capture/drop count, immediately drops
-  full-frame ARGB pixels after detection, and retains only bounded compact
+  time and scans every emitted in-window frame for the capture/drop count. The
+  fixed-camera motion detector may retain only the bounded decoded impact
+  window at the capped working size long enough to build the median luma
+  background, then must drop full-frame ARGB and retain only compact
   blob/index/timestamp candidate records plus bounded downscaled proof
   thumbnails. Retained candidate count is detector evidence only and must not
   satisfy capture-side decoded/scanned/`SENSOR_TIMESTAMP` gates.
-- Sound-triggered recorded-HFR window foundations treat the loud pop only as a
+- Recorded-HFR candidate/reducer caps are configuration-scoped to the
+  recorded-HFR path. Full-frame fallback without ROI is allowed only under the
+  recorded-HFR scanned-frame, blob-count, total-candidate, RANSAC-candidate, and
+  pair-hypothesis budgets; sibling live/import paths do not inherit these caps
+  unless they explicitly opt in.
+- The sound-triggered recorded-HFR motion detector may retain bounded luma
+  medians, foreground masks, connected-component metrics, motion-candidate
+  shape/foreground summaries, and low-resolution proof thumbnails only. It must
+  not persist raw decoded frames or thumbnail bytes, and no foreground, global
+  lighting/camera motion, oversized merged foreground, or ambiguous track must
+  fail loud instead of producing a plausible speed.
+- Recorded-HFR window decoding uses `MediaCodec` byte-buffer output and rejects
+  unsupported or opaque layouts instead of falling back to render-surface plane
+  APIs. The S10+ measured format is NV12-compatible
+  `COLOR_FormatYUV420SemiPlanar` with explicit stride/slice-height handling.
+- Sound-triggered recorded-HFR window routing treats the loud pop only as a
   timestamp marker. Raw PCM stays in memory, is never logged, persisted,
   exported, or included in proof artifacts, and only derived scalar diagnostics
-  may be reported. Audio and speech-recognizer ownership must be single-owner
-  in the later Android route.
+  may be reported. Run Mode suspends `SpeechRecognizer` before `AudioRecord`
+  starts so microphone ownership remains single-owner during the shot.
+- Impact audio is processed as a chunk stream. The app does not persist raw PCM
+  and no longer repeatedly copies/rescans the growing in-memory buffer. The
+  provisional pop gates are field-tuned constants and must be validated against
+  realistic ambient no-false-trigger proof before release.
+- `BurstStopMode.ExternalStop` still receives a duration failsafe so a stalled
+  audio marker path cannot keep Camera2/MediaRecorder running indefinitely.
 - Sound-triggered window decoding must use bounded container-PTS windows and
   low-resolution proof thumbnails only. Optional proof fields may contain
   window times, anchor error, decode wall-clock, and source-validity verdicts,
@@ -221,7 +245,10 @@ Run this on every code change before review and before commit.
   endpoints, or pairing codes.
 - Recorded-HFR source processing must close the Android frame source on
   success, no-read, resource-limit, cancellation, and decode-error paths. The
-  app-owned MP4 remains app-private and is deleted after terminal handling.
+  app-owned MP4 remains app-private. Successful attempts are deleted after
+  terminal handling; failed debug attempts may retain only matching
+  `speed_ball_...mp4` files under the 3-file/25 MB cap, and release builds
+  clean failed clips instead of retaining proof media.
 - Imported clips are estimate-only. Clean monotonic container PTS is not strict
   timing proof, and import code must not construct
   `MeasurementRunOutcome.Success`.

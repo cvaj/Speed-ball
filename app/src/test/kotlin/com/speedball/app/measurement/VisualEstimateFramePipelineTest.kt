@@ -341,6 +341,83 @@ class VisualEstimateFramePipelineTest {
     }
 
     @Test
+    fun candidateReducerWithoutBudgetKeepsSiblingBehaviorAboveRecordedHfrCap() {
+        val candidates = noisyCandidateFrames(totalBlobsPerFrame = 25)
+        val noBudget = VisualEstimateCandidateReducer.reduce(
+            frameCandidates = candidates,
+            config = reducerTrackConfig(candidateReductionBudget = null),
+        )
+        val recordedBudget = VisualEstimateCandidateReducer.reduce(
+            frameCandidates = candidates,
+            config = reducerTrackConfig(
+                candidateReductionBudget = CandidateReductionBudget(
+                    maxBlobsPerFrame = 32,
+                    maxTotalCandidateBlobs = 90,
+                    maxRansacCandidates = 90,
+                    maxRansacPairHypotheses = 4_096,
+                    ransacCancellationCheckInterval = 128,
+                ),
+            ),
+        )
+
+        assertInstanceOf(VisualEstimateCandidateReductionOutcome.Success::class.java, noBudget)
+        val budgetFailure = assertInstanceOf(VisualEstimateCandidateReductionOutcome.Failure::class.java, recordedBudget)
+        assertEquals(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, budgetFailure.reason)
+        assertTrue(budgetFailure.message.contains("window cap"))
+    }
+
+    @Test
+    fun recordedHfrBudgetCandidateCeilingIsCoherentWithPairCeiling() {
+        val budget = CandidateReductionBudget(
+            maxBlobsPerFrame = 32,
+            maxTotalCandidateBlobs = 90,
+            maxRansacCandidates = 90,
+            maxRansacPairHypotheses = 4_096,
+            ransacCancellationCheckInterval = 128,
+        )
+        val invalid = CandidateReductionBudget(
+            maxBlobsPerFrame = 32,
+            maxTotalCandidateBlobs = 92,
+            maxRansacCandidates = 92,
+            maxRansacPairHypotheses = 4_096,
+            ransacCancellationCheckInterval = 128,
+        )
+
+        assertEquals(null, budget.validate())
+        assertEquals(4_005, budget.maxRansacCandidates * (budget.maxRansacCandidates - 1) / 2)
+        assertEquals(4_186, invalid.maxRansacCandidates * (invalid.maxRansacCandidates - 1) / 2)
+        assertEquals(MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED, invalid.validate()?.reason)
+    }
+
+    @Test
+    fun physicalCapsuleCandidateIsNotDownRankedByLegacyShapePenalty() {
+        val candidates = List(4) { frameIndex ->
+            val physical = physicalCapsuleBlob(x = 10 + frameIndex * 6, y = 20)
+            val blobs = if (frameIndex in 1..2) {
+                listOf(physical, testBlob(x = 10 + frameIndex * 6, y = 20))
+            } else {
+                listOf(physical)
+            }
+            VisualEstimateCandidateFrame(
+                compactPosition = frameIndex,
+                originalFrameIndex = frameIndex,
+                timestampSeconds = frameIndex / 120.0,
+                width = 96,
+                height = 64,
+                blobs = blobs,
+            )
+        }
+
+        val result = VisualEstimateCandidateReducer.reduce(
+            frameCandidates = candidates,
+            config = reducerTrackConfig(candidateReductionBudget = null),
+        )
+
+        val success = assertInstanceOf(VisualEstimateCandidateReductionOutcome.Success::class.java, result, result.toString())
+        assertTrue(success.selected.all { (_, blob) -> blob.physicalMetrics != null }, success.selected.toString())
+    }
+
+    @Test
     fun frameBoundsNoReadBeforePixelsCanLeakIntoResult() {
         val outcome = VisualEstimateFramePipeline.estimateFromFrames(
             sequence = TimedFrameSequence(
@@ -387,6 +464,62 @@ class VisualEstimateFramePipelineTest {
             ),
             estimateConfig = estimateConfig,
             timing = timing,
+        )
+
+    private fun reducerTrackConfig(candidateReductionBudget: CandidateReductionBudget?): TrackExtractionConfig =
+        TrackExtractionConfig(
+            detectorConfig = defaultConfig(
+                width = 120,
+                height = 80,
+                bounds = testBounds(width = 120, height = 80),
+            ),
+            maxFrameToFrameJumpPx = 120.0,
+            allowDirectionalCandidateSelection = true,
+            candidateReductionBudget = candidateReductionBudget,
+        )
+
+    private fun noisyCandidateFrames(totalBlobsPerFrame: Int): List<VisualEstimateCandidateFrame> =
+        List(4) { frameIndex ->
+            val trackBlob = testBlob(x = 10 + frameIndex * 5, y = 20)
+            val decoys = (1 until totalBlobsPerFrame).map { offset ->
+                testBlob(x = 2 + offset * 3 % 110, y = 40 + offset % 20)
+            }
+            VisualEstimateCandidateFrame(
+                compactPosition = frameIndex,
+                originalFrameIndex = frameIndex,
+                timestampSeconds = frameIndex / 100.0,
+                width = 120,
+                height = 80,
+                blobs = listOf(trackBlob) + decoys,
+            )
+        }
+
+    private fun testBlob(x: Int, y: Int): Blob =
+        Blob(
+            areaPx = 4,
+            centroid = ImagePoint(x.toDouble(), y.toDouble()),
+            bounds = PixelBounds(x, y, x + 1, y + 1),
+            compactness = 1.0,
+        )
+
+    private fun physicalCapsuleBlob(x: Int, y: Int): Blob =
+        Blob(
+            areaPx = 24,
+            centroid = ImagePoint(x.toDouble(), y.toDouble()),
+            bounds = PixelBounds(x - 8, y - 2, x + 8, y + 2),
+            compactness = 0.20,
+            physicalMetrics = PhysicalBallCandidateMetrics(
+                solidity = 0.85,
+                principalAxisRatio = 4.2,
+                roundness = 0.30,
+                capsuleScore = 0.55,
+                meanHueDegrees = 120.0,
+                meanSaturation = 1.0,
+                meanValue = 1.0,
+                saturationStdDev = 0.02,
+                valueStdDev = 0.03,
+                touchesFrameEdge = false,
+            ),
         )
 
     private fun testBounds(

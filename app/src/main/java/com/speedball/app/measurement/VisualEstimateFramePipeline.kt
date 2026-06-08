@@ -205,17 +205,35 @@ object VisualEstimateCandidateReducer {
     fun reduce(
         frameCandidates: List<VisualEstimateCandidateFrame>,
         config: TrackExtractionConfig,
+        isCancelled: () -> Boolean = { false },
     ): VisualEstimateCandidateReductionOutcome {
+        config.candidateReductionBudget?.validate()?.let {
+            return VisualEstimateCandidateReductionOutcome.Failure(it.reason.toVisualReason(), it.message)
+        }
+        enforceCandidateBudget(frameCandidates, config.candidateReductionBudget)?.let { return it }
+        if (isCancelled()) {
+            return VisualEstimateCandidateReductionOutcome.Failure(
+                VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                "Recorded-HFR candidate reduction was cancelled before selection.",
+            )
+        }
         if (frameCandidates.size < 4) {
             return VisualEstimateCandidateReductionOutcome.Failure(
                 VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
                 "At least four usable detections are required for an estimate.",
             )
         }
-        val selected = if (config.seedPoint != null) {
-            selectSeededMovingTrack(frameCandidates, config)
-        } else {
-            selectHighVelocityDirectionalTrack(frameCandidates, config)
+        val selected = try {
+            if (config.seedPoint != null) {
+                selectSeededMovingTrack(frameCandidates, config)
+            } else {
+                selectHighVelocityDirectionalTrack(frameCandidates, config, isCancelled)
+            }
+        } catch (failure: CandidateReductionResourceException) {
+            return VisualEstimateCandidateReductionOutcome.Failure(
+                VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                failure.message ?: "Recorded-HFR candidate reduction exceeded the resource budget.",
+            )
         } ?: return VisualEstimateCandidateReductionOutcome.Failure(
             VisualEstimateNoReadReason.AMBIGUOUS_TRACK,
             "Multiple blobs did not form one coherent horizontal ball track or seeded moving ball track.",
@@ -232,6 +250,38 @@ object VisualEstimateCandidateReducer {
             selected = selected,
         )
     }
+}
+
+private class CandidateReductionResourceException(message: String) : RuntimeException(message)
+
+private fun enforceCandidateBudget(
+    frameCandidates: List<VisualEstimateCandidateFrame>,
+    budget: CandidateReductionBudget?,
+): VisualEstimateCandidateReductionOutcome.Failure? {
+    if (budget == null) return null
+    var totalBlobs = 0
+    frameCandidates.forEach { frame ->
+        if (frame.blobs.size > budget.maxBlobsPerFrame) {
+            return VisualEstimateCandidateReductionOutcome.Failure(
+                VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                "Recorded-HFR frame ${frame.originalFrameIndex} produced ${frame.blobs.size} candidate blobs, exceeding the per-frame cap ${budget.maxBlobsPerFrame}.",
+            )
+        }
+        totalBlobs += frame.blobs.size
+        if (totalBlobs > budget.maxTotalCandidateBlobs) {
+            return VisualEstimateCandidateReductionOutcome.Failure(
+                VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                "Recorded-HFR window produced $totalBlobs candidate blobs, exceeding the window cap ${budget.maxTotalCandidateBlobs}.",
+            )
+        }
+    }
+    if (totalBlobs > budget.maxRansacCandidates) {
+        return VisualEstimateCandidateReductionOutcome.Failure(
+            VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+            "Recorded-HFR RANSAC candidate count $totalBlobs exceeded the reducer cap ${budget.maxRansacCandidates}.",
+        )
+    }
+    return null
 }
 
 private fun extractDirectionalSamples(
@@ -318,8 +368,10 @@ private fun selectSeededMovingTrack(
 private fun selectHighVelocityDirectionalTrack(
     frameCandidates: List<VisualEstimateCandidateFrame>,
     config: TrackExtractionConfig,
+    isCancelled: () -> Boolean = { false },
 ): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
-    selectRansacStraightFlightTrack(frameCandidates, config)?.let { return it }
+    selectRansacStraightFlightTrack(frameCandidates, config, isCancelled)?.let { return it }
+    if (isCancelled()) throw CandidateReductionResourceException("Recorded-HFR candidate reduction exceeded the deadline.")
 
     var bestPath: StraightFlightPath? = null
     for (startIndex in 1 until frameCandidates.size) {
@@ -366,13 +418,28 @@ private fun selectHighVelocityDirectionalTrack(
 private fun selectRansacStraightFlightTrack(
     frameCandidates: List<VisualEstimateCandidateFrame>,
     config: TrackExtractionConfig,
+    isCancelled: () -> Boolean,
 ): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
     val candidates = frameCandidates.flatMapIndexed { frameOrder, frame ->
         frame.blobs.map { blob -> RansacBlobCandidate(frameOrder, frame, blob) }
     }
+    val budget = config.candidateReductionBudget
     var bestConsensus: RansacStraightFlightConsensus? = null
+    var evaluatedPairs = 0
     for (firstIndex in candidates.indices) {
         for (lastIndex in firstIndex + 1 until candidates.size) {
+            evaluatedPairs += 1
+            if (budget != null && evaluatedPairs > budget.maxRansacPairHypotheses) {
+                throw CandidateReductionResourceException(
+                    "Recorded-HFR RANSAC evaluated more than ${budget.maxRansacPairHypotheses} pair hypotheses.",
+                )
+            }
+            if (
+                evaluatedPairs == 1 ||
+                budget != null && evaluatedPairs % budget.ransacCancellationCheckInterval == 0
+            ) {
+                if (isCancelled()) throw CandidateReductionResourceException("Recorded-HFR candidate reduction exceeded the deadline.")
+            }
             val hypothesis = RansacLineHypothesis.from(candidates[firstIndex], candidates[lastIndex]) ?: continue
             val consensusPath = ransacConsensusPath(frameCandidates, hypothesis, config)
             if (consensusPath.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) continue
@@ -609,6 +676,9 @@ private fun normalizedLineResidual(path: List<Pair<VisualEstimateCandidateFrame,
 }
 
 private fun blobShapePenalty(blob: Blob): Double {
+    blob.physicalMetrics?.let { metrics ->
+        if (metrics.reason == null) return 0.0
+    }
     val longSide = max(blob.bounds.width, blob.bounds.height).toDouble()
     val shortSide = min(blob.bounds.width, blob.bounds.height).toDouble().coerceAtLeast(1.0)
     val elongation = longSide / shortSide

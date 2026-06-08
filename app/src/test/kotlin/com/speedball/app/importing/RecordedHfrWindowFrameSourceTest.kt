@@ -2,6 +2,7 @@ package com.speedball.app.importing
 
 import com.speedball.app.capture.ContainerTimeWindow
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -108,6 +109,57 @@ class RecordedHfrWindowFrameSourceTest {
         assertInstanceOf(ImportValidationResult.Success::class.java, result)
     }
 
+    @Test
+    fun androidWindowDecoderUsesExtractorCodecPathNotRetrieverFrameIndex() {
+        val androidSource = readProjectFile("app/src/main/java/com/speedball/app/importing/AndroidRecordedHfrWindowFrameSource.kt")
+        val mainActivity = readProjectFile("app/src/main/java/com/speedball/app/MainActivity.kt")
+        val audioSource = readProjectFile("app/src/main/java/com/speedball/app/audio/AndroidImpactAudioTrigger.kt")
+
+        assertTrue(androidSource.contains("MediaExtractor.SEEK_TO_CLOSEST_SYNC"))
+        assertTrue(androidSource.contains("MediaCodec.createDecoderByType"))
+        assertTrue(androidSource.contains("configure(format, null, null, 0)"))
+        assertTrue(androidSource.contains("codec.getOutputBuffer(outputIndex)"))
+        assertTrue(androidSource.contains("RecordedHfrByteBufferYuvConverter.convert"))
+        assertTrue(androidSource.contains("window.windowStartUs"))
+        assertTrue(androidSource.contains("window.windowEndUs"))
+        assertTrue(androidSource.contains("maxDecodeWallClockMillis"))
+        assertFalse(androidSource.contains("ImageReader"))
+        assertFalse(androidSource.contains("getOutputImage"))
+        assertFalse(androidSource.contains(".planes"))
+        assertFalse(androidSource.contains("Bitmap"))
+        assertFalse(androidSource.contains("mutableListOf<ImportVideoFrame>"))
+        assertFalse(androidSource.contains("frames += imageToFrame"))
+        assertTrue(audioSource.contains("AudioTimestamp.TIMEBASE_BOOTTIME"))
+        assertTrue(audioSource.contains("onArmed("))
+        assertTrue(audioSource.indexOf("recorder.startRecording()") < audioSource.indexOf("onArmed("))
+        assertTrue(audioSource.contains("ImpactAudioStreamingDetector"))
+        assertTrue(audioSource.contains("detector.feed(chunk, 0, read)"))
+        assertFalse(audioSource.contains("copyOf(written)"))
+        assertTrue(audioSource.contains("MediaRecorder.AudioSource.UNPROCESSED"))
+        assertTrue(audioSource.contains("MediaRecorder.AudioSource.MIC"))
+        assertFalse(androidSource.contains("import android.media.MediaMetadataRetriever"))
+        assertFalse(androidSource.contains("getFrameAtIndex"))
+        assertTrue(mainActivity.contains("AndroidRecordedHfrWindowFrameSource.create"))
+        assertTrue(mainActivity.contains("autoProbeRecordedHfrByteBuffer"))
+        assertTrue(mainActivity.contains("RecordedHfrByteBufferViabilityProbe.run(file)"))
+        assertTrue(mainActivity.contains("RecordedHfrStreamingTimingMode.CONTAINER_PTS_DELTAS"))
+        assertFalse(mainActivity.substringAfter("private fun runRecordedWindowEstimate").substringBefore("private fun reconcileImportTiming").contains("AndroidImportVideoFrameSource.create"))
+    }
+
+    @Test
+    fun byteBufferViabilityProbeAvoidsPlaneApiFamily() {
+        val probe = readProjectFile("app/src/main/java/com/speedball/app/importing/RecordedHfrByteBufferViabilityProbe.kt")
+
+        assertTrue(probe.contains("configure(inputFormat, null, null, 0)"))
+        assertTrue(probe.contains("codec.getOutputBuffer(outputIndex)"))
+        assertTrue(probe.contains("MediaFormat.KEY_COLOR_FORMAT"))
+        assertTrue(probe.contains("MediaFormat.KEY_STRIDE"))
+        assertTrue(probe.contains("MediaFormat.KEY_SLICE_HEIGHT"))
+        assertFalse(probe.contains("ImageReader"))
+        assertFalse(probe.contains("getOutputImage"))
+        assertFalse(probe.contains(".planes"))
+    }
+
     private fun assertSuccess(
         result: ImportValidationResult<RecordedHfrWindowFrameSource>,
     ): RecordedHfrWindowFrameSource =
@@ -178,4 +230,12 @@ class RecordedHfrWindowFrameSourceTest {
             height = 2,
             argbPixels = IntArray(4) { 0xff000000.toInt() },
         )
+
+    private fun readProjectFile(path: String): String =
+        java.nio.file.Files.readAllLines(
+            listOf(
+                java.nio.file.Path.of(path),
+                java.nio.file.Path.of(path.removePrefix("app/")),
+            ).first { java.nio.file.Files.exists(it) },
+        ).joinToString("\n")
 }

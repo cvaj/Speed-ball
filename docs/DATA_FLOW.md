@@ -84,37 +84,121 @@ MainActivity
   -> developer UI selects default 720p@120 when available
   -> SpeechRecognizer listens for "shoot" in Run Mode after setup is valid
 Camera2 constrained high-speed session
+  -> AudioRecord starts first and obtains TIMEBASE_BOOTTIME mic anchor
   -> offscreen companion preview surface + MediaRecorder surface for Run Mode
-  -> best-effort 1/1000s Camera2 manual exposure request, with AE fallback
-  -> fixed timer stops the recording automatically
+  -> auto-exposure by default; explicit manual fast shutter is opt-in
+  -> actual CaptureResult SENSOR_EXPOSURE_TIME samples feed diagnostics
+  -> first positive capture-result SENSOR_TIMESTAMP anchors the video clock
+  -> Ready cue is emitted after both audio and video anchors exist
+  -> actual cue completion maps to an audio sample index and enables acceptance
+  -> chunk-fed ImpactAudioStreamingDetector scans each finalized audio window once
+  -> loud ambient-relative pop/spike is used only as a timestamp marker
+  -> impact marker maps to a bounded container-PTS decode window
+  -> recorder stops after the 200 ms post-impact capture window
+  -> recorder duration failsafe still caps ExternalStop if no marker arrives
   -> capture callback SENSOR_TIMESTAMP list
   -> BurstDiagnostics unique-count floor + median-gap band
   -> saved burst in app-specific external files
   -> app-owned MP4 is passed directly to recorded estimate processing
   -> redacted metadata and decoded sample count probe
-  -> detector working resolution selection, capped at 1280x720
-  -> streaming `AndroidImportVideoFrameSource.nextFrame()` decode loop
-  -> increment scanned decoded-frame count for every pulled frame
-  -> existing HSV/blob detector while full-frame pixels are local
-  -> discard full-frame ARGB immediately after detection
-  -> retain only bounded candidate blob/index/timestamp records plus bounded thumbnails
+  -> detector working resolution selection, capped at 640x360 for 720p recorded-HFR
+  -> MediaExtractor.seekTo(windowStartUs, CLOSEST_SYNC)
+  -> MediaCodec.configure(format, null, null, 0) byte-buffer decode
+  -> read codec output with getOutputBuffer(), KEY_COLOR_FORMAT, KEY_STRIDE, and KEY_SLICE_HEIGHT
+  -> convert only supported raw YUV layouts; unsupported/opaque output fails loud
+  -> emit only frames inside windowStartUs/windowEndUs
+  -> increment scanned decoded-frame count for every emitted in-window frame
+  -> compute ROI/full-frame luma/non-dark-pixel source-validity summary and bounded
+     source proof thumbnails before detector/reducer no-reads
+  -> retain only bounded impact-window ARGB frames needed for median-background
+     motion detection
+  -> foreground(frame) = abs(luma(frame) - medianBackground) over the bounded
+     working frame or optional ROI
+  -> bounded morphology plus connected components emit isolated motion-ball
+     candidates only
+  -> reject no foreground, global lighting/camera motion, merged foreground
+     masses (`BALL_NOT_ISOLATED`), too many isolated moving fragments, oversized
+     components, and over-budget work with fail-loud no-read reasons
+  -> discard full-frame ARGB after motion detection
+  -> retain only bounded motion candidate blob/index/timestamp records plus
+     bounded thumbnails
   -> VisualEstimateCandidateReducer reuses the existing straight-hit/RANSAC selector
-  -> ImportTimingReconciliation with RECORDED_CAPTURE_FRAME_INTERVAL from retained original decoded frame indexes
+  -> ImportTimingReconciliation with CONTAINER_PTS_DELTAS from retained window PTS
   -> skip non-hit leading frames, filter tiny speckles, and use RANSAC-style
      consensus to select a short high-velocity one-directional straight
-     yellow-ball motion window
+     motion-ball window
   -> VisualEstimateCaptureProofBuilder bounded thumbnails from retained recorded-HFR proof frames
-  -> RecordedHfrCaptureGate metadata sample count == scanned decoded-frame count == unique SENSOR_TIMESTAMP count
-  -> RecordedHfrCaptureGate sensor-cadence/capture-proof pass
+  -> RecordedHfrWindowCaptureGate proves the full burst plus bounded window integrity
+  -> actual median exposure above 2 ms returns motion-blur-risk no-read, not mph
   -> VisualEstimateOutcome estimate success or no-read with proof
   -> MeasurementResultUiState.EstimateOutcome UI formatting
   -> SavedResultSummaryStore app-private redacted RECORDED_ESTIMATE summary
   -> ImportEvidenceExporter redacted RECORDED_ESTIMATE text export
-  -> app-owned MP4 deleted after processing
+  -> successful MP4 deleted; failed debug attempts retain only bounded app-private proof clips
 ```
 
-The sound-triggered recorded-HFR window workstream now has batch-1 foundations
-only; `shoot` is not yet routed through it. The new pure path is:
+The sound-triggered recorded-HFR window route is now the live Run Mode `shoot`
+path. A loud ambient-relative impact pop, including a mouth-generated pop, is
+treated as a timestamp marker, not as sound classification. A 2026-06-07 S10+
+device probe logged
+`CAMERA_TIMESTAMP_SOURCE ... source=REALTIME value=1 sharedClockCandidate=true`,
+so the Android route uses `AudioRecord.getTimestamp(TIMEBASE_BOOTTIME)` as the
+audio anchor for the same elapsed-realtime clock base. The impact mic is armed
+before HFR starts, but accepted detections are disabled until the first positive
+Camera2 `SENSOR_TIMESTAMP` exists and the app's own Ready cue has been blanked
+by audio sample index.
+
+The recorded-HFR window decoder no longer uses a render surface for the
+production route. It avoids the entire `ImageReader`/`getOutputImage`/plane API
+family because the S10+ observed crash was a native abort that Kotlin could not
+catch. The 2026-06-07 S10+ byte-buffer spike measured
+`COLOR_FormatYUV420SemiPlanar` (`21`), `stride=1280`, `sliceHeight=720`, and a
+convertible NV12 layout; a source-drain proof decoded 24 bounded-window frames
+from `0..191433 us` with an empty app crash buffer.
+The S10+ recorded-HFR capture route defaults to the 720p@120 mode when
+available. The 1920x1080-to-640x360 transform remains tested as an alternate
+source/import guard, not as the default field capture mode.
+
+The impact detector is streaming, not batch-per-read. Android feeds short audio
+chunks into `ImpactAudioStreamingDetector`; the detector holds a monotonic scan
+cursor, evaluates each finalized fixed baseline/window position once, and uses
+the same arithmetic as the batch compatibility wrapper for identical verdict,
+sample-index, and diagnostic behavior. This removes the previous O(n^2)
+`copyOf(written)`/full-rescan path that made a 5-second actionable window take
+about 40 seconds to report no-impact on the S10+.
+
+The current gates are provisional field-tuned constants:
+`thresholdMultiplier=2.5`, `minimumPeakDelta=100`, and
+`minimumBaselineRms=25.0`. A 2026-06-07 S10+ run showed that a rejected
+post-Ready spike of delta `107.20` / ratio `3.04` should count as a valid pop.
+The same gate must not accept near-silent breath/rustle or moderate sub-pop
+ambient transients, and field proof must include a realistic outdoor/noisy
+ambient no-pop window.
+
+```text
+AudioRecord timestamp anchor from getTimestamp(TIMEBASE_BOOTTIME)
+  -> first positive Camera2 SENSOR_TIMESTAMP + elapsedRealtimeNanos video anchor
+  -> actual Ready cue completion maps to accept-after audio sample index
+  -> ImpactAudioStreamingDetector detects the first post-ready loud ambient-delta marker only
+  -> AudioVideoClockAnchor maps both anchors to elapsedRealtimeNanos
+  -> ImpactWindowMapper computes container-time windowStartUs/windowEndUs
+     with sensor impact frame index retained as diagnostic only
+  -> AndroidRecordedHfrWindowFrameSource seeks by container PTS and decodes a
+     bounded MediaCodec window, not the whole clip
+  -> RecordedHfrWindowCaptureGate accepts a bounded decoded subset while
+     proving capture cadence/source validity and leaving the full-burst gate
+     unchanged for non-windowed paths
+  -> optional ROI or full-frame 640x360 working region feeds bounded
+     median-background motion candidate generation
+  -> recorded-HFR candidate budget enforces 32 blobs/frame, 90 total blobs,
+     90 RANSAC candidates, and 4096 pair hypotheses
+  -> RecordedHfrStreamingEstimate uses CONTAINER_PTS_DELTAS timing mode for
+     retained sound-window candidates
+  -> VisualEstimateCaptureProof carries window/anchor/decode/source validity
+     fields for the attempt report
+```
+
+The pure foundation shape remains:
 
 ```text
 AudioRecord timestamp anchor from getTimestamp framePosition/nanoTime
@@ -133,13 +217,15 @@ AudioRecord timestamp anchor from getTimestamp framePosition/nanoTime
      validity fields for the attempt report
 ```
 
-This foundation still requires batch-2 Android recorder/microphone orchestration,
-bounded MediaExtractor/MediaCodec implementation, and S10+ device proof before
-it can be claimed as the live Run Mode route.
-
 If the recorded-HFR gate fails, the detector trace/proof may still be shown as
 imagery and counts, but the terminal outcome is no-read and no mph/angle/carry
 value is displayed.
+
+Failed recorded-HFR attempts in debug builds retain at most three app-owned
+`speed_ball_<width>x<height>_<fps>_<timestamp>.mp4` files and at most 25 MB
+total, scoped to the app-private movies directory. Logs and reports use only
+sanitized display names and byte counts. Release builds clean up failed clips
+instead of retaining debug proof media.
 
 The older decode proof branch remains diagnostic-only:
 
@@ -206,11 +292,13 @@ time-spread gates still see gaps.
 ## Phase 13 S10+ Visual Estimate Path
 
 Setup Mode owns camera permission, selected high-speed mode, A/B caliper
-positions, raw distance text and parsed feet, color sample, ROI, level reference,
-and fallback/import setup. Run Mode consumes that setup but does not edit it as
-the normal surface. Entering Run Mode and every `shoot` re-checks the same setup
-gates; invalid setup produces a specific run-state reason and does not start
-capture.
+positions, raw distance text and parsed feet, optional color sample, optional ROI, level
+reference, and fallback/import setup. Run Mode consumes that setup but does not
+edit it as the normal surface. Entering Run Mode and every `shoot` re-checks
+distance, level, permission, and mode gates; invalid setup produces a
+specific run-state reason and does not start capture. Recorded-HFR treats ROI as
+optional and falls back to the bounded full-frame working region when it is
+missing or invalid, and treats color as optional post-motion evidence.
 
 The setup drawer button labeled `Est 120` starts the direct visual-estimate
 diagnostic path. Run Mode `Shoot` and the readiness-gated voice command `shoot`
@@ -239,9 +327,10 @@ DirectVisualEstimateCapture
 Capture proof is one-attempt-deep and in memory by default. It contains
 low-resolution thumbnail pixels, ROI/candidate/selected overlays, readback or
 recorded-source dimensions, scanned decoded-frame count, retained candidate
-counts, frame callback counts, unique sensor timestamp count, and bounded
-detector counts. It does not contain mph, angle, distance, raw media paths,
-full-resolution recorded frames, or a strict timing-proof token. No-read and failure
+counts, frame callback counts, unique sensor timestamp count, bounded detector
+counts, optional resource-cap reason, and exposure/source-validity diagnostics.
+It does not contain mph, angle, distance, raw media paths, full-resolution
+recorded frames, or a strict timing-proof token. No-read and failure
 reports use the proof to explain whether zero frames, zero candidates, too few
 candidate frames, too few selected samples, or recorded-source count/cadence
 gates caused the attempt to fail loud.
@@ -617,10 +706,13 @@ calibration plus readback-space ball motion plus known delta time must produce
 the expected mph through real estimate logic, including a non-square/aspect
 ratio case.
 The `shoot` voice command is a readiness-gated recorded-HFR command: it checks
-the same Phase 14 `canArm()` gate used by setup, prints `Ready to shoot`, speaks
-`Ready`, plays three short beeps, and then starts the recorded-HFR path. It must
-not route through `startDirectVisualEstimate()` on S10+. If readiness fails, the
-status row reports the specific condition, logcat records
+the same Phase 14 setup state for distance/color/level/mode readiness, stops
+speech recognition, arms impact audio, starts HFR after the mic is actually
+listening, waits for the first video timestamp, and only then emits the
+Ready/beep cue. Marker acceptance is enabled after the actual cue completion
+maps to an audio sample index. It must not route through
+`startDirectVisualEstimate()` on S10+. If readiness fails, the status row reports
+the specific condition, logcat records
 `VOICE_SHOOT_NOT_READY`, and listening continues. The preview surface is a setup
 aid only. Recorded capture can use an offscreen companion preview surface, and
 the setup feed restarts after completion, failure, or no-read.

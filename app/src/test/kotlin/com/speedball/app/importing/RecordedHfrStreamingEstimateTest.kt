@@ -1,13 +1,17 @@
 package com.speedball.app.importing
 
 import com.speedball.app.measurement.BlobDetectionConfig
+import com.speedball.app.measurement.CandidateReductionBudget
 import com.speedball.app.measurement.EstimateTimingBasis
 import com.speedball.app.measurement.FrameProcessingBounds
 import com.speedball.app.measurement.HsvColor
 import com.speedball.app.measurement.HsvThreshold
 import com.speedball.app.measurement.HsvTolerance
 import com.speedball.app.measurement.MeasurementCalibrationState
+import com.speedball.app.measurement.MinimumSpeedGatePolicy
 import com.speedball.app.measurement.RegionOfInterest
+import com.speedball.app.measurement.RecordedHfrMotionDetectorConfig
+import com.speedball.app.measurement.RecordedHfrPhysicalDetectorConfig
 import com.speedball.app.measurement.TrackExtractionConfig
 import com.speedball.app.measurement.VisualEstimateCandidateFrame
 import com.speedball.app.measurement.VisualEstimateConfidence
@@ -21,6 +25,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import kotlin.math.abs
 
 class RecordedHfrStreamingEstimateTest {
     @Test
@@ -142,6 +147,42 @@ class RecordedHfrStreamingEstimateTest {
         assertTrue(noRead.message.contains("container PTS"))
     }
 
+    @Test
+    fun recordedHfrScaleGoldenKeepsMphInvariantAndRejectsHalvingAt640x360() {
+        val full = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(
+                scaleGoldenFrames(
+                    width = 1280,
+                    height = 720,
+                    y = 360,
+                    positions = listOf(100, 130, 160, 190),
+                    blobRadius = 3,
+                ),
+            ),
+            config = scaleGoldenConfig(width = 1280, height = 720, pixelsPerFoot = 30.0, maxJumpPx = 90.0),
+        )
+        val working = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(
+                scaleGoldenFrames(
+                    width = 640,
+                    height = 360,
+                    y = 180,
+                    positions = listOf(50, 65, 80, 95),
+                    blobRadius = 2,
+                ),
+            ),
+            config = scaleGoldenConfig(width = 640, height = 360, pixelsPerFoot = 15.0, maxJumpPx = 45.0),
+        )
+
+        val mph720 = assertInstanceOf(VisualEstimateOutcome.Success::class.java, full.outcome, full.outcome.toString()).milesPerHour
+        val mph640 = assertInstanceOf(VisualEstimateOutcome.Success::class.java, working.outcome, working.outcome.toString()).milesPerHour
+        val relativeError = abs(mph640 - mph720) / mph720
+        val halvedRelativeError = abs(mph640 - mph720 * 0.5) / mph720
+
+        assertTrue(relativeError <= 0.05, "640x360 mph=$mph640 720p mph=$mph720")
+        assertFalse(halvedRelativeError <= 0.05, "640x360 mph must not match a half-speed scale bug")
+    }
+
 
     @Test
     fun oneToThreeCandidateFramesNoReadWithCountsAndNoSpeed() {
@@ -164,6 +205,24 @@ class RecordedHfrStreamingEstimateTest {
         assertEquals(3, noRead.diagnostics?.candidateFrameCount)
         assertEquals(0, noRead.diagnostics?.selectedSampleCount)
         assertFalse(noRead.toString().contains("mph", ignoreCase = true))
+    }
+
+    @Test
+    fun allBlackWindowFailsAsSourceInvalidWithProofBeforeInsufficientDetections() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(List(8) { index -> blankFrame(index, ptsNanos = index * 8_333_333L) }),
+            config = streamingConfig(timingMode = RecordedHfrStreamingTimingMode.CONTAINER_PTS_DELTAS),
+        )
+
+        val noRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, result.outcome)
+        assertEquals(VisualEstimateNoReadReason.DETECTION_FAILED, noRead.reason)
+        assertTrue(noRead.message.contains("black", ignoreCase = true))
+        assertEquals("NO_READ_BLACK_OR_INVALID_SOURCE", result.sourceValidity.verdict)
+        assertFalse(result.sourceValidity.passes)
+        assertTrue(result.retainedProofFrameCount > 0)
+        assertTrue(result.proofThumbnails.isNotEmpty())
+        assertEquals(0, result.retainedCandidateFrameCount)
+        assertEquals(0, result.candidateBlobCount)
     }
 
     @Test
@@ -201,6 +260,130 @@ class RecordedHfrStreamingEstimateTest {
         assertTrue(result.proofThumbnails.size <= 4)
     }
 
+    @Test
+    fun recordedBudgetCapsCandidateBlobsBeforeRansacWork() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(
+                List(4) { frameIndex ->
+                    multiBlobFrame(index = frameIndex, blobCount = 25)
+                },
+            ),
+            config = streamingConfig(
+                candidateReductionBudget = CandidateReductionBudget(
+                    maxBlobsPerFrame = 32,
+                    maxTotalCandidateBlobs = 90,
+                    maxRansacCandidates = 90,
+                    maxRansacPairHypotheses = 4_096,
+                    ransacCancellationCheckInterval = 128,
+                ),
+            ),
+        )
+
+        val noRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, result.outcome)
+        assertEquals(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, noRead.reason)
+        assertTrue(noRead.message.contains("window cap"), noRead.message)
+        assertTrue(result.retainedProofFrameCount > 0)
+        assertFalse(noRead.toString().contains("mph", ignoreCase = true))
+    }
+
+    @Test
+    fun physicalDetectorOptInMergesFragmentsBeforeRecordedHfrCandidateBudget() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(
+                List(7) { index ->
+                    physicalFragmentFrame(index = index, x = 18 + index * 5)
+                },
+            ),
+            config = physicalStreamingConfig(
+                candidateReductionBudget = CandidateReductionBudget(
+                    maxBlobsPerFrame = 1,
+                    maxTotalCandidateBlobs = 8,
+                    maxRansacCandidates = 8,
+                    maxRansacPairHypotheses = 28,
+                    ransacCancellationCheckInterval = 4,
+                ),
+            ),
+        )
+
+        val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, result.outcome, result.outcome.toString())
+        assertEquals(7, result.scannedFrameCount)
+        assertTrue(result.retainedCandidateFrameCount >= 4)
+        assertEquals(result.retainedCandidateFrameCount, result.candidateBlobCount)
+        assertTrue(result.detectorTrace.frames.all { frame -> frame.candidates.all { it.physicalMetrics != null } })
+        assertTrue(success.milesPerHour > 1.0)
+    }
+
+    @Test
+    fun motionDetectorOptInFindsMovingObjectWithoutColorThreshold() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
+            config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = 35.0),
+        )
+
+        val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, result.outcome, result.outcome.toString())
+        assertEquals(7, result.scannedFrameCount)
+        assertEquals(7, result.retainedCandidateFrameCount)
+        assertEquals(7, result.candidateBlobCount)
+        assertTrue(result.detectorTrace.frames.all { frame -> frame.candidates.all { it.motionMetrics != null } })
+        assertTrue(success.milesPerHour > 35.0, "motion mph=${success.milesPerHour}")
+    }
+
+    @Test
+    fun motionDetectorRejectsSlowMediumMoverBySamePlaneSpeedFloorWhileFastCapsulePasses() {
+        val slow = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
+            config = motionStreamingConfig(pixelsPerFoot = 200.0, minEstimateMilesPerHour = 35.0),
+        )
+        val fast = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
+            config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = 35.0),
+        )
+
+        val slowNoRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, slow.outcome, slow.outcome.toString())
+        val fastSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, fast.outcome, fast.outcome.toString())
+        assertEquals(VisualEstimateNoReadReason.AMBIGUOUS_TRACK, slowNoRead.reason)
+        assertTrue(slowNoRead.message.contains("speed threshold"), slowNoRead.message)
+        assertTrue(slow.retainedCandidateFrameCount >= 4, "slow path must reach speed discrimination, not fail shape detection")
+        assertTrue(fastSuccess.milesPerHour > 35.0, "fast mph=${fastSuccess.milesPerHour}")
+    }
+
+    @Test
+    fun motionAndPhysicalDetectorConfigConflictFailsLoudBeforeDecode() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
+            config = physicalStreamingConfig(
+                candidateReductionBudget = CandidateReductionBudget(
+                    maxBlobsPerFrame = 1,
+                    maxTotalCandidateBlobs = 8,
+                    maxRansacCandidates = 8,
+                    maxRansacPairHypotheses = 28,
+                    ransacCancellationCheckInterval = 4,
+                ),
+            ).copy(motionDetectorConfig = RecordedHfrMotionDetectorConfig()),
+        )
+
+        val noRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, result.outcome)
+        assertEquals(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, noRead.reason)
+        assertEquals(0, result.scannedFrameCount)
+        assertTrue(noRead.message.contains("both physical and fixed-camera motion detectors"), noRead.message)
+    }
+
+    @Test
+    fun proofOnlyWindowBuildsThumbnailsWithoutCandidateDetection() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(List(8) { index -> ballFrame(index = index, x = 2 + index) }),
+            config = streamingConfig(proofOnly = true),
+        )
+
+        val noRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, result.outcome)
+        assertEquals(VisualEstimateNoReadReason.EXCESSIVE_RESIDUAL, noRead.reason)
+        assertEquals(8, result.scannedFrameCount)
+        assertEquals(0, result.retainedCandidateFrameCount)
+        assertEquals(0, result.candidateBlobCount)
+        assertTrue(result.retainedProofFrameCount > 0)
+        assertTrue(result.proofThumbnails.isNotEmpty())
+    }
+
     private class FakeFrameSource(
         private val frames: List<ImportVideoFrame>,
     ) : ImportFrameSource {
@@ -221,6 +404,8 @@ class RecordedHfrStreamingEstimateTest {
         maxRetainedCandidateFrames: Int = 40,
         maxProofFrames: Int = 8,
         timingMode: RecordedHfrStreamingTimingMode = RecordedHfrStreamingTimingMode.FRAME_INDEX_INTERVAL,
+        candidateReductionBudget: CandidateReductionBudget? = null,
+        proofOnly: Boolean = false,
     ): RecordedHfrStreamingEstimateConfig =
         RecordedHfrStreamingEstimateConfig(
             frameIntervalSeconds = 1.0 / 120.0,
@@ -247,6 +432,7 @@ class RecordedHfrStreamingEstimateTest {
                     ),
                     maxFrameToFrameJumpPx = 100.0,
                     allowDirectionalCandidateSelection = true,
+                    candidateReductionBudget = candidateReductionBudget,
                 ),
                 estimateConfig = VisualEstimatePipelineConfig(minEstimateMilesPerHour = 1.0),
             ),
@@ -256,6 +442,141 @@ class RecordedHfrStreamingEstimateTest {
             proofThumbnailMaxWidth = 16,
             proofThumbnailMaxHeight = 9,
             timingMode = timingMode,
+            proofOnly = proofOnly,
+        )
+
+    private fun scaleGoldenConfig(
+        width: Int,
+        height: Int,
+        pixelsPerFoot: Double,
+        maxJumpPx: Double,
+    ): RecordedHfrStreamingEstimateConfig =
+        RecordedHfrStreamingEstimateConfig(
+            frameIntervalSeconds = 1.0 / 120.0,
+            calibration = calibration(pixels = pixelsPerFoot, feet = 1.0),
+            framePipelineConfig = VisualEstimateFramePipelineConfig(
+                trackConfig = TrackExtractionConfig(
+                    detectorConfig = BlobDetectionConfig(
+                        threshold = HsvThreshold(
+                            center = HsvColor(120.0, 1.0, 1.0),
+                            tolerance = HsvTolerance(10.0, 0.1, 0.1),
+                        ),
+                        roi = RegionOfInterest(0, 0, width, height),
+                        minAreaPx = 1,
+                        maxAreaPx = 128,
+                        bounds = FrameProcessingBounds(
+                            maxWidth = width,
+                            maxHeight = height,
+                            maxPixels = width * height,
+                            maxFrameCount = 24,
+                            maxThresholdPixels = width * height,
+                            maxComponentsPerFrame = width * height,
+                            maxOperationsPerFrame = width * height * 20,
+                        ),
+                    ),
+                    maxFrameToFrameJumpPx = maxJumpPx,
+                    allowDirectionalCandidateSelection = true,
+                ),
+                estimateConfig = VisualEstimatePipelineConfig(minEstimateMilesPerHour = 1.0),
+            ),
+            maxScannedFrames = 24,
+            maxRetainedCandidateFrames = 24,
+            maxProofFrames = 4,
+            proofThumbnailMaxWidth = 96,
+            proofThumbnailMaxHeight = 54,
+        )
+
+    private fun physicalStreamingConfig(
+        candidateReductionBudget: CandidateReductionBudget,
+    ): RecordedHfrStreamingEstimateConfig =
+        RecordedHfrStreamingEstimateConfig(
+            frameIntervalSeconds = 1.0 / 120.0,
+            calibration = calibration(pixels = 10.0, feet = 1.0),
+            framePipelineConfig = VisualEstimateFramePipelineConfig(
+                trackConfig = TrackExtractionConfig(
+                    detectorConfig = BlobDetectionConfig(
+                        threshold = HsvThreshold(
+                            center = HsvColor(120.0, 1.0, 1.0),
+                            tolerance = HsvTolerance(10.0, 0.1, 0.1),
+                        ),
+                        roi = RegionOfInterest(0, 0, PHYSICAL_WIDTH, PHYSICAL_HEIGHT),
+                        minAreaPx = 1,
+                        maxAreaPx = PHYSICAL_WIDTH * PHYSICAL_HEIGHT,
+                        bounds = FrameProcessingBounds(
+                            maxWidth = PHYSICAL_WIDTH,
+                            maxHeight = PHYSICAL_HEIGHT,
+                            maxPixels = PHYSICAL_WIDTH * PHYSICAL_HEIGHT,
+                            maxFrameCount = 24,
+                            maxThresholdPixels = PHYSICAL_WIDTH * PHYSICAL_HEIGHT,
+                            maxComponentsPerFrame = PHYSICAL_WIDTH * PHYSICAL_HEIGHT,
+                            maxOperationsPerFrame = PHYSICAL_WIDTH * PHYSICAL_HEIGHT * 80,
+                        ),
+                    ),
+                    maxFrameToFrameJumpPx = 80.0,
+                    allowDirectionalCandidateSelection = true,
+                    candidateReductionBudget = candidateReductionBudget,
+                ),
+                estimateConfig = VisualEstimatePipelineConfig(minEstimateMilesPerHour = 1.0),
+            ),
+            maxScannedFrames = 24,
+            maxRetainedCandidateFrames = 12,
+            maxProofFrames = 6,
+            proofThumbnailMaxWidth = 32,
+            proofThumbnailMaxHeight = 18,
+            physicalDetectorConfig = RecordedHfrPhysicalDetectorConfig(),
+        )
+
+    private fun motionStreamingConfig(
+        pixelsPerFoot: Double,
+        minEstimateMilesPerHour: Double,
+    ): RecordedHfrStreamingEstimateConfig =
+        RecordedHfrStreamingEstimateConfig(
+            frameIntervalSeconds = 1.0 / 120.0,
+            calibration = calibration(pixels = pixelsPerFoot, feet = 1.0),
+            framePipelineConfig = VisualEstimateFramePipelineConfig(
+                trackConfig = TrackExtractionConfig(
+                    detectorConfig = BlobDetectionConfig(
+                        threshold = HsvThreshold(
+                            center = HsvColor(120.0, 1.0, 1.0),
+                            tolerance = HsvTolerance(4.0, 0.05, 0.05),
+                        ),
+                        roi = RegionOfInterest(0, 0, MOTION_WIDTH, MOTION_HEIGHT),
+                        minAreaPx = 1,
+                        maxAreaPx = MOTION_WIDTH * MOTION_HEIGHT,
+                        bounds = FrameProcessingBounds(
+                            maxWidth = MOTION_WIDTH,
+                            maxHeight = MOTION_HEIGHT,
+                            maxPixels = MOTION_WIDTH * MOTION_HEIGHT,
+                            maxFrameCount = 24,
+                            maxThresholdPixels = MOTION_WIDTH * MOTION_HEIGHT,
+                            maxComponentsPerFrame = MOTION_WIDTH * MOTION_HEIGHT,
+                            maxOperationsPerFrame = MOTION_WIDTH * MOTION_HEIGHT * 80,
+                        ),
+                    ),
+                    maxFrameToFrameJumpPx = 100.0,
+                    allowDirectionalCandidateSelection = true,
+                    candidateReductionBudget = CandidateReductionBudget(
+                        maxBlobsPerFrame = 2,
+                        maxTotalCandidateBlobs = 16,
+                        maxRansacCandidates = 16,
+                        maxRansacPairHypotheses = 256,
+                        ransacCancellationCheckInterval = 8,
+                    ),
+                ),
+                estimateConfig = VisualEstimatePipelineConfig(
+                    minEstimateMilesPerHour = minEstimateMilesPerHour,
+                    minimumSpeedGatePolicy = MinimumSpeedGatePolicy.SAME_PLANE_ONLY,
+                ),
+            ),
+            maxScannedFrames = 24,
+            maxRetainedCandidateFrames = 12,
+            maxProofFrames = 6,
+            proofThumbnailMaxWidth = 64,
+            proofThumbnailMaxHeight = 36,
+            motionDetectorConfig = RecordedHfrMotionDetectorConfig(
+                openRadiusPx = 0,
+                closeRadiusPx = 1,
+            ),
         )
 
     private fun calibration(pixels: Double, feet: Double): MeasurementCalibrationState =
@@ -277,20 +598,120 @@ class RecordedHfrStreamingEstimateTest {
         )
     }
 
-    private fun blankFrame(index: Int): ImportVideoFrame =
+    private fun multiBlobFrame(index: Int, blobCount: Int): ImportVideoFrame {
+        val pixels = IntArray(FRAME_WIDTH * FRAME_HEIGHT) { BLACK }
+        repeat(blobCount) { order ->
+            val x = (order * 2) % FRAME_WIDTH
+            val y = order % FRAME_HEIGHT
+            pixels[y * FRAME_WIDTH + x] = GREEN
+        }
+        return ImportVideoFrame(
+            frameIndex = index,
+            presentationTimestampNanos = index * 8_333_333L,
+            width = FRAME_WIDTH,
+            height = FRAME_HEIGHT,
+            argbPixels = pixels,
+        )
+    }
+
+    private fun scaleGoldenFrames(
+        width: Int,
+        height: Int,
+        y: Int,
+        positions: List<Int>,
+        blobRadius: Int,
+    ): List<ImportVideoFrame> =
+        positions.mapIndexed { index, x ->
+            val pixels = IntArray(width * height) { DARK_GRAY }
+            for (dy in -blobRadius..blobRadius) {
+                for (dx in -blobRadius..blobRadius) {
+                    val px = x + dx
+                    val py = y + dy
+                    if (px in 0 until width && py in 0 until height) {
+                        pixels[py * width + px] = GREEN
+                    }
+                }
+            }
+            ImportVideoFrame(
+                frameIndex = index,
+                presentationTimestampNanos = null,
+                width = width,
+                height = height,
+                argbPixels = pixels,
+            )
+        }
+
+    private fun blankFrame(index: Int, ptsNanos: Long? = null): ImportVideoFrame =
         ImportVideoFrame(
             frameIndex = index,
-            presentationTimestampNanos = null,
+            presentationTimestampNanos = ptsNanos,
             width = FRAME_WIDTH,
             height = FRAME_HEIGHT,
             argbPixels = IntArray(FRAME_WIDTH * FRAME_HEIGHT) { BLACK },
         )
 
+    private fun physicalFragmentFrame(index: Int, x: Int): ImportVideoFrame {
+        val pixels = IntArray(PHYSICAL_WIDTH * PHYSICAL_HEIGHT) { BLACK }
+        fun set(px: Int, py: Int) {
+            if (px in 0 until PHYSICAL_WIDTH && py in 0 until PHYSICAL_HEIGHT) {
+                pixels[py * PHYSICAL_WIDTH + px] = GREEN
+            }
+        }
+        fun disk(cx: Int, cy: Int, radius: Int) {
+            for (py in cy - radius..cy + radius) {
+                for (px in cx - radius..cx + radius) {
+                    val dx = px - cx
+                    val dy = py - cy
+                    if (dx * dx + dy * dy <= radius * radius) set(px, py)
+                }
+            }
+        }
+        for (py in 12..38) {
+            for (px in 0..20) set(px, py)
+        }
+        disk(x, 24, 4)
+        disk(x + 6, 24, 4)
+        return ImportVideoFrame(
+            frameIndex = index,
+            presentationTimestampNanos = index * 8_333_333L,
+            width = PHYSICAL_WIDTH,
+            height = PHYSICAL_HEIGHT,
+            argbPixels = pixels,
+        )
+    }
+
+    private fun motionCapsuleFrames(stepPx: Int): List<ImportVideoFrame> =
+        List(7) { index ->
+            val pixels = IntArray(MOTION_WIDTH * MOTION_HEIGHT) { DARK_GRAY }
+            val left = 40 + index * stepPx
+            val top = 160
+            for (py in top until top + 40) {
+                for (px in left until left + 100) {
+                    if (px in 0 until MOTION_WIDTH && py in 0 until MOTION_HEIGHT) {
+                        pixels[py * MOTION_WIDTH + px] = WHITE
+                    }
+                }
+            }
+            ImportVideoFrame(
+                frameIndex = index,
+                presentationTimestampNanos = index * 8_333_333L,
+                width = MOTION_WIDTH,
+                height = MOTION_HEIGHT,
+                argbPixels = pixels,
+            )
+        }
+
     private companion object {
         const val FRAME_WIDTH = 40
         const val FRAME_HEIGHT = 9
+        const val PHYSICAL_WIDTH = 96
+        const val PHYSICAL_HEIGHT = 48
+        const val MOTION_WIDTH = 640
+        const val MOTION_HEIGHT = 360
         const val BALL_Y = 4
         const val BLACK = 0xff000000.toInt()
+        const val DARK_GRAY = 0xff202020.toInt()
         const val GREEN = 0xff00ff00.toInt()
+        const val WHITE = 0xffffffff.toInt()
     }
 }

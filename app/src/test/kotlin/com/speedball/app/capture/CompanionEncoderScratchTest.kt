@@ -33,7 +33,7 @@ class CompanionEncoderScratchTest {
 
         assertEquals(3_000_000L, companionScratchFileSizeLimitBytes(mode720, durationMillis = 1))
         assertEquals(9_000_000L, companionScratchFileSizeLimitBytes(mode720, durationMillis = 3_000))
-        assertEquals(15_000_000L, companionScratchFileSizeLimitBytes(mode1080, durationMillis = 99_000))
+        assertEquals(40_000_000L, companionScratchFileSizeLimitBytes(mode1080, durationMillis = 99_000))
     }
 
     @Test

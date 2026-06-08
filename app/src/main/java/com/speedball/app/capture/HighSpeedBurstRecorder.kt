@@ -16,9 +16,11 @@ import android.media.MediaRecorder
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Range
 import android.view.Surface
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Owns one Camera2 constrained-high-speed burst at a time. */
@@ -35,7 +37,10 @@ class HighSpeedBurstRecorder(private val context: Context) {
     private var recorderStarted = false
     private var outputFile: File? = null
     private var timestamps = mutableListOf<Long>()
+    private var actualExposureTimeNanos = mutableListOf<Long>()
     private var callbackCount = AtomicInteger(0)
+    private var firstAnchorSent = AtomicBoolean(false)
+    private var recorderStartCommandElapsedNanos = 0L
     private var completion: ((BurstOutcome) -> Unit)? = null
     private var options: BurstOptions? = null
     private val terminalGate = TerminalCompletionGate()
@@ -55,7 +60,10 @@ class HighSpeedBurstRecorder(private val context: Context) {
             this.options = options.copy(durationMillis = clampBurstDurationMillis(options.durationMillis))
             completion = onComplete
             timestamps = mutableListOf()
+            actualExposureTimeNanos = mutableListOf()
             callbackCount = AtomicInteger(0)
+            firstAnchorSent = AtomicBoolean(false)
+            recorderStartCommandElapsedNanos = 0L
             recorderStarted = false
             terminalGate.reset()
         }
@@ -191,6 +199,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
         try {
             val baseRequest = buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = null)
             val preferredExposureNanos = options?.preferredExposureTimeNanos
+            val timestampSource = readTimestampSourceLabel(manager, cameraId)
             val manualRequest = resolveManualExposureTimeNanos(manager, cameraId, preferredExposureNanos)
                 ?.let { exposureNanos ->
                     buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = exposureNanos)
@@ -204,15 +213,42 @@ class HighSpeedBurstRecorder(private val context: Context) {
                 ) {
                     callbackCount.incrementAndGet()
                     result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { timestamp ->
-                        synchronized(lock) { timestamps.add(timestamp) }
+                        if (timestamp > 0L) {
+                            synchronized(lock) { timestamps.add(timestamp) }
+                            if (firstAnchorSent.compareAndSet(false, true)) {
+                                options?.onFirstFrameAnchor?.invoke(
+                                    BurstFrameAnchor(
+                                        sensorTimestampNanos = timestamp,
+                                        elapsedRealtimeNanos = if (timestampSource == CameraTimestampSourceLabel.REALTIME) {
+                                            timestamp
+                                        } else {
+                                            SystemClock.elapsedRealtimeNanos()
+                                        },
+                                        recorderStartCommandElapsedNanos = recorderStartCommandElapsedNanos,
+                                        timestampSource = timestampSource,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                    result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { exposureTimeNanos ->
+                        if (exposureTimeNanos > 0L) {
+                            synchronized(lock) { actualExposureTimeNanos.add(exposureTimeNanos) }
+                        }
                     }
                 }
             }
             highSpeedSession.setRepeatingBurst(burst, captureCallback, backgroundHandler)
+            recorderStartCommandElapsedNanos = SystemClock.elapsedRealtimeNanos()
             recorder?.start()
             recorderStarted = true
             synchronized(lock) { state = BurstRecorderState.Recording }
-            backgroundHandler.postDelayed({ complete(null, stopRecorder = true) }, options?.durationMillis ?: DEFAULT_BURST_DURATION_MILLIS)
+            resolveBurstDurationFailsafeMillis(
+                stopMode = options?.stopMode ?: BurstStopMode.FixedDuration,
+                durationMillis = options?.durationMillis ?: DEFAULT_BURST_DURATION_MILLIS,
+            )?.let { durationMillis ->
+                backgroundHandler.postDelayed({ complete(null, stopRecorder = true) }, durationMillis)
+            }
         } catch (exception: RuntimeException) {
             complete(
                 BurstOutcome.Failure(BurstFailure.RECORDING_FAILED, "High-speed recording failed: ${exception.message ?: exception.javaClass.simpleName}."),
@@ -235,6 +271,8 @@ class HighSpeedBurstRecorder(private val context: Context) {
             if (exposureTimeNanos != null) {
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                 set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureTimeNanos)
+            } else {
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
             }
         }.build()
 
@@ -274,6 +312,16 @@ class HighSpeedBurstRecorder(private val context: Context) {
             ?: return null
         return exposureRange.clamp(requested)
     }
+
+    private fun readTimestampSourceLabel(manager: CameraManager, cameraId: String): CameraTimestampSourceLabel =
+        try {
+            mapCameraTimestampSourceValue(
+                manager.getCameraCharacteristics(cameraId)
+                    .get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
+            )
+        } catch (_: RuntimeException) {
+            CameraTimestampSourceLabel.UNEXPECTED
+        }
 
     private fun createRecorder(mode: HighSpeedMode): MediaRecorder? {
         val file = File(
@@ -364,6 +412,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
         val safeOptions = options ?: return BurstOutcome.Failure(BurstFailure.RECORDING_FAILED, "Capture options were lost before completion.")
         val output = outputFile
         val timestampCopy = synchronized(lock) { timestamps.toList() }
+        val exposureCopy = synchronized(lock) { actualExposureTimeNanos.toList() }
         val outcome = buildBurstOutcome(
             timestampsNanos = timestampCopy,
             callbackCount = callbackCount.get(),
@@ -371,6 +420,8 @@ class HighSpeedBurstRecorder(private val context: Context) {
             fps = safeOptions.mode.fps,
             outputPath = output?.absolutePath.orEmpty(),
             fileBytes = output?.length() ?: 0L,
+            requestedExposureTimeNanos = safeOptions.preferredExposureTimeNanos,
+            actualExposureTimeNanos = exposureCopy,
         )
         return if (outcome is BurstOutcome.Success) {
             outcome.copy(

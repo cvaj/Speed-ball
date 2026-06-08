@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test
 
 class Phase14WorkflowStateTest {
     @Test
-    fun captureCannotArmUntilPermissionGeometryScaleColorAndLevelAreReady() {
+    fun captureCannotArmUntilPermissionGeometryScaleAndLevelAreReady() {
         val notReady = Phase14WorkflowState().reduce(Phase14WorkflowEvent.ArmCapture)
 
         assertEquals(Phase14CaptureState.NotReady, notReady.capture)
@@ -123,14 +123,14 @@ class Phase14WorkflowStateTest {
     }
 
     @Test
-    fun clearedColorSampleKeepsTargetButPreventsReadiness() {
+    fun clearedColorSampleKeepsTargetButDoesNotBlockRecordedHfrReadiness() {
         val cleared = baseReadyState().reduce(
             Phase14WorkflowEvent.ColorSampleCleared(NormalizedFramePoint(0.25, 0.75)),
         )
 
         assertEquals(NormalizedFramePoint(0.25, 0.75), cleared.colorSamplePoint)
         assertNull(cleared.colorSample)
-        assertFalse(cleared.canArm())
+        assertTrue(cleared.canArm())
         assertInstanceOf(
             ColorWorkflowReadiness.NotReady::class.java,
             cleared.buildColorForActiveReadback().readiness(160, 90),
