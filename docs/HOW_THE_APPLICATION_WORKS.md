@@ -22,21 +22,29 @@ Tapping Tools opens one translucent bottom drawer at a time. The primary drawer
 contains only camera-use actions: target A/B, coarse/fine caliper drag, voice,
 setup, and hide. Setup replaces that drawer instead of stacking
 another panel on the image; it contains distance, permission, mode, manual
-level recapture, ball fallback, color sampling, ROI setup,
+level recapture, ball fallback, color sampling, Ball Box size lock, Impact zone,
 manual estimate, import/recalibration, and recorder diagnostics.
 Both drawer pages print a compact on-screen status row with the current app
 status and active setup target, so actions such as applying distance or
 sampling color have visible confirmation. Hide closes all tools. The A/B
 caliper lines and preview tap/drag calibration remain usable while tools are
 hidden, so field references near the ground are not blocked by the drawer.
-ROI, color sample target, and level/horizon overlays are calibration aids and
-appear only with the summoned operation controls, not as permanent camera
-clutter. The user enters the known distance in feet, slides the two vertical
+The color sample target and level/horizon overlays are calibration aids and
+the Ball Box/Impact handles remain visible while Setup Mode is active so the
+drawer can be hidden during precise placement. The control buttons and text
+inputs remain in the drawer; the camera image keeps only drawing guides. The
+user enters the known distance in feet, slides the two vertical
 lines onto the measured field markers with smooth finger drag, uses the drawer
 toggle for coarse/fine drag precision, samples the ball color from camera
-pixels, and may place an ROI around the expected hit path for setup visibility
-and legacy live/import diagnostics. Run Mode recorded-HFR does not require an
-ROI; when no valid ROI is present it scans the bounded 640x360 working frame
+pixels, may lock the visible four-point Ball Box at the expected travel
+distance, and may draw a four-point Impact zone around the allowed ball-flight
+area. Ball Box and Impact corners move independently, so each shape can be any
+quadrilateral inside the camera image. Corner drags clamp over-drags to the
+image edge instead of ignoring outward motion outside the exact preview bounds. The locked
+Ball Box and Impact zone feed recorded-HFR candidate filtering before blob caps
+and path selection, so outdoor nets, trees, and small color-matched background
+fragments do not exhaust the detector budget. Run Mode recorded-HFR does not require an
+ROI; when no Impact zone is present it scans the bounded 640x360 working frame
 and lets candidate/RANSAC caps plus trajectory gates reject background blobs. The
 distance field is replacement state: editing it after A/B lines are set
 overwrites the active known-distance feet value while preserving the current A/B
@@ -113,7 +121,8 @@ manual direct diagnostic path, proof thumbnails remain bounded low-resolution
 direct-readback frames.
 Zero captured frames means the attempt produced no imagery. Zero candidate
 frames means the median-background motion detector found no isolated usable ball
-candidate in the processed frames. When selected ball color is available, the
+candidate in the processed frames after optional Impact-zone and Ball Box gates.
+When selected ball color is available, the
 motion detector can split a smaller color-matched child blob out of a larger
 moving foreground parent before path selection. `BALL_NOT_ISOLATED` means
 foreground moved, but it was still too merged with a hand/body/bat or otherwise
@@ -123,17 +132,18 @@ velocity, cadence, and smooth-path discriminators ran.
 The app now separates the visible workflow into two app-level modes:
 
 - **Setup Mode** is for configuring camera permission, high-speed mode, A/B
-  distance calipers, raw distance text, ball color, optional ROI, level, fallback, import,
+  distance calipers, raw distance text, ball color, Ball Box size lock, Impact
+  zone, level, fallback, import,
   and diagnostics. The live preview remains visible so the user can align setup.
 - **Run Mode** is for executing shots. It does not present setup editing as the
   normal surface. It shows the camera view, command readiness, a manual `Shoot`
   control, and a way back to Setup Mode.
 
 Setup is expected to happen once per physical setup. Repeated shots preserve A/B
-lines, distance text, optional color, optional ROI, and level unless the user explicitly changes
+lines, distance text, optional color, Ball Box, Impact zone, and level unless the user explicitly changes
 or recalibrates them. Entering Run Mode and every `shoot` re-checks the setup
 gates, so a lost preview, invalid distance, missing level, or
-missing permission blocks the next capture with the specific reason. Invalid ROI
+missing permission blocks the next capture with the specific reason. Invalid legacy ROI
 does not block recorded-HFR; it falls back to the full bounded working frame.
 Green ready/listening means the setup is valid and a command path is available.
 If Android speech recognition is unavailable or repeatedly errors, Run Mode
@@ -284,13 +294,16 @@ debug proof media. The app reads redacted metadata, probes
 monotonic presentation timestamps as estimate evidence only for user-selected
 imports, and streams app-owned recorded-HFR shots one decoded frame at a time
 at a detector working size no larger than 640x360 for the recorded-HFR route.
-Calibration points, optional ROI, motion-candidate gates, and max jump are transformed
-into that working coordinate space before detection. If the optional ROI is
-missing or invalid for recorded-HFR, the detector uses the whole bounded working
-frame. The sound-triggered recorded-HFR route builds a luma median background
+Calibration points, optional ROI, Impact-zone polygon, locked Ball Box size,
+motion-candidate gates, and max jump are transformed into that working
+coordinate space before detection. If the Impact zone is missing or invalid for
+recorded-HFR, the detector uses the whole bounded working frame. The
+sound-triggered recorded-HFR route builds a luma median background
 from the bounded impact window, differences each frame against that static
-background, applies bounded morphology, and emits only isolated motion-ball
-candidates. Large foreground masses are not treated as ball centroids; when a
+background, masks pixels outside the user-drawn Impact zone when present,
+applies the setup-locked Ball Box size gate when present, applies bounded
+morphology, and emits only isolated motion-ball candidates. Large foreground
+masses are not treated as ball centroids; when a
 selected ball color exists inside a moving parent, the detector first tries to
 split bounded color-matched child candidates, otherwise the merged foreground
 no-reads as `BALL_NOT_ISOLATED`. Frames with multiple isolated moving fragments
@@ -445,9 +458,13 @@ a typed failure, or bounded logcat diagnostics.
    travel plane, and may tune the motion-candidate shape ratio from its default
    `2.00`. The user may also edit launch height from the default `4.0` feet so
    carry/distance projection starts at the actual ball height above ground.
-4. In Setup Mode, the user may tap the live feed to sample the ball HSV color
-   and may set an ROI around the expected path. These help diagnostics and
-   legacy/import paths, but recorded-HFR Run Mode can arm without color or ROI.
+4. In Setup Mode, the user may tap Ball Box on the live feed to sample ball HSV
+   color and lock the expected ball size at the actual travel distance, and may
+   drag a four-point Impact zone around the allowed flight area. Ball Box and
+   Impact are independent-corner polygons, not fixed rectangles. These help
+   recorded-HFR reject outdoor background blobs before candidate caps, but Run
+   Mode can still arm without them. The older ROI rectangle remains a legacy
+   diagnostic aid.
 5. In Setup Mode, the app captures a still-phone IMU level snapshot and shows the horizon
    overlay; voice recording captures this automatically if it is missing.
 6. Once setup is valid, the user enters Run Mode. Run Mode shows ready/listening

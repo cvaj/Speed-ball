@@ -125,6 +125,11 @@ Camera2 constrained high-speed session
   -> retain only selected dense/full-window ARGB frames needed for median-background motion detection
   -> foreground(frame) = abs(luma(frame) - medianBackground) over the bounded
      working frame or optional ROI
+  -> optional user-drawn Impact-zone polygon masks foreground pixels before
+     morphology/component counting
+  -> optional setup-locked four-point Ball Box polygon derives expected ball
+     size and rejects components far smaller or larger than the ball at the
+     expected travel distance
   -> bounded morphology plus connected components emit isolated motion-ball
      candidates
   -> if a moving foreground component is merged with a hand/body/bat, selected
@@ -700,7 +705,8 @@ input is revalidated at measurement time rather than trusted from stale state.
 Phase 14 estimate setup stores vertical caliper line positions, the entered
 distance in feet, optional calibration/ball plane depth text, configurable
 launch-height text, configurable motion-blob side ratio, color sample point,
-sampled HSV value, and ROI as
+sampled HSV value, setup-locked four-point Ball Box polygon, four-point Impact-zone polygon,
+and ROI as
 normalized frame coordinates after preview scale and sensor-rotation transform handling.
 It also stores a setup-time
 `LevelReferenceSnapshot` from the phone IMU: `TYPE_GRAVITY` is preferred,
@@ -730,9 +736,10 @@ when the gesture ends. This keeps the line visually tied to the finger instead
 of restarting pointer input or waiting on parent shell recomposition for every
 drag step.
 The reference axis is drawn only from a captured `LevelReferenceSnapshot`; no
-screen-horizontal fallback is drawn. The color sample target, ROI rectangle,
-and level/horizon line are shown only while setup controls are visible.
-Target-selection, line drag gestures, color/ROI feed taps, and the drawer
+screen-horizontal fallback is drawn. The color sample target, magenta Ball Box
+polygon, orange Impact-zone polygon, and level/horizon line remain visible
+in Setup Mode while capture is idle, even when the controls drawer is hidden.
+Target-selection, line drag gestures, Ball Box/Impact/color feed taps, and the drawer
 coarse/fine precision toggle update the same reducer state. Caliper drags use
 the Captain-style fraction update over the visible preview width because the
 vertical A/B lines are display controls that must reach both preview edges.

@@ -38,6 +38,7 @@ import com.speedball.app.measurement.MeasurementTimingProof
 import com.speedball.app.measurement.MeasurementWorkflowEvent
 import com.speedball.app.measurement.MeasurementWorkflowState
 import com.speedball.app.measurement.NormalizedFramePoint
+import com.speedball.app.measurement.NormalizedFramePolygon
 import com.speedball.app.measurement.NormalizedFrameRect
 import com.speedball.app.measurement.Phase14CaptureState
 import com.speedball.app.measurement.Phase14Geometry
@@ -398,6 +399,40 @@ class SpeedBallShellStateTest {
 
         assertTrue(joined.contains("setupTarget=ROI"))
         assertTrue(joined.contains("phase14Color=ready"))
+        assertNoResultValuesExceptCalibrationText(joined)
+    }
+
+    @Test
+    fun phase14ImpactZoneAndBallBoxSetupAreVisibleWithoutEstimateValues() {
+        val setup = phase14ReadyState()
+            .reduce(
+                Phase14WorkflowEvent.ImpactZoneSelected(
+                    NormalizedFramePolygon(
+                        listOf(
+                            NormalizedFramePoint(0.10, 0.30),
+                            NormalizedFramePoint(0.85, 0.25),
+                            NormalizedFramePoint(0.90, 0.72),
+                            NormalizedFramePoint(0.12, 0.78),
+                        ),
+                    ),
+                ),
+            )
+            .reduce(
+                Phase14WorkflowEvent.ExpectedBallBoundsSelected(
+                    NormalizedFramePolygon(
+                        listOf(
+                            NormalizedFramePoint(0.48, 0.44),
+                            NormalizedFramePoint(0.55, 0.45),
+                            NormalizedFramePoint(0.54, 0.56),
+                            NormalizedFramePoint(0.49, 0.55),
+                        ),
+                    ),
+                ),
+            )
+        val joined = phase14WorkflowUiLines(setup).joinToString("\n")
+
+        assertTrue(joined.contains("phase14ImpactZone=ready points=4"))
+        assertTrue(joined.contains("phase14BallBox=ready widthNorm=0.070 heightNorm=0.120"))
         assertNoResultValuesExceptCalibrationText(joined)
     }
 

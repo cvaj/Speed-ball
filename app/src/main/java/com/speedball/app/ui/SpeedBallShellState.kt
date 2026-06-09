@@ -283,11 +283,19 @@ fun phase14WorkflowUiLines(state: Phase14WorkflowState): List<String> {
             }
         }
     }
-    val color = if (state.colorSample != null && state.colorSamplePoint != null && state.regionOfInterest != null) {
-        "phase14Color=ready roi=normalized"
+    val color = if (state.colorSample != null && state.colorSamplePoint != null) {
+        "phase14Color=ready discriminator=optional"
     } else {
-        "phase14Color=not-ready action=sample-color-and-set-roi"
+        "phase14Color=not-ready action=sample-color"
     }
+    val impactZone = state.impactZone?.takeIf { it.isInFrame() }?.let {
+        "phase14ImpactZone=ready points=${it.points.size}"
+    } ?: "phase14ImpactZone=full-frame action=draw-impact-zone-to-limit-background-noise"
+    val ballBox = state.expectedBallBounds?.takeIf { it.isInFrame() }?.let {
+        val width = it.points.maxOf { point -> point.x } - it.points.minOf { point -> point.x }
+        val height = it.points.maxOf { point -> point.y } - it.points.minOf { point -> point.y }
+        "phase14BallBox=ready widthNorm=${width.format(3)} heightNorm=${height.format(3)}"
+    } ?: "phase14BallBox=not-ready action=tap-ball-and-resize-box"
     val source = if (state.permissionReady && state.geometry != null) {
         "phase14Source=ready readback=${state.geometry.readback.width}x${state.geometry.readback.height}"
     } else {
@@ -304,7 +312,7 @@ fun phase14WorkflowUiLines(state: Phase14WorkflowState): List<String> {
         Phase14CaptureState.Complete -> "phase14Capture=complete"
     }
     val result = state.result?.let(::visualEstimateOutcomeUiLines).orEmpty()
-    return listOf(setup, color, source, level, capture) + result
+    return listOf(setup, color, impactZone, ballBox, source, level, capture) + result
 }
 
 private fun sourceProofUiLine(sourceProof: WorkflowSourceProofState): List<String> =

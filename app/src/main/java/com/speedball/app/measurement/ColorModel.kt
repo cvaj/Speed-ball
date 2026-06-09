@@ -1,6 +1,9 @@
 package com.speedball.app.measurement
 
+import com.speedball.core.model.ImagePoint
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
@@ -56,6 +59,58 @@ data class RegionOfInterest(
         )
         return clipped.takeIf { it.left < it.rightExclusive && it.top < it.bottomExclusive }
     }
+}
+
+/** Four-point inclusion polygon in detector pixel coordinates. */
+data class PixelInclusionPolygon(
+    val points: List<ImagePoint>,
+) {
+    init {
+        require(points.size >= 3) { "Inclusion polygon needs at least three points." }
+        require(points.all { it.xPx.isFinite() && it.yPx.isFinite() }) { "Inclusion polygon points must be finite." }
+    }
+
+    fun boundingRoi(width: Int, height: Int): RegionOfInterest? {
+        val left = floor(points.minOf { it.xPx }).toInt()
+        val top = floor(points.minOf { it.yPx }).toInt()
+        val right = ceil(points.maxOf { it.xPx }).toInt() + 1
+        val bottom = ceil(points.maxOf { it.yPx }).toInt() + 1
+        return RegionOfInterest(left, top, right, bottom).clippedTo(width, height)
+    }
+
+    fun contains(x: Int, y: Int): Boolean {
+        val px = x + 0.5
+        val py = y + 0.5
+        var inside = false
+        var previous = points.last()
+        for (current in points) {
+            val intersects = (current.yPx > py) != (previous.yPx > py)
+            if (intersects) {
+                val xAtY = (previous.xPx - current.xPx) * (py - current.yPx) / (previous.yPx - current.yPx) + current.xPx
+                if (px < xAtY) inside = !inside
+            }
+            previous = current
+        }
+        return inside
+    }
+}
+
+/**
+ * Detector-space observed ball size from setup. The bounds are used as a
+ * permissive candidate-size discriminator, not as a standalone speed proof.
+ */
+data class ExpectedBallSizePx(
+    val widthPx: Double,
+    val heightPx: Double,
+) {
+    init {
+        require(widthPx.isFinite() && widthPx > 0.0) { "Expected ball width must be positive." }
+        require(heightPx.isFinite() && heightPx > 0.0) { "Expected ball height must be positive." }
+    }
+
+    val shortSidePx: Double = min(widthPx, heightPx)
+    val longSidePx: Double = max(widthPx, heightPx)
+    val areaPx: Double = widthPx * heightPx
 }
 
 /** CPU and memory guardrails for pure Kotlin frame processing. */

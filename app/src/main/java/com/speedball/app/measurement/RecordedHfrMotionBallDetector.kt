@@ -47,6 +47,11 @@ data class RecordedHfrMotionDetectorConfig(
     val maxMedianGlobalShiftPx: Double = 1.5,
     val maxAdjacentGlobalShiftPx: Double = 4.0,
     val minGlobalMotionImprovementRatio: Double = 0.20,
+    val inclusionPolygon: PixelInclusionPolygon? = null,
+    val expectedBallSizePx: ExpectedBallSizePx? = null,
+    val minExpectedBallAreaRatio: Double = 0.35,
+    val maxExpectedBallAreaRatio: Double = 2.50,
+    val maxExpectedBallSideRatioDelta: Double = 1.00,
 ) {
     fun validate(): MeasurementRunOutcome.NoRead? {
         if (
@@ -78,6 +83,9 @@ data class RecordedHfrMotionDetectorConfig(
             maxMedianGlobalShiftPx,
             maxAdjacentGlobalShiftPx,
             minGlobalMotionImprovementRatio,
+            minExpectedBallAreaRatio,
+            maxExpectedBallAreaRatio,
+            maxExpectedBallSideRatioDelta,
         )
         if (fractions.any { !it.isFinite() || it <= 0.0 } ||
             maxForegroundAreaFractionPerFrame > 1.0 ||
@@ -87,7 +95,8 @@ data class RecordedHfrMotionDetectorConfig(
             maxCandidateShortSideFrameFraction > 1.0 ||
             minCandidateCompactness > 1.0 ||
             minGlobalMotionImprovementRatio >= 1.0 ||
-            globalMotionSearchPx.toDouble() <= maxAdjacentGlobalShiftPx
+            globalMotionSearchPx.toDouble() <= maxAdjacentGlobalShiftPx ||
+            maxExpectedBallAreaRatio < minExpectedBallAreaRatio
         ) {
             return MeasurementRunOutcome.NoRead(
                 MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
@@ -138,8 +147,21 @@ object RecordedHfrMotionBallDetector {
         val width = frames.first().width
         val height = frames.first().height
         val pixelCount = width * height
-        val roi = detectorConfig.roi.clippedTo(width, height)
+        val detectorRoi = detectorConfig.roi.clippedTo(width, height)
             ?: return failure(RecordedHfrMotionDetectorReason.RESOURCE_LIMIT_EXCEEDED, "ROI does not overlap the frame.")
+        val inclusionRoi = motionConfig.inclusionPolygon?.boundingRoi(width, height)
+        val roi = if (inclusionRoi == null) {
+            detectorRoi
+        } else {
+            RegionOfInterest(
+                left = max(detectorRoi.left, inclusionRoi.left),
+                top = max(detectorRoi.top, inclusionRoi.top),
+                rightExclusive = min(detectorRoi.rightExclusive, inclusionRoi.rightExclusive),
+                bottomExclusive = min(detectorRoi.bottomExclusive, inclusionRoi.bottomExclusive),
+            ).clippedTo(width, height)
+                ?: return failure(RecordedHfrMotionDetectorReason.RESOURCE_LIMIT_EXCEEDED, "Impact zone does not overlap the detector frame.")
+        }
+        val inclusionMask = motionConfig.inclusionPolygon?.toMask(width, height, roi)
         val background = medianBackground(frames, pixelCount, isCancelled)
             ?: return failure(RecordedHfrMotionDetectorReason.RESOURCE_LIMIT_EXCEEDED, "Recorded-HFR motion detector was cancelled while building the background.")
         try {
@@ -157,7 +179,7 @@ object RecordedHfrMotionBallDetector {
         var hadOversizedParent = false
         frames.forEachIndexed { index, frame ->
             if (isCancelled()) return failure(RecordedHfrMotionDetectorReason.RESOURCE_LIMIT_EXCEEDED, "Recorded-HFR motion detector was cancelled.")
-            val mask = foregroundMask(frame, background, roi, motionConfig)
+            val mask = foregroundMask(frame, background, roi, motionConfig, inclusionMask)
             val foregroundCount = mask.countTrue()
             val foregroundFraction = foregroundCount.toDouble() / pixelCount.toDouble()
             foregroundFractions += foregroundFraction
@@ -178,7 +200,7 @@ object RecordedHfrMotionBallDetector {
                 height,
                 roi,
                 motionConfig.closeRadiusPx,
-            )
+            ).maskedBy(inclusionMask)
             val components = collectComponents(processedMask, width, height, roi, detectorConfig.bounds, isCancelled)
                 ?: return failure(RecordedHfrMotionDetectorReason.RESOURCE_LIMIT_EXCEEDED, "Recorded-HFR motion component processing exceeded resource limits.")
             val candidates = components.flatMap { component ->
@@ -205,7 +227,7 @@ object RecordedHfrMotionBallDetector {
                         threshold = detectorConfig.threshold,
                         config = motionConfig,
                     )?.let(::listOf) ?: emptyList<ScoredMotionCandidate>().also {
-                        if (component.areaPx >= motionConfig.minCandidateAreaPx) {
+                        if (component.isLargeEnoughToBeBallCandidate(motionConfig)) {
                             hadOversizedParent = true
                         }
                     }
@@ -334,6 +356,7 @@ private fun MotionComponent.toScoredBallCandidate(
     ) {
         return null
     }
+    if (!matchesExpectedBallSize(config)) return null
     val colorMatchFraction = colorMatchFraction(frame, mask, bounds, threshold)
     val sideRatioRange = (config.maxCandidatePrincipalAxisRatio - 1.0).coerceAtLeast(1.0e-6)
     val sideRatioScore = (1.0 - ((axisRatio - 1.0) / sideRatioRange)).coerceIn(0.0, 1.0)
@@ -406,6 +429,25 @@ private fun MotionComponent.toColorSeededBallCandidates(
             parentAreaRatio = child.areaPx.toDouble() / areaPx.toDouble(),
         )
     }
+}
+
+private fun MotionComponent.isLargeEnoughToBeBallCandidate(config: RecordedHfrMotionDetectorConfig): Boolean =
+    if (config.expectedBallSizePx == null) areaPx >= config.minCandidateAreaPx else expectedBallAreaScore(config) != null
+
+private fun MotionComponent.matchesExpectedBallSize(config: RecordedHfrMotionDetectorConfig): Boolean =
+    config.expectedBallSizePx == null || expectedBallAreaScore(config) != null
+
+private fun MotionComponent.expectedBallAreaScore(config: RecordedHfrMotionDetectorConfig): Double? {
+    val expected = config.expectedBallSizePx ?: return null
+    val areaRatio = areaPx.toDouble() / expected.areaPx
+    if (areaRatio < config.minExpectedBallAreaRatio || areaRatio > config.maxExpectedBallAreaRatio) return null
+    val shortSide = min(bounds.width, bounds.height).toDouble()
+    val longSide = max(bounds.width, bounds.height).toDouble()
+    val shortRatio = shortSide / expected.shortSidePx
+    val longRatio = longSide / expected.longSidePx
+    val sideDelta = max(kotlin.math.abs(shortRatio - 1.0), kotlin.math.abs(longRatio - 1.0))
+    if (sideDelta > config.maxExpectedBallSideRatioDelta) return null
+    return (1.0 - sideDelta).coerceIn(0.0, 1.0)
 }
 
 private fun colorMatchFraction(
@@ -589,17 +631,40 @@ private fun foregroundMask(
     background: IntArray,
     roi: RegionOfInterest,
     config: RecordedHfrMotionDetectorConfig,
+    inclusionMask: BooleanArray?,
 ): BooleanArray {
     val mask = BooleanArray(frame.width * frame.height)
     for (y in roi.top until roi.bottomExclusive) {
         for (x in roi.left until roi.rightExclusive) {
             val index = y * frame.width + x
+            if (inclusionMask != null && !inclusionMask[index]) continue
             if (kotlin.math.abs(luma(frame.argbPixels[index]) - background[index]) >= config.lumaDifferenceThreshold) {
                 mask[index] = true
             }
         }
     }
     return mask
+}
+
+private fun PixelInclusionPolygon.toMask(width: Int, height: Int, roi: RegionOfInterest): BooleanArray {
+    val mask = BooleanArray(width * height)
+    for (y in roi.top until roi.bottomExclusive) {
+        for (x in roi.left until roi.rightExclusive) {
+            if (contains(x, y)) {
+                mask[y * width + x] = true
+            }
+        }
+    }
+    return mask
+}
+
+private fun BooleanArray.maskedBy(inclusionMask: BooleanArray?): BooleanArray {
+    if (inclusionMask == null) return this
+    val output = BooleanArray(size)
+    for (index in indices) {
+        output[index] = this[index] && inclusionMask[index]
+    }
+    return output
 }
 
 private fun morphologyOpen(mask: BooleanArray, width: Int, height: Int, roi: RegionOfInterest, radius: Int): BooleanArray =

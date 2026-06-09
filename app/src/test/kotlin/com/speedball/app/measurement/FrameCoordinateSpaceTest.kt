@@ -50,6 +50,29 @@ class FrameCoordinateSpaceTest {
     }
 
     @Test
+    fun fitCenterClampsDragPastLetterboxToFrameEdge() {
+        val transform = PreviewFrameTransform(
+            view = FrameDimensions(400, 400),
+            source = FrameDimensions(1280, 720),
+            scaleMode = PreviewScaleMode.FitCenter,
+        )
+
+        val above = transform.viewPointToNormalizedClamped(200.0, 20.0)
+        val below = transform.viewPointToNormalizedClamped(200.0, 390.0)
+        val left = transform.viewPointToNormalizedClamped(-40.0, 200.0)
+        val right = transform.viewPointToNormalizedClamped(440.0, 200.0)
+
+        assertEquals(0.5, above?.x ?: Double.NaN, 1.0e-9)
+        assertEquals(0.0, above?.y ?: Double.NaN, 1.0e-9)
+        assertEquals(0.5, below?.x ?: Double.NaN, 1.0e-9)
+        assertEquals(1.0, below?.y ?: Double.NaN, 1.0e-9)
+        assertEquals(0.0, left?.x ?: Double.NaN, 1.0e-9)
+        assertEquals(0.5, left?.y ?: Double.NaN, 1.0e-9)
+        assertEquals(1.0, right?.x ?: Double.NaN, 1.0e-9)
+        assertEquals(0.5, right?.y ?: Double.NaN, 1.0e-9)
+    }
+
+    @Test
     fun fitCenterRoundTripsNormalizedPointThroughPillarboxedView() {
         val transform = PreviewFrameTransform(
             view = FrameDimensions(2280, 1080),

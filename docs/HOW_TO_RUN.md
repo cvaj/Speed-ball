@@ -101,14 +101,24 @@ gate below; the status text always names the **specific** thing still missing
    for the reported carry/distance projection. Default is `4.0`; set it higher
    for throw tests, such as `5.5`. This does not change blob detection or
    measured speed.
-7. **Ball color (optional discriminator)** — tap **`Color`** to select the color
-   target, then tap the ball in the preview (or **`Sample`**) to sample its HSV
-   color. Recorded-HFR Run Mode can arm without this.
-8. **ROI (optional setup aid / legacy region)** — tap **`ROI`**, then **tap on the preview** along
-   the path the ball will travel to center the region box there; fine-tune with
-   the **nudge** controls. (The box is a fixed-size rectangle you position; there
-   is no drag-resize.) Recorded-HFR Run Mode can scan the bounded full working
-   frame without this.
+7. **Ball color and size lock (optional discriminator)** — place the ball at
+   the expected impact/travel distance, tap **`Ball Box`**, then tap the ball in
+   the preview. The app samples HSV color and draws a magenta four-point
+   ball-size polygon. Drag any corner independently until it bounds the visible
+   ball at that distance; the points are not locked to a rectangle. This gives
+   recorded-HFR a detector-scale expected ball size so tiny net/grass fragments
+   and oversized moving junk are rejected before candidate caps. Recorded-HFR
+   Run Mode can arm without this, but outdoor green/yellow scenes should use it.
+8. **Impact zone (recommended outdoors)** — tap **`Impact`** and drag the four
+   orange corners around the part of the camera image where the batted ball is
+   allowed to travel. Each corner moves independently, so the shape can be any
+   quadrilateral you need inside the camera image. Recorded-HFR ignores motion
+   outside this polygon before connected-component/candidate counting, which
+   keeps nets, trees, hands, and grass motion from exhausting the blob budget.
+   After selecting **`Impact`** or **`Ball Box`**, you may press **`Hide`**; the
+   drawer disappears but the handles remain on the camera image and stay
+   draggable. Corner drags clamp to the image edge, so pulling outward to the
+   border should not go dead.
 9. **Level** — captured automatically once permission/mode are ready; tap
    **`Level`** to recapture while the phone is held still.
 
@@ -204,8 +214,10 @@ the preview returns afterward.
   reopens the decoder and converts only that interval to detector ARGB frames.
   If the scout is unsure, it falls back to the full bounded window. The detector
   builds a luma median background, differences each processed frame against
-  that background, and emits isolated motion-ball candidates. Color/ROI may
-  help diagnostics but do not gate Run Mode readiness. The app keeps only
+  that background, masks the user-drawn Impact zone when present, applies the
+  locked Ball Box size gate when present, and emits isolated motion-ball
+  candidates. Color/ROI may help diagnostics but do not gate Run Mode
+  readiness. The app keeps only
   bounded thumbnail proof plus compact blob/index/timestamp records after
   detection. The
   recorded-HFR window decoder uses MediaCodec byte-buffer output, not the
@@ -218,8 +230,9 @@ the preview returns afterward.
 - `candidateFrames=0` means the median-background motion detector found no
   isolated moving ball candidate in the processed impact-window frames.
   `BALL_NOT_ISOLATED` means foreground moved but was too merged/ambiguous to
-  treat as the ball after optional color, near-circular shape ratio, centroid
-  velocity, and smooth-path discriminators. `selectedSamples<4` means motion candidates
+  treat as the ball after Impact-zone masking, optional Ball Box size, optional
+  color, near-circular shape ratio, centroid velocity, and smooth-path
+  discriminators. `selectedSamples<4` means motion candidates
   existed but not enough usable track samples were selected.
 
 After the result, Run Mode returns to ready/listening. **Repeat a start command
@@ -314,8 +327,9 @@ $ADB shell am start -n com.speedball.app/.MainActivity
 # 4) (optional) watch logs while you shoot
 $ADB logcat -c && $ADB logcat | grep -E "RECORDED_HFR|RECORDED_ESTIMATE|VISUAL_ESTIMATE|VOICE_|DECODE_"
 ```
-Then on the phone: **Setup** (permission -> distance A/B + feet -> color ->
-optional ROI -> level) -> **Run** -> **Shoot** (or say "shoot", "record",
+Then on the phone: **Setup** (permission -> distance A/B + feet -> Ball Box/color
+-> Impact zone -> level) -> **Run** -> **Shoot** (or say "shoot", "record",
 "cheese", or "smile") with the neon
-ball crossing the camera frame. Recorded-HFR can process without ROI; ROI is a
-setup/diagnostic aid, not a per-shot blocker.
+ball crossing the camera frame. Recorded-HFR can process without ROI; the
+Impact zone and Ball Box are optional outdoor noise-reduction controls, not
+per-shot blockers.

@@ -1,5 +1,6 @@
 package com.speedball.app.measurement
 
+import com.speedball.core.model.ImagePoint
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertInstanceOf
@@ -191,6 +192,81 @@ class RecordedHfrMotionBallDetectorTest {
         assertTrue(success.frames.all { frame -> frame.blobs.single().motionMetrics?.parentAreaRatio ?: 1.0 < 0.8 })
         assertTrue(success.frames.zipWithNext().all { (previous, current) ->
             current.blobs.single().centroid.xPx > previous.blobs.single().centroid.xPx
+        })
+    }
+
+    @Test
+    fun impactZoneMasksOutdoorNoiseBeforeCandidateCaps() {
+        val frames = List(8) { index ->
+            frame(width = 200, height = 120, timestampSeconds = index / 120.0) {
+                disk(cx = 24 + index * 14, cy = 62, radius = 6, color = YELLOW)
+                repeat(18) { order ->
+                    rect(
+                        left = 118 + (order % 6) * 12 + index % 3,
+                        top = 10 + (order / 6) * 25,
+                        width = 8,
+                        height = 9,
+                        color = WHITE,
+                    )
+                }
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = yellowDetectorConfig(width = 200, height = 120),
+            motionConfig = RecordedHfrMotionDetectorConfig(
+                openRadiusPx = 0,
+                closeRadiusPx = 1,
+                minCandidateAreaPx = 45,
+                minCandidateShortSidePx = 6,
+                maxCandidateBlobsPerFrame = 3,
+                inclusionPolygon = PixelInclusionPolygon(
+                    listOf(
+                        ImagePoint(0.0, 35.0),
+                        ImagePoint(115.0, 35.0),
+                        ImagePoint(115.0, 88.0),
+                        ImagePoint(0.0, 88.0),
+                    ),
+                ),
+            ),
+        )
+
+        val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
+        assertTrue(success.candidateBlobCount <= success.frames.size * 2)
+        assertTrue(success.frames.all { frame -> frame.blobs.all { blob -> blob.centroid.xPx < 115.0 } })
+    }
+
+    @Test
+    fun expectedBallSizeRejectsSmallAndLargeMovingJunk() {
+        val frames = List(8) { index ->
+            frame(width = 220, height = 130, timestampSeconds = index / 120.0) {
+                disk(cx = 32 + index * 16, cy = 70, radius = 7, color = YELLOW)
+                rect(left = 118 + index, top = 35, width = 6, height = 6, color = WHITE)
+                rect(left = 150 + index, top = 76, width = 46, height = 30, color = WHITE)
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = yellowDetectorConfig(width = 220, height = 130),
+            motionConfig = RecordedHfrMotionDetectorConfig(
+                openRadiusPx = 0,
+                closeRadiusPx = 1,
+                minCandidateAreaPx = 20,
+                minCandidateShortSidePx = 4,
+                maxCandidateBlobsPerFrame = 4,
+                expectedBallSizePx = ExpectedBallSizePx(widthPx = 15.0, heightPx = 15.0),
+                minExpectedBallAreaRatio = 0.40,
+                maxExpectedBallAreaRatio = 2.25,
+                maxExpectedBallSideRatioDelta = 0.80,
+            ),
+        )
+
+        val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
+        assertTrue(success.frames.size >= 4)
+        assertTrue(success.frames.all { frame ->
+            frame.blobs.all { blob -> blob.bounds.width in 10..22 && blob.bounds.height in 10..22 }
         })
     }
 

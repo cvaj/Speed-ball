@@ -38,6 +38,8 @@ data class Phase14WorkflowState(
     val colorSample: HsvColor? = null,
     val colorTolerance: HsvTolerance = HsvTolerance(8.0, 0.12, 0.12),
     val regionOfInterest: NormalizedFrameRect? = null,
+    val impactZone: NormalizedFramePolygon? = null,
+    val expectedBallBounds: NormalizedFramePolygon? = null,
     val levelReference: LevelReferenceSnapshot? = null,
     val capture: Phase14CaptureState = Phase14CaptureState.Idle,
     val result: VisualEstimateOutcome? = null,
@@ -59,6 +61,8 @@ data class Phase14WorkflowState(
                         colorSamplePoint = null,
                         colorSample = null,
                         regionOfInterest = null,
+                        impactZone = null,
+                        expectedBallBounds = null,
                         levelReference = null,
                         capture = Phase14CaptureState.Idle,
                         result = null,
@@ -74,6 +78,8 @@ data class Phase14WorkflowState(
                     colorSamplePoint = null,
                     colorSample = null,
                     regionOfInterest = null,
+                    impactZone = null,
+                    expectedBallBounds = null,
                     levelReference = null,
                     capture = Phase14CaptureState.Idle,
                     result = null,
@@ -111,6 +117,7 @@ data class Phase14WorkflowState(
                     colorSamplePoint = event.point.takeIf { it.isInFrame() },
                     colorSample = event.sample,
                     colorTolerance = event.tolerance.clamped(),
+                    expectedBallBounds = event.expectedBallBounds?.takeIf { it.isInFrame() } ?: expectedBallBounds,
                     capture = Phase14CaptureState.Idle,
                     result = null,
                 )
@@ -126,6 +133,20 @@ data class Phase14WorkflowState(
             is Phase14WorkflowEvent.RegionOfInterestSelected ->
                 copy(
                     regionOfInterest = event.region.takeIf { it.isInFrame() },
+                    capture = Phase14CaptureState.Idle,
+                    result = null,
+                )
+
+            is Phase14WorkflowEvent.ImpactZoneSelected ->
+                copy(
+                    impactZone = event.polygon.takeIf { it.isInFrame() },
+                    capture = Phase14CaptureState.Idle,
+                    result = null,
+                )
+
+            is Phase14WorkflowEvent.ExpectedBallBoundsSelected ->
+                copy(
+                    expectedBallBounds = event.bounds.takeIf { it.isInFrame() },
                     capture = Phase14CaptureState.Idle,
                     result = null,
                 )
@@ -236,9 +257,12 @@ sealed interface Phase14WorkflowEvent {
         val point: NormalizedFramePoint,
         val sample: HsvColor,
         val tolerance: HsvTolerance,
+        val expectedBallBounds: NormalizedFramePolygon? = null,
     ) : Phase14WorkflowEvent
     data class ColorSampleCleared(val point: NormalizedFramePoint) : Phase14WorkflowEvent
     data class RegionOfInterestSelected(val region: NormalizedFrameRect) : Phase14WorkflowEvent
+    data class ImpactZoneSelected(val polygon: NormalizedFramePolygon) : Phase14WorkflowEvent
+    data class ExpectedBallBoundsSelected(val bounds: NormalizedFramePolygon) : Phase14WorkflowEvent
     data class LevelReferenceCaptured(val snapshot: LevelReferenceSnapshot) : Phase14WorkflowEvent
     data object LevelReferenceCleared : Phase14WorkflowEvent
     data object ArmCapture : Phase14WorkflowEvent

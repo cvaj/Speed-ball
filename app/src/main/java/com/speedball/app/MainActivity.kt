@@ -135,6 +135,7 @@ import com.speedball.app.measurement.FrameDimensions
 import com.speedball.app.measurement.HsvColor
 import com.speedball.app.measurement.HsvThreshold
 import com.speedball.app.measurement.HsvTolerance
+import com.speedball.app.measurement.ExpectedBallSizePx
 import com.speedball.app.measurement.LevelReferenceDisplayRotation
 import com.speedball.app.measurement.LevelReferenceOutcome
 import com.speedball.app.measurement.LevelReferenceSnapshot
@@ -143,6 +144,7 @@ import com.speedball.app.measurement.MeasurementCalibrationState
 import com.speedball.app.measurement.MinimumSpeedGatePolicy
 import com.speedball.app.measurement.MeasurementWorkflowState
 import com.speedball.app.measurement.NormalizedFramePoint
+import com.speedball.app.measurement.NormalizedFramePolygon
 import com.speedball.app.measurement.NormalizedFrameRect
 import com.speedball.app.measurement.Phase14Geometry
 import com.speedball.app.measurement.Phase14SetupMode
@@ -348,11 +350,17 @@ class MainActivity : ComponentActivity() {
                 onUseBallDiameterFallback = { useBallDiameterFallbackSetup() },
                 onCaptureLevel = { captureLevelReferenceForSetup() },
                 onSampleColor = { sampleDefaultEstimateColor() },
-                onSetRoi = { setDefaultEstimateRoi() },
                 onSelectCaliperA = { selectSetupAdjustmentTarget(SetupAdjustmentTarget.CaliperA) },
                 onSelectCaliperB = { selectSetupAdjustmentTarget(SetupAdjustmentTarget.CaliperB) },
                 onSelectColorPoint = { selectSetupAdjustmentTarget(SetupAdjustmentTarget.ColorPoint) },
-                onSelectRoi = { selectSetupAdjustmentTarget(SetupAdjustmentTarget.Roi) },
+                onSelectImpactZone = { selectSetupAdjustmentTarget(SetupAdjustmentTarget.ImpactZone) },
+                onSelectBallBox = { selectSetupAdjustmentTarget(SetupAdjustmentTarget.BallBox) },
+                onSetImpactZoneCornerFromPreview = { corner, x, y, width, height ->
+                    setImpactZoneCornerFromPreview(corner, x, y, width, height)
+                },
+                onSetBallBoxCornerFromPreview = { corner, x, y, width, height ->
+                    setBallBoxCornerFromPreview(corner, x, y, width, height)
+                },
                 onNudgeSetup = { dx, dy -> nudgeSelectedSetupTarget(dx, dy) },
                 onFineNudgeSetup = { dx, dy -> nudgeSelectedSetupTarget(dx, dy) },
                 onPickImport = { requestImportVideo() },
@@ -2344,6 +2352,14 @@ class MainActivity : ComponentActivity() {
                 val roi = phase14WorkflowState.regionOfInterest ?: DEFAULT_PHASE14_ROI
                 phase14WorkflowState.reduce(Phase14WorkflowEvent.RegionOfInterestSelected(roi.nudged(dx, dy)))
             }
+            SetupAdjustmentTarget.ImpactZone -> {
+                val impactZone = phase14WorkflowState.impactZone ?: DEFAULT_PHASE14_IMPACT_ZONE
+                phase14WorkflowState.reduce(Phase14WorkflowEvent.ImpactZoneSelected(impactZone.nudged(dx, dy)))
+            }
+            SetupAdjustmentTarget.BallBox -> {
+                val ballBox = phase14WorkflowState.expectedBallBounds ?: DEFAULT_PHASE14_BALL_BOX
+                phase14WorkflowState.reduce(Phase14WorkflowEvent.ExpectedBallBoundsSelected(ballBox.nudged(dx, dy)))
+            }
         }
         updateLegacyWorkflowFromPhase14()
         updateShellState(status = "Setup target ${setupAdjustmentTarget.label} moved")
@@ -2417,22 +2433,79 @@ class MainActivity : ComponentActivity() {
         viewWidth: Int,
         viewHeight: Int,
     ) {
-        val point = normalizedPreviewPoint(x, y, viewWidth, viewHeight) ?: run {
-            updateShellState(status = "Tap inside camera feed")
-            return
-        }
         when (setupAdjustmentTarget) {
-            SetupAdjustmentTarget.CaliperA -> setCaliperPoint(point, SetupAdjustmentTarget.CaliperA, "Caliper A set")
-            SetupAdjustmentTarget.CaliperB -> setCaliperPoint(point, SetupAdjustmentTarget.CaliperB, "Caliper B set")
-            SetupAdjustmentTarget.ColorPoint -> samplePreviewColorAt(point)
+            SetupAdjustmentTarget.CaliperA -> {
+                val point = normalizedPreviewPoint(x, y, viewWidth, viewHeight) ?: return updateShellState(status = "Tap inside camera feed")
+                setCaliperPoint(point, SetupAdjustmentTarget.CaliperA, "Caliper A set")
+            }
+            SetupAdjustmentTarget.CaliperB -> {
+                val point = normalizedPreviewPoint(x, y, viewWidth, viewHeight) ?: return updateShellState(status = "Tap inside camera feed")
+                setCaliperPoint(point, SetupAdjustmentTarget.CaliperB, "Caliper B set")
+            }
+            SetupAdjustmentTarget.ColorPoint -> {
+                val point = normalizedPreviewPoint(x, y, viewWidth, viewHeight) ?: return updateShellState(status = "Tap inside camera feed")
+                samplePreviewColorAt(point)
+            }
             SetupAdjustmentTarget.Roi -> {
+                val point = normalizedPreviewPoint(x, y, viewWidth, viewHeight) ?: return updateShellState(status = "Tap inside camera feed")
                 phase14WorkflowState = phase14WorkflowState.reduce(
                     Phase14WorkflowEvent.RegionOfInterestSelected(centerRoiAt(point)),
                 )
                 updateLegacyWorkflowFromPhase14()
                 updateShellState(status = "ROI centered")
             }
+            SetupAdjustmentTarget.ImpactZone -> {
+                val point = normalizedOverlayPoint(x, y, viewWidth, viewHeight) ?: return updateShellState(status = "Tap inside setup overlay")
+                phase14WorkflowState = phase14WorkflowState.reduce(
+                    Phase14WorkflowEvent.ImpactZoneSelected(moveNearestPolygonCorner(phase14WorkflowState.impactZone ?: DEFAULT_PHASE14_IMPACT_ZONE, point)),
+                )
+                updateLegacyWorkflowFromPhase14()
+                updateShellState(status = "Impact zone point moved")
+            }
+            SetupAdjustmentTarget.BallBox -> {
+                val point = normalizedOverlayPoint(x, y, viewWidth, viewHeight) ?: return updateShellState(status = "Tap inside setup overlay")
+                samplePreviewColorAt(normalizedPreviewPoint(x, y, viewWidth, viewHeight) ?: point)
+                phase14WorkflowState = phase14WorkflowState.reduce(
+                    Phase14WorkflowEvent.ExpectedBallBoundsSelected(moveNearestPolygonCorner(phase14WorkflowState.expectedBallBounds ?: centerBallBoxAt(point), point)),
+                )
+                updateLegacyWorkflowFromPhase14()
+                updateShellState(status = "Ball box point moved")
+            }
         }
+    }
+
+    private fun setImpactZoneCornerFromPreview(
+        cornerIndex: Int,
+        x: Float,
+        y: Float,
+        viewWidth: Int,
+        viewHeight: Int,
+    ) {
+        val point = normalizedOverlayPoint(x, y, viewWidth, viewHeight) ?: return
+        val current = phase14WorkflowState.impactZone ?: DEFAULT_PHASE14_IMPACT_ZONE
+        val points = current.points.toMutableList()
+        if (cornerIndex !in points.indices) return
+        points[cornerIndex] = point.coercedInFrame()
+        phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.ImpactZoneSelected(NormalizedFramePolygon(points)))
+        updateLegacyWorkflowFromPhase14()
+        updateShellState(status = "Impact zone corner ${cornerIndex + 1} moved")
+    }
+
+    private fun setBallBoxCornerFromPreview(
+        cornerIndex: Int,
+        x: Float,
+        y: Float,
+        viewWidth: Int,
+        viewHeight: Int,
+    ) {
+        val point = normalizedOverlayPoint(x, y, viewWidth, viewHeight) ?: return
+        val current = phase14WorkflowState.expectedBallBounds ?: DEFAULT_PHASE14_BALL_BOX
+        val points = current.points.toMutableList()
+        if (cornerIndex !in points.indices) return
+        points[cornerIndex] = point.coercedInFrame()
+        phase14WorkflowState = phase14WorkflowState.reduce(Phase14WorkflowEvent.ExpectedBallBoundsSelected(NormalizedFramePolygon(points)))
+        updateLegacyWorkflowFromPhase14()
+        updateShellState(status = "Ball box corner ${cornerIndex + 1} moved")
     }
 
     private fun setCaliperLineFromPreview(
@@ -2550,6 +2623,19 @@ class MainActivity : ComponentActivity() {
         ).viewPointToNormalized(x.toDouble(), y.toDouble())
     }
 
+    private fun normalizedOverlayPoint(
+        x: Float,
+        y: Float,
+        viewWidth: Int,
+        viewHeight: Int,
+    ): NormalizedFramePoint? {
+        if (viewWidth <= 0 || viewHeight <= 0) return null
+        return NormalizedFramePoint(
+            x = (x / viewWidth.toFloat()).coerceIn(0f, 1f).toDouble(),
+            y = (y / viewHeight.toFloat()).coerceIn(0f, 1f).toDouble(),
+        )
+    }
+
     private fun currentCaliperPointA(): NormalizedFramePoint =
         phase14WorkflowState.calibrationPointA ?: DEFAULT_CALIPER_POINT_A
 
@@ -2563,6 +2649,23 @@ class MainActivity : ComponentActivity() {
         val left = (point.x - width / 2.0).coerceIn(0.0, 1.0 - width)
         val top = (point.y - height / 2.0).coerceIn(0.0, 1.0 - height)
         return NormalizedFrameRect(left, top, left + width, top + height)
+    }
+
+    private fun centerBallBoxAt(point: NormalizedFramePoint): NormalizedFramePolygon =
+        DEFAULT_PHASE14_BALL_BOX.centeredAt(point)
+
+    private fun moveNearestPolygonCorner(
+        polygon: NormalizedFramePolygon,
+        point: NormalizedFramePoint,
+    ): NormalizedFramePolygon {
+        val points = polygon.points.toMutableList()
+        val index = points.indices.minByOrNull { pointIndex ->
+            val dx = points[pointIndex].x - point.x
+            val dy = points[pointIndex].y - point.y
+            dx * dx + dy * dy
+        } ?: return polygon
+        points[index] = point.coercedInFrame()
+        return NormalizedFramePolygon(points)
     }
 
     private fun sampleRectFor(
@@ -3545,7 +3648,28 @@ class MainActivity : ComponentActivity() {
             ),
             motionDetectorConfig = RecordedHfrMotionDetectorConfig(
                 maxCandidatePrincipalAxisRatio = motionBlobSideRatio,
+                inclusionPolygon = buildRecordedMotionInclusionPolygon(importGeometry),
+                expectedBallSizePx = buildRecordedExpectedBallSize(importGeometry),
             ),
+        )
+    }
+
+    private fun buildRecordedMotionInclusionPolygon(geometry: Phase14Geometry) =
+        phase14WorkflowState.impactZone
+            ?.let { com.speedball.app.measurement.DetectionReadbackTransform(geometry.source, geometry.readback).normalizedToReadbackPolygon(it) }
+
+    private fun buildRecordedExpectedBallSize(geometry: Phase14Geometry): ExpectedBallSizePx? {
+        val bounds = phase14WorkflowState.expectedBallBounds ?: return null
+        val polygon = com.speedball.app.measurement.DetectionReadbackTransform(geometry.source, geometry.readback)
+            .normalizedToReadbackPolygon(bounds)
+            ?: return null
+        val minX = polygon.points.minOf { it.xPx }
+        val maxX = polygon.points.maxOf { it.xPx }
+        val minY = polygon.points.minOf { it.yPx }
+        val maxY = polygon.points.maxOf { it.yPx }
+        return ExpectedBallSizePx(
+            widthPx = maxX - minX,
+            heightPx = maxY - minY,
         )
     }
 
@@ -4084,11 +4208,37 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun NormalizedFramePolygon.nudged(dx: Double, dy: Double): NormalizedFramePolygon =
+        NormalizedFramePolygon(points.map { it.nudged(dx, dy) })
+
+    private fun NormalizedFramePolygon.centeredAt(point: NormalizedFramePoint): NormalizedFramePolygon {
+        val centerX = points.map { it.x }.average()
+        val centerY = points.map { it.y }.average()
+        val unclamped = points.map { NormalizedFramePoint(it.x + point.x - centerX, it.y + point.y - centerY) }
+        val minX = unclamped.minOf { it.x }
+        val maxX = unclamped.maxOf { it.x }
+        val minY = unclamped.minOf { it.y }
+        val maxY = unclamped.maxOf { it.y }
+        val shiftX = when {
+            minX < 0.0 -> -minX
+            maxX > 1.0 -> 1.0 - maxX
+            else -> 0.0
+        }
+        val shiftY = when {
+            minY < 0.0 -> -minY
+            maxY > 1.0 -> 1.0 - maxY
+            else -> 0.0
+        }
+        return NormalizedFramePolygon(unclamped.map { NormalizedFramePoint(it.x + shiftX, it.y + shiftY).coercedInFrame() })
+    }
+
     private enum class SetupAdjustmentTarget(val label: String) {
         CaliperA("A"),
         CaliperB("B"),
         ColorPoint("Color"),
         Roi("ROI"),
+        ImpactZone("Impact"),
+        BallBox("Ball Box"),
     }
 
     private companion object {
@@ -4178,6 +4328,22 @@ class MainActivity : ComponentActivity() {
         val DEFAULT_CALIPER_POINT_B = NormalizedFramePoint(0.80, 0.50)
         val DEFAULT_COLOR_SAMPLE_POINT = NormalizedFramePoint(0.50, 0.50)
         val DEFAULT_PHASE14_ROI = NormalizedFrameRect(0.10, 0.10, 0.90, 0.90)
+        val DEFAULT_PHASE14_IMPACT_ZONE = NormalizedFramePolygon(
+            listOf(
+                NormalizedFramePoint(0.20, 0.25),
+                NormalizedFramePoint(0.80, 0.25),
+                NormalizedFramePoint(0.85, 0.75),
+                NormalizedFramePoint(0.15, 0.75),
+            ),
+        )
+        val DEFAULT_PHASE14_BALL_BOX = NormalizedFramePolygon(
+            listOf(
+                NormalizedFramePoint(0.47, 0.45),
+                NormalizedFramePoint(0.53, 0.45),
+                NormalizedFramePoint(0.53, 0.55),
+                NormalizedFramePoint(0.47, 0.55),
+            ),
+        )
         val DEFAULT_PHASE14_COLOR_TOLERANCE = HsvTolerance(hueDegrees = 25.0, saturation = 0.45, value = 0.45)
         val DIRECT_UI_PIXEL_CONFIG = DirectPixelProofConfig(maxTotalSamples = 1_440)
     }

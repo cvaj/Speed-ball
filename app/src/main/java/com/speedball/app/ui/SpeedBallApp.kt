@@ -61,7 +61,7 @@ import android.view.Surface
 import android.view.TextureView
 import kotlin.math.cos
 import com.speedball.app.measurement.NormalizedFramePoint
-import com.speedball.app.measurement.NormalizedFrameRect
+import com.speedball.app.measurement.NormalizedFramePolygon
 import com.speedball.app.measurement.Phase14WorkflowState
 import com.speedball.app.measurement.VisualEstimateCaptureProof
 import com.speedball.app.measurement.VisualEstimateProofBlob
@@ -92,11 +92,13 @@ fun SpeedBallApp(
     onUseBallDiameterFallback: () -> Unit = {},
     onCaptureLevel: () -> Unit = {},
     onSampleColor: () -> Unit = {},
-    onSetRoi: () -> Unit = {},
     onSelectCaliperA: () -> Unit = {},
     onSelectCaliperB: () -> Unit = {},
     onSelectColorPoint: () -> Unit = {},
-    onSelectRoi: () -> Unit = {},
+    onSelectImpactZone: () -> Unit = {},
+    onSelectBallBox: () -> Unit = {},
+    onSetImpactZoneCornerFromPreview: (Int, Float, Float, Int, Int) -> Unit = { _, _, _, _, _ -> },
+    onSetBallBoxCornerFromPreview: (Int, Float, Float, Int, Int) -> Unit = { _, _, _, _, _ -> },
     onNudgeSetup: (Double, Double) -> Unit = { _, _ -> },
     onFineNudgeSetup: (Double, Double) -> Unit = { _, _ -> },
     onPickImport: () -> Unit = {},
@@ -143,11 +145,13 @@ fun SpeedBallApp(
                     onUseBallDiameterFallback = onUseBallDiameterFallback,
                     onCaptureLevel = onCaptureLevel,
                     onSampleColor = onSampleColor,
-                    onSetRoi = onSetRoi,
                     onSelectCaliperA = onSelectCaliperA,
                     onSelectCaliperB = onSelectCaliperB,
                     onSelectColorPoint = onSelectColorPoint,
-                    onSelectRoi = onSelectRoi,
+                    onSelectImpactZone = onSelectImpactZone,
+                    onSelectBallBox = onSelectBallBox,
+                    onSetImpactZoneCornerFromPreview = onSetImpactZoneCornerFromPreview,
+                    onSetBallBoxCornerFromPreview = onSetBallBoxCornerFromPreview,
                     onNudgeSetup = onNudgeSetup,
                     onFineNudgeSetup = onFineNudgeSetup,
                     onVoiceRecord = onVoiceRecord,
@@ -187,11 +191,13 @@ private fun SetupPreviewSurface(
     onUseBallDiameterFallback: () -> Unit,
     onCaptureLevel: () -> Unit,
     onSampleColor: () -> Unit,
-    onSetRoi: () -> Unit,
     onSelectCaliperA: () -> Unit,
     onSelectCaliperB: () -> Unit,
     onSelectColorPoint: () -> Unit,
-    onSelectRoi: () -> Unit,
+    onSelectImpactZone: () -> Unit,
+    onSelectBallBox: () -> Unit,
+    onSetImpactZoneCornerFromPreview: (Int, Float, Float, Int, Int) -> Unit,
+    onSetBallBoxCornerFromPreview: (Int, Float, Float, Int, Int) -> Unit,
     onNudgeSetup: (Double, Double) -> Unit,
     onFineNudgeSetup: (Double, Double) -> Unit,
     onVoiceRecord: () -> Unit,
@@ -217,6 +223,8 @@ private fun SetupPreviewSurface(
     val currentFineLineDrag by rememberUpdatedState(fineLineDrag)
     val currentOnSetCaliperAFromPreview by rememberUpdatedState(onSetCaliperAFromPreview)
     val currentOnSetCaliperBFromPreview by rememberUpdatedState(onSetCaliperBFromPreview)
+    val currentOnSetImpactZoneCornerFromPreview by rememberUpdatedState(onSetImpactZoneCornerFromPreview)
+    val currentOnSetBallBoxCornerFromPreview by rememberUpdatedState(onSetBallBoxCornerFromPreview)
     val currentOnPreviewTap by rememberUpdatedState(onPreviewTap)
     val sourceDimensions = phase14State.geometry?.source
     val previewRotationDegrees = state.previewRotationDegrees
@@ -226,6 +234,7 @@ private fun SetupPreviewSurface(
     val setupModeActive = state.appMode == SpeedBallAppMode.Setup
     val runModeActive = state.appMode == SpeedBallAppMode.Run
     val showControls = setupModeActive && controlsVisible && !captureActive
+    val showSetupOverlay = setupModeActive && !captureActive
     val hasSuccessfulResultStatus = isSuccessfulResultStatus(state.captureStatus)
     val successReport = state.visualEstimateReport?.takeIf { it.kind == VisualEstimateReportKind.Success }
     val noReadReport = state.visualEstimateReport?.takeIf { it.kind != VisualEstimateReportKind.Success }
@@ -308,6 +317,8 @@ private fun SetupPreviewSurface(
                     var activeDragLineFraction: Float? = null
                     var activeDragTarget: String? = null
                     var activeDragCanvasSize: IntSize? = null
+                    var activeImpactCorner: Int? = null
+                    var activeBallBoxCorner: Int? = null
 
                     fun commitActiveDrag() {
                         val fraction = activeDragLineFraction
@@ -333,6 +344,8 @@ private fun SetupPreviewSurface(
                         activeDragLineFraction = null
                         activeDragTarget = null
                         activeDragCanvasSize = null
+                        activeImpactCorner = null
+                        activeBallBoxCorner = null
                     }
 
                     detectDragGestures(
@@ -344,6 +357,18 @@ private fun SetupPreviewSurface(
                                 "A" -> pointA.x.toFloat()
                                 "B" -> pointB.x.toFloat()
                                 else -> null
+                            }
+                            if (activeDragTarget == "Impact") {
+                                val canvasSize = Size(size.width.toFloat(), size.height.toFloat())
+                                activeImpactCorner = nearestOffsetIndex(it, (currentPhase14State.impactZone ?: DEFAULT_IMPACT_ZONE).points.map { point ->
+                                    point.toOffset(canvasSize)
+                                })
+                            }
+                            if (activeDragTarget == "Ball Box") {
+                                val canvasSize = Size(size.width.toFloat(), size.height.toFloat())
+                                activeBallBoxCorner = nearestOffsetIndex(it, (currentPhase14State.expectedBallBounds ?: DEFAULT_BALL_BOX).points.map { point ->
+                                    point.toOffset(canvasSize)
+                                })
                             }
                         },
                         onDragEnd = {
@@ -379,6 +404,30 @@ private fun SetupPreviewSurface(
                                     activeDragLineFraction = fraction
                                     dragCaliperBOverrideFraction = fraction
                                 }
+                                "Impact" -> {
+                                    val corner = activeImpactCorner
+                                    if (corner != null) {
+                                        currentOnSetImpactZoneCornerFromPreview(
+                                            corner,
+                                            change.position.x,
+                                            change.position.y,
+                                            canvasSize.width,
+                                            canvasSize.height,
+                                        )
+                                    }
+                                }
+                                "Ball Box" -> {
+                                    val corner = activeBallBoxCorner
+                                    if (corner != null) {
+                                        currentOnSetBallBoxCornerFromPreview(
+                                            corner,
+                                            change.position.x,
+                                            change.position.y,
+                                            canvasSize.width,
+                                            canvasSize.height,
+                                        )
+                                    }
+                                }
                             }
                         },
                     )
@@ -386,7 +435,7 @@ private fun SetupPreviewSurface(
                 .pointerInput(Unit) {
                     detectTapGestures { tap ->
                         when (currentSetupAdjustmentTargetLabel) {
-                            "Color", "ROI" -> currentOnPreviewTap(tap.x, tap.y, size.width, size.height)
+                            "Color", "Impact", "Ball Box" -> currentOnPreviewTap(tap.x, tap.y, size.width, size.height)
                         }
                     }
                 },
@@ -397,7 +446,6 @@ private fun SetupPreviewSurface(
                 (phase14State.calibrationPointB ?: DEFAULT_CALIPER_B)
             val caliperColor = Color(0xfff5f7fb)
             val sampleColor = Color(0xffffd400)
-            val roiColor = Color(0xff1fbf75)
             val levelColor = Color(0xff34d6ff)
             val levelHorizontalAxisColor = Color(0xff34d6ff)
             val levelVerticalAxisColor = Color(0xffffc247)
@@ -466,20 +514,23 @@ private fun SetupPreviewSurface(
                     cap = StrokeCap.Round,
                 )
             }
-            if (showControls) {
+            if (showSetupOverlay) {
                 val colorPoint = phase14State.colorSamplePoint ?: DEFAULT_COLOR_POINT
-                val roi = phase14State.regionOfInterest ?: DEFAULT_ROI
+                val impactZone = phase14State.impactZone ?: DEFAULT_IMPACT_ZONE
+                val ballBox = phase14State.expectedBallBounds ?: DEFAULT_BALL_BOX
                 drawCircle(color = sampleColor, radius = 11f, center = colorPoint.toPreviewOffset(size, sourceDimensions, previewRotationDegrees))
-                val roiRect = roi.toPreviewRect(size, sourceDimensions, previewRotationDegrees)
-                drawRect(
-                    color = roiColor,
-                    topLeft = roiRect.topLeft,
-                    size = Size(
-                        width = roiRect.width,
-                        height = roiRect.height,
-                    ),
-                    style = Stroke(width = 3f),
-                )
+                val impactOffsets = impactZone.points.map { it.toOffset(size) }
+                impactOffsets.forEachIndexed { index, offset ->
+                    val next = impactOffsets[(index + 1) % impactOffsets.size]
+                    drawLine(color = Color(0xfff26d21), start = offset, end = next, strokeWidth = 4f)
+                    drawCircle(color = Color(0xfff26d21), radius = 8f, center = offset)
+                }
+                val ballOffsets = ballBox.points.map { it.toOffset(size) }
+                ballOffsets.forEachIndexed { index, offset ->
+                    val next = ballOffsets[(index + 1) % ballOffsets.size]
+                    drawLine(color = Color(0xffff4f7b), start = offset, end = next, strokeWidth = 4f)
+                    drawCircle(color = Color(0xffff4f7b), radius = 7f, center = offset)
+                }
                 phase14State.levelReference?.let { level ->
                     val centerY = size.height / 2f
                     val slope = tan(Math.toRadians(level.rollDegrees)).toFloat()
@@ -520,7 +571,8 @@ private fun SetupPreviewSurface(
                     onUseBallDiameterFallback = onUseBallDiameterFallback,
                     onSelectColorPoint = onSelectColorPoint,
                     onSampleColor = onSampleColor,
-                    onSelectRoi = onSelectRoi,
+                    onSelectImpactZone = onSelectImpactZone,
+                    onSelectBallBox = onSelectBallBox,
                     onPickImport = onPickImport,
                     onStartVisualEstimate = onStartVisualEstimate,
                     onRecalibrateEstimate = onRecalibrateEstimate,
@@ -958,7 +1010,8 @@ private fun ApplicationSettingsPanel(
     onUseBallDiameterFallback: () -> Unit,
     onSelectColorPoint: () -> Unit,
     onSampleColor: () -> Unit,
-    onSelectRoi: () -> Unit,
+    onSelectImpactZone: () -> Unit,
+    onSelectBallBox: () -> Unit,
     onPickImport: () -> Unit,
     onStartVisualEstimate: () -> Unit,
     onRecalibrateEstimate: () -> Unit,
@@ -1018,7 +1071,8 @@ private fun ApplicationSettingsPanel(
             OverlayButton("Ball", onUseBallDiameterFallback, Modifier.weight(1f))
             OverlayButton("Color", onSelectColorPoint, Modifier.weight(1f))
             OverlayButton("Sample", onSampleColor, Modifier.weight(1f))
-            OverlayButton("ROI", onSelectRoi, Modifier.weight(1f))
+            OverlayButton("Impact", onSelectImpactZone, Modifier.weight(1f))
+            OverlayButton("Ball Box", onSelectBallBox, Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             OverlayButton("Import", onPickImport, Modifier.weight(1f))
@@ -1231,6 +1285,13 @@ private fun NormalizedFramePoint.toOffset(size: Size): Offset =
 private fun NormalizedFramePoint.toCaliperOffset(size: Size): Offset =
     Offset(x = (x.coerceIn(0.0, 1.0) * size.width).toFloat(), y = size.height / 2f)
 
+private fun nearestOffsetIndex(target: Offset, offsets: List<Offset>): Int? =
+    offsets.indices.minByOrNull { index ->
+        val dx = offsets[index].x - target.x
+        val dy = offsets[index].y - target.y
+        dx * dx + dy * dy
+    }
+
 private fun NormalizedFramePoint.toPreviewOffset(
     size: Size,
     sourceDimensions: FrameDimensions?,
@@ -1246,26 +1307,6 @@ private fun NormalizedFramePoint.toPreviewOffset(
         sourceToViewRotationDegrees = previewRotationDegrees,
     ).normalizedToViewPoint(this)
     return point?.let { Offset(it.xPx.toFloat(), it.yPx.toFloat()) } ?: toOffset(size)
-}
-
-private data class PreviewRect(val topLeft: Offset, val width: Float, val height: Float)
-
-private fun NormalizedFrameRect.toPreviewRect(
-    size: Size,
-    sourceDimensions: FrameDimensions?,
-    previewRotationDegrees: Int,
-): PreviewRect {
-    val corners = listOf(
-        NormalizedFramePoint(left, top),
-        NormalizedFramePoint(right, top),
-        NormalizedFramePoint(right, bottom),
-        NormalizedFramePoint(left, bottom),
-    ).map { it.toPreviewOffset(size, sourceDimensions, previewRotationDegrees) }
-    val minX = corners.minOf { it.x }
-    val maxX = corners.maxOf { it.x }
-    val minY = corners.minOf { it.y }
-    val maxY = corners.maxOf { it.y }
-    return PreviewRect(Offset(minX, minY), maxX - minX, maxY - minY)
 }
 
 private fun TextureView.applyCameraPreviewTransform(
@@ -1303,5 +1344,20 @@ private fun TextureView.applyCameraPreviewTransform(
 private val DEFAULT_CALIPER_A = NormalizedFramePoint(0.20, 0.50)
 private val DEFAULT_CALIPER_B = NormalizedFramePoint(0.80, 0.50)
 private val DEFAULT_COLOR_POINT = NormalizedFramePoint(0.50, 0.50)
-private val DEFAULT_ROI = NormalizedFrameRect(0.10, 0.10, 0.90, 0.90)
+private val DEFAULT_IMPACT_ZONE = NormalizedFramePolygon(
+    listOf(
+        NormalizedFramePoint(0.20, 0.25),
+        NormalizedFramePoint(0.80, 0.25),
+        NormalizedFramePoint(0.85, 0.75),
+        NormalizedFramePoint(0.15, 0.75),
+    ),
+)
+private val DEFAULT_BALL_BOX = NormalizedFramePolygon(
+    listOf(
+        NormalizedFramePoint(0.47, 0.45),
+        NormalizedFramePoint(0.53, 0.45),
+        NormalizedFramePoint(0.53, 0.55),
+        NormalizedFramePoint(0.47, 0.55),
+    ),
+)
 private const val FINE_DRAG_SCALE = 0.05f

@@ -43,6 +43,14 @@ data class NormalizedFrameRect(
             top < bottom
 }
 
+/** Normalized source-frame polygon used to constrain the recorded-HFR search area. */
+data class NormalizedFramePolygon(
+    val points: List<NormalizedFramePoint>,
+) {
+    fun isInFrame(): Boolean =
+        points.size >= 3 && points.all { it.isInFrame() }
+}
+
 /** Preview scaling mode used to derive normalized frame taps from view taps. */
 enum class PreviewScaleMode {
     FitCenter,
@@ -101,6 +109,18 @@ data class PreviewFrameTransform(
             .takeIf { it.isInFrame() }
             ?.toSourceNormalized(normalizedRotationDegrees)
             ?.takeIf { it.isInFrame() }
+    }
+
+    /** Converts a drag point into source-frame coordinates, clamping over-drags to the image edge. */
+    fun viewPointToNormalizedClamped(xView: Double, yView: Double): NormalizedFramePoint? {
+        if (!xView.isFinite() || !yView.isFinite()) return null
+        val oriented = NormalizedFramePoint(
+            x = (((xView - offsetX) / scaleX) / orientedSource.width.toDouble()).coerceIn(0.0, 1.0),
+            y = (((yView - offsetY) / scaleY) / orientedSource.height.toDouble()).coerceIn(0.0, 1.0),
+        )
+        return oriented
+            .toSourceNormalized(normalizedRotationDegrees)
+            .takeIf { it.isInFrame() }
     }
 
     /** Converts a normalized source-frame point into preview-view coordinates. */
@@ -174,6 +194,13 @@ data class DetectionReadbackTransform(
             bottomExclusive = ceil(rect.bottom * readback.height).toInt(),
         )
         return roi.clippedTo(readback.width, readback.height)
+    }
+
+    fun normalizedToReadbackPolygon(polygon: NormalizedFramePolygon): PixelInclusionPolygon? {
+        if (!polygon.isInFrame()) return null
+        return PixelInclusionPolygon(
+            polygon.points.mapNotNull { normalizedToReadbackPoint(it) },
+        ).takeIf { it.points.size == polygon.points.size }
     }
 
     fun sourcePointToReadback(point: ImagePoint): ImagePoint? {
