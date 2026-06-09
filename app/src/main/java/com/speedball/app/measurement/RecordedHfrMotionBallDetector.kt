@@ -18,9 +18,13 @@ enum class RecordedHfrMotionDetectorReason {
 /**
  * Numeric gates for median-background recorded-HFR ball isolation.
  *
- * The detector is intentionally conservative: oversized moving foreground is not
- * rescued by color in this slice. It must isolate direct motion components or
- * fail loudly before mph conversion.
+ * The detector is intentionally conservative: it can rank bounded foreground
+ * fragments by selected color, preferred near-circular side ratio,
+ * compactness, size, and edge contact, but it does not convert those fragments
+ * to mph. Side ratio is scoring evidence rather than a standalone veto because
+ * close or fast balls can be real motion-blur streaks. The downstream reducer
+ * still has to select a smooth, one-directional, high-centroid-motion flight
+ * path or the attempt fails loudly before mph conversion.
  */
 data class RecordedHfrMotionDetectorConfig(
     val minWindowFramesForMedian: Int = 7,
@@ -31,14 +35,14 @@ data class RecordedHfrMotionDetectorConfig(
     val maxMedianForegroundAreaFraction: Double = 0.35,
     val openRadiusPx: Int = 1,
     val closeRadiusPx: Int = 2,
-    val minCandidateAreaPx: Int = 20,
+    val minCandidateAreaPx: Int = 250,
     val maxCandidateAreaFrameFraction: Double = 0.025,
     val maxCandidateLongSideFrameFraction: Double = 0.22,
     val maxCandidateShortSideFrameFraction: Double = 0.20,
-    val minCandidateShortSidePx: Int = 4,
+    val minCandidateShortSidePx: Int = 12,
     val minCandidateCompactness: Double = 0.20,
-    val maxCandidatePrincipalAxisRatio: Double = 8.0,
-    val maxCandidateBlobsPerFrame: Int = 3,
+    val maxCandidatePrincipalAxisRatio: Double = 1.30,
+    val maxCandidateBlobsPerFrame: Int = 6,
     val globalMotionSearchPx: Int = 6,
     val maxMedianGlobalShiftPx: Double = 1.5,
     val maxAdjacentGlobalShiftPx: Double = 4.0,
@@ -55,7 +59,8 @@ data class RecordedHfrMotionDetectorConfig(
             minCandidateAreaPx <= 0 ||
             minCandidateShortSidePx <= 0 ||
             maxCandidateBlobsPerFrame <= 0 ||
-            globalMotionSearchPx <= 0
+            globalMotionSearchPx <= 0 ||
+            maxCandidatePrincipalAxisRatio < 1.0
         ) {
             return MeasurementRunOutcome.NoRead(
                 MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED,
@@ -176,19 +181,38 @@ object RecordedHfrMotionBallDetector {
             )
             val components = collectComponents(processedMask, width, height, roi, detectorConfig.bounds, isCancelled)
                 ?: return failure(RecordedHfrMotionDetectorReason.RESOURCE_LIMIT_EXCEEDED, "Recorded-HFR motion component processing exceeded resource limits.")
-            val candidates = components.mapNotNull { component ->
-                component.toBallCandidate(width, height, foregroundFraction, motionConfig).also {
-                    if (it == null && component.areaPx >= motionConfig.minCandidateAreaPx) {
-                        hadOversizedParent = true
+            val candidates = components.flatMap { component ->
+                val seededCandidates = component.toColorSeededBallCandidates(
+                    frame = frame,
+                    foregroundMask = processedMask,
+                    width = width,
+                    height = height,
+                    foregroundAreaFraction = foregroundFraction,
+                    threshold = detectorConfig.threshold,
+                    bounds = detectorConfig.bounds,
+                    config = motionConfig,
+                    isCancelled = isCancelled,
+                )
+                if (seededCandidates.isNotEmpty()) {
+                    seededCandidates
+                } else {
+                    component.toScoredBallCandidate(
+                        frame = frame,
+                        mask = processedMask,
+                        width = width,
+                        height = height,
+                        foregroundAreaFraction = foregroundFraction,
+                        threshold = detectorConfig.threshold,
+                        config = motionConfig,
+                    )?.let(::listOf) ?: emptyList<ScoredMotionCandidate>().also {
+                        if (component.areaPx >= motionConfig.minCandidateAreaPx) {
+                            hadOversizedParent = true
+                        }
                     }
                 }
-            }
-            if (candidates.size > motionConfig.maxCandidateBlobsPerFrame) {
-                return failure(
-                    RecordedHfrMotionDetectorReason.BALL_NOT_ISOLATED,
-                    "Recorded-HFR motion detector found too many isolated foreground components in one frame.",
-                )
-            }
+            }.sortedByDescending { it.score }
+                .take(motionConfig.maxCandidateBlobsPerFrame)
+                .map { it.blob }
             if (candidates.isNotEmpty()) {
                 candidateFrames += VisualEstimateCandidateFrame(
                     compactPosition = candidateFrames.size,
@@ -212,7 +236,7 @@ object RecordedHfrMotionBallDetector {
         if (!hadForeground) {
             return RecordedHfrMotionDetectionOutcome.Failure(
                 VisualEstimateNoReadReason.NO_FOREGROUND_MOTION,
-                "No fixed-camera foreground motion was detected in the recorded-HFR window.",
+                NO_MOVING_BLOBS_IN_VIEW_MESSAGE,
                 RecordedHfrMotionDetectorReason.NO_FOREGROUND_MOTION,
             )
         }
@@ -221,6 +245,8 @@ object RecordedHfrMotionBallDetector {
                 if (hadOversizedParent) VisualEstimateNoReadReason.BALL_NOT_ISOLATED else VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
                 if (hadOversizedParent) {
                     "Moving foreground was detected, but no isolated ball-sized component survived the motion detector."
+                } else if (candidateBlobCount == 0) {
+                    NO_MOVING_BLOBS_IN_VIEW_MESSAGE
                 } else {
                     "Recorded-HFR motion detector found too few isolated ball candidates."
                 },
@@ -264,6 +290,9 @@ object RecordedHfrMotionBallDetector {
     }
 }
 
+private const val NO_MOVING_BLOBS_IN_VIEW_MESSAGE =
+    "It appears there are no moving ball blobs in the camera frame view."
+
 private data class MotionComponent(
     val areaPx: Int,
     val centroid: ImagePoint,
@@ -272,12 +301,22 @@ private data class MotionComponent(
     val touchesFrameEdge: Boolean,
 )
 
-private fun MotionComponent.toBallCandidate(
+private data class ScoredMotionCandidate(
+    val blob: Blob,
+    val score: Double,
+)
+
+private fun MotionComponent.toScoredBallCandidate(
+    frame: RgbFrame,
+    mask: BooleanArray,
     width: Int,
     height: Int,
     foregroundAreaFraction: Double,
+    threshold: HsvThreshold,
     config: RecordedHfrMotionDetectorConfig,
-): Blob? {
+    parentAreaPx: Int = areaPx,
+    parentAreaRatio: Double = 1.0,
+): ScoredMotionCandidate? {
     val frameArea = width * height
     val maxArea = max(config.minCandidateAreaPx, (frameArea * config.maxCandidateAreaFrameFraction).toInt())
     val longSide = max(bounds.width, bounds.height)
@@ -291,23 +330,103 @@ private fun MotionComponent.toBallCandidate(
         longSide > maxLongSide ||
         shortSide > maxShortSide ||
         shortSide < config.minCandidateShortSidePx ||
-        compactness < config.minCandidateCompactness ||
-        axisRatio > config.maxCandidatePrincipalAxisRatio
+        compactness < config.minCandidateCompactness
     ) {
         return null
     }
-    return Blob(
-        areaPx = areaPx,
-        centroid = centroid,
-        bounds = bounds,
-        compactness = compactness,
-        motionMetrics = MotionBallCandidateMetrics(
-            parentAreaPx = areaPx,
-            parentAreaRatio = 1.0,
-            foregroundAreaFraction = foregroundAreaFraction,
-            touchesFrameEdge = touchesFrameEdge,
+    val colorMatchFraction = colorMatchFraction(frame, mask, bounds, threshold)
+    val sideRatioRange = (config.maxCandidatePrincipalAxisRatio - 1.0).coerceAtLeast(1.0e-6)
+    val sideRatioScore = (1.0 - ((axisRatio - 1.0) / sideRatioRange)).coerceIn(0.0, 1.0)
+    val compactnessScore = compactness.coerceIn(0.0, 1.0)
+    val areaScore = (areaPx.toDouble() / maxArea.toDouble()).coerceIn(0.0, 1.0)
+    val edgePenalty = if (touchesFrameEdge) 0.20 else 0.0
+    val score = colorMatchFraction * 4.0 +
+        sideRatioScore * 3.0 +
+        compactnessScore +
+        areaScore * 0.5 -
+        edgePenalty
+    return ScoredMotionCandidate(
+        blob = Blob(
+            areaPx = areaPx,
+            centroid = centroid,
+            bounds = bounds,
+            compactness = compactness,
+            motionMetrics = MotionBallCandidateMetrics(
+                parentAreaPx = parentAreaPx,
+                parentAreaRatio = parentAreaRatio,
+                foregroundAreaFraction = foregroundAreaFraction,
+                touchesFrameEdge = touchesFrameEdge,
+            ),
         ),
+        score = score,
     )
+}
+
+private fun MotionComponent.toColorSeededBallCandidates(
+    frame: RgbFrame,
+    foregroundMask: BooleanArray,
+    width: Int,
+    height: Int,
+    foregroundAreaFraction: Double,
+    threshold: HsvThreshold,
+    bounds: FrameProcessingBounds,
+    config: RecordedHfrMotionDetectorConfig,
+    isCancelled: () -> Boolean,
+): List<ScoredMotionCandidate> {
+    val colorMask = BooleanArray(foregroundMask.size)
+    var colorPixelCount = 0
+    for (y in this.bounds.top..this.bounds.bottomInclusive) {
+        for (x in this.bounds.left..this.bounds.rightInclusive) {
+            val index = y * width + x
+            if (!foregroundMask[index]) continue
+            if (threshold.matches(ColorMath.argbToHsv(frame.argbPixels[index]))) {
+                colorMask[index] = true
+                colorPixelCount += 1
+            }
+        }
+    }
+    if (colorPixelCount < config.minCandidateAreaPx) return emptyList()
+    val childRoi = RegionOfInterest(
+        left = this.bounds.left,
+        top = this.bounds.top,
+        rightExclusive = this.bounds.rightInclusive + 1,
+        bottomExclusive = this.bounds.bottomInclusive + 1,
+    )
+    val components = collectComponents(colorMask, width, height, childRoi, bounds, isCancelled) ?: return emptyList()
+    return components.mapNotNull { child ->
+        child.toScoredBallCandidate(
+            frame = frame,
+            mask = colorMask,
+            width = width,
+            height = height,
+            foregroundAreaFraction = foregroundAreaFraction,
+            threshold = threshold,
+            config = config,
+            parentAreaPx = areaPx,
+            parentAreaRatio = child.areaPx.toDouble() / areaPx.toDouble(),
+        )
+    }
+}
+
+private fun colorMatchFraction(
+    frame: RgbFrame,
+    mask: BooleanArray,
+    bounds: PixelBounds,
+    threshold: HsvThreshold,
+): Double {
+    var pixels = 0
+    var matches = 0
+    for (y in bounds.top..bounds.bottomInclusive) {
+        for (x in bounds.left..bounds.rightInclusive) {
+            val index = y * frame.width + x
+            if (!mask[index]) continue
+            pixels += 1
+            if (threshold.matches(ColorMath.argbToHsv(frame.argbPixels[index]))) {
+                matches += 1
+            }
+        }
+    }
+    return if (pixels == 0) 0.0 else matches.toDouble() / pixels.toDouble()
 }
 
 private fun medianBackground(

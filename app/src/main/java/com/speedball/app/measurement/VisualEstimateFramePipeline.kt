@@ -80,7 +80,13 @@ object VisualEstimateFramePipeline {
                 trace = traceBuilder.build(),
             )
         }
-        if (!config.maxFrameToFrameJumpPx.isFinite() || config.maxFrameToFrameJumpPx <= 0.0 || config.maxInteriorMisses < 0) {
+        if (
+            !config.maxFrameToFrameJumpPx.isFinite() ||
+            config.maxFrameToFrameJumpPx <= 0.0 ||
+            config.maxInteriorMisses < 0 ||
+            config.maxCandidateTimestampGapSpreadRatio.isNaN() ||
+            config.maxCandidateTimestampGapSpreadRatio <= 0.0
+        ) {
             return VisualEstimateSampleExtractionWithTrace(
                 outcome = VisualEstimateSampleExtractionOutcome.Failure(
                     VisualEstimateNoReadReason.DETECTION_FAILED,
@@ -275,12 +281,6 @@ private fun enforceCandidateBudget(
             )
         }
     }
-    if (totalBlobs > budget.maxRansacCandidates) {
-        return VisualEstimateCandidateReductionOutcome.Failure(
-            VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
-            "Recorded-HFR RANSAC candidate count $totalBlobs exceeded the reducer cap ${budget.maxRansacCandidates}.",
-        )
-    }
     return null
 }
 
@@ -362,7 +362,7 @@ private fun selectSeededMovingTrack(
         previous = next
     }
     if (tracked.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return selectHighVelocityDirectionalTrack(frameCandidates, config)
-    return movingWindowFromSeededTrack(tracked) ?: selectHighVelocityDirectionalTrack(frameCandidates, config)
+    return movingWindowFromSeededTrack(tracked, config) ?: selectHighVelocityDirectionalTrack(frameCandidates, config)
 }
 
 private fun selectHighVelocityDirectionalTrack(
@@ -404,9 +404,9 @@ private fun selectHighVelocityDirectionalTrack(
                     lastBlob = nextBlob
                     if (path.size >= MAX_MOTION_WINDOW_SAMPLES) break
                 }
-                val bestCandidate = listStraightFlightWindows(path, direction)
-                    .maxWithOrNull(compareBy<StraightFlightPath> { it.score }.thenBy { it.path.size })
-                if (bestCandidate != null && (bestPath == null || bestCandidate.score > bestPath.score)) {
+                val bestCandidate = listStraightFlightWindows(path, direction, config)
+                    .maxWithOrNull(straightFlightPathComparator)
+                if (bestCandidate != null && (bestPath == null || straightFlightPathComparator.compare(bestCandidate, bestPath) > 0)) {
                     bestPath = bestCandidate
                 }
             }
@@ -424,6 +424,7 @@ private fun selectRansacStraightFlightTrack(
         frame.blobs.map { blob -> RansacBlobCandidate(frameOrder, frame, blob) }
     }
     val budget = config.candidateReductionBudget
+    if (budget != null && candidates.size > budget.maxRansacCandidates) return null
     var bestConsensus: RansacStraightFlightConsensus? = null
     var evaluatedPairs = 0
     for (firstIndex in candidates.indices) {
@@ -444,8 +445,8 @@ private fun selectRansacStraightFlightTrack(
             val consensusPath = ransacConsensusPath(frameCandidates, hypothesis, config)
             if (consensusPath.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) continue
 
-            val bestWindow = listStraightFlightWindows(consensusPath, hypothesis.direction)
-                .maxWithOrNull(compareBy<StraightFlightPath> { it.score }.thenBy { it.path.size })
+            val bestWindow = listStraightFlightWindows(consensusPath, hypothesis.direction, config)
+                .maxWithOrNull(straightFlightPathComparator)
                 ?: continue
             val averageInlierDistance = bestWindow.path
                 .map { (_, blob) -> hypothesis.distanceTo(blob.centroid) }
@@ -492,6 +493,7 @@ private fun ransacConsensusPath(
 
 private fun movingWindowFromSeededTrack(
     tracked: List<Pair<VisualEstimateCandidateFrame, Blob>>,
+    config: TrackExtractionConfig,
 ): List<Pair<VisualEstimateCandidateFrame, Blob>>? {
     val motionIndex = firstHighVelocityMotionIndex(tracked) ?: return null
     val windowStart = max(0, motionIndex - 1)
@@ -516,8 +518,8 @@ private fun movingWindowFromSeededTrack(
         previous = currentBlob
         if (candidate.size >= MAX_MOTION_WINDOW_SAMPLES) break
     }
-    return listStraightFlightWindows(candidate, direction)
-        .maxWithOrNull(compareBy<StraightFlightPath> { it.score }.thenBy { it.path.size })
+    return listStraightFlightWindows(candidate, direction, config)
+        .maxWithOrNull(straightFlightPathComparator)
         ?.path
 }
 
@@ -588,6 +590,10 @@ private data class RansacStraightFlightConsensus(
 ) {
     fun isBetterThan(other: RansacStraightFlightConsensus?): Boolean {
         if (other == null) return true
+        val thisSize = path.path.size
+        val otherSize = other.path.path.size
+        if (thisSize != otherSize) return thisSize > otherSize
+        if (inlierCount != other.inlierCount) return inlierCount > other.inlierCount
         val thisScore = consensusScore()
         val otherScore = other.consensusScore()
         return thisScore > otherScore
@@ -599,15 +605,20 @@ private data class RansacStraightFlightConsensus(
             averageInlierDistancePx * RANSAC_INLIER_DISTANCE_SCORE_WEIGHT
 }
 
+private val straightFlightPathComparator: Comparator<StraightFlightPath> =
+    compareBy<StraightFlightPath> { it.path.size }
+        .thenBy { it.score }
+
 private fun listStraightFlightWindows(
     path: List<Pair<VisualEstimateCandidateFrame, Blob>>,
     direction: Double,
+    config: TrackExtractionConfig,
 ): List<StraightFlightPath> {
     if (path.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return emptyList()
     val candidates = mutableListOf<StraightFlightPath>()
     for (start in 0..path.size - SEEDED_MOTION_MIN_USABLE_DETECTIONS) {
         for (endExclusive in (start + SEEDED_MOTION_MIN_USABLE_DETECTIONS)..min(path.size, start + MAX_HIT_FLIGHT_WINDOW_SAMPLES)) {
-            scoreStraightFlightWindow(path.subList(start, endExclusive), direction)?.let(candidates::add)
+            scoreStraightFlightWindow(path.subList(start, endExclusive), direction, config)?.let(candidates::add)
         }
     }
     return candidates
@@ -616,6 +627,7 @@ private fun listStraightFlightWindows(
 private fun scoreStraightFlightWindow(
     path: List<Pair<VisualEstimateCandidateFrame, Blob>>,
     direction: Double,
+    config: TrackExtractionConfig,
 ): StraightFlightPath? {
     if (path.size < SEEDED_MOTION_MIN_USABLE_DETECTIONS) return null
     val deltas = path.zipWithNext().map { (previous, current) ->
@@ -625,6 +637,14 @@ private fun scoreStraightFlightWindow(
         FlightStep(dx = dx, dy = dy, dt = dt)
     }
     if (deltas.any { !it.isUsable() || it.dx < HIGH_VELOCITY_HORIZONTAL_STEP_PX }) return null
+    val minDt = deltas.minOf { it.dt }
+    val maxDt = deltas.maxOf { it.dt }
+    if (
+        config.maxCandidateTimestampGapSpreadRatio.isFinite() &&
+        maxDt / minDt > config.maxCandidateTimestampGapSpreadRatio
+    ) {
+        return null
+    }
     val horizontalTravel = deltas.sumOf { it.dx }
     val totalTravel = path.last().second.centroid.distanceTo(path.first().second.centroid)
     val durationSeconds = path.last().first.timestampSeconds - path.first().first.timestampSeconds
@@ -745,8 +765,8 @@ private const val DIRECTION_REVERSAL_TOLERANCE_PX = 1.0
 private const val STATIONARY_AFTER_MOTION_DISTANCE_PX = 0.75
 private const val MAX_STATIONARY_SAMPLES_AFTER_MOTION = 3
 private const val MAX_MOTION_WINDOW_SAMPLES = 32
-private const val MAX_HIT_FLIGHT_WINDOW_SAMPLES = 12
-private const val RANSAC_STRAIGHT_FLIGHT_INLIER_DISTANCE_PX = 2.5
+private const val MAX_HIT_FLIGHT_WINDOW_SAMPLES = 24
+private const val RANSAC_STRAIGHT_FLIGHT_INLIER_DISTANCE_PX = 8.0
 private const val RANSAC_INLIER_COUNT_SCORE_WEIGHT = 12.0
 private const val RANSAC_INLIER_DISTANCE_SCORE_WEIGHT = 8.0
 

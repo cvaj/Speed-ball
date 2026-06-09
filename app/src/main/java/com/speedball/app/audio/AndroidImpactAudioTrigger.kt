@@ -144,6 +144,9 @@ class AndroidImpactAudioTrigger(private val context: Context) {
         minBuffer: Int,
         chunkSize: Int,
     ): AudioRecord? {
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            return null
+        }
         val bufferSize = maxOf(minBuffer, chunkSize * 2)
         for (source in listOf(MediaRecorder.AudioSource.UNPROCESSED, MediaRecorder.AudioSource.MIC)) {
             val recorder = try {
@@ -154,6 +157,8 @@ class AndroidImpactAudioTrigger(private val context: Context) {
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufferSize,
                 )
+            } catch (_: SecurityException) {
+                null
             } catch (_: RuntimeException) {
                 null
             }

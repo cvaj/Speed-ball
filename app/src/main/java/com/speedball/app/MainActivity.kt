@@ -112,6 +112,8 @@ import com.speedball.app.importing.RecordedHfrByteBufferViabilityProbe
 import com.speedball.app.importing.RecordedHfrCaptureGate
 import com.speedball.app.importing.RecordedHfrDecodedWindowProof
 import com.speedball.app.importing.RecordedHfrDecodedWindowValidator
+import com.speedball.app.importing.RecordedHfrMotionScoutConfig
+import com.speedball.app.importing.RecordedHfrMotionScoutSelection
 import com.speedball.app.importing.RecordedHfrStreamingEstimate
 import com.speedball.app.importing.RecordedHfrStreamingEstimateConfig
 import com.speedball.app.importing.RecordedHfrStreamingTimingMode
@@ -158,6 +160,7 @@ import com.speedball.app.measurement.VisualEstimateFrameTiming
 import com.speedball.app.measurement.VisualEstimateNoReadReason
 import com.speedball.app.measurement.VisualEstimateOutcome
 import com.speedball.app.measurement.VisualEstimatePipelineConfig
+import com.speedball.app.measurement.VisualEstimateScaleMode
 import com.speedball.app.measurement.parsePositiveFeet
 import com.speedball.app.ui.SpeedBallApp
 import com.speedball.app.ui.SpeedBallAppMode
@@ -214,6 +217,10 @@ class MainActivity : ComponentActivity() {
     private var phase14WorkflowState = Phase14WorkflowState()
     private var setupAdjustmentTarget = SetupAdjustmentTarget.CaliperA
     private var knownDistanceFeetText = INITIAL_KNOWN_DISTANCE_FEET_TEXT
+    private var calibrationPlaneDepthFeetText = INITIAL_CALIBRATION_PLANE_DEPTH_FEET_TEXT
+    private var ballPlaneDepthFeetText = INITIAL_BALL_PLANE_DEPTH_FEET_TEXT
+    private var motionBlobSideRatioText = INITIAL_MOTION_BLOB_SIDE_RATIO_TEXT
+    private var launchHeightFeetText = INITIAL_LAUNCH_HEIGHT_FEET_TEXT
     private var importWorkflowState = ImportWorkflowState()
     private lateinit var savedResultStore: SavedResultSummaryStore
     private var savedResultHistory = SavedResultHistory()
@@ -236,6 +243,7 @@ class MainActivity : ComponentActivity() {
     private var voiceRecordListening = false
     private var voiceConsecutiveErrors = 0
     private var voiceRestartRunnable: Runnable? = null
+    private var reportAutoClearRunnable: Runnable? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private var readySpeech: TextToSpeech? = null
     private var readySpeechReady = false
@@ -327,6 +335,10 @@ class MainActivity : ComponentActivity() {
                     startAutoBurstIfReady()
                 },
                 onKnownDistanceChanged = { updateKnownDistanceFeetInput(it) },
+                onCalibrationPlaneDepthChanged = { updateCalibrationPlaneDepthFeetInput(it) },
+                onBallPlaneDepthChanged = { updateBallPlaneDepthFeetInput(it) },
+                onMotionBlobSideRatioChanged = { updateMotionBlobSideRatioInput(it) },
+                onLaunchHeightChanged = { updateLaunchHeightFeetInput(it) },
                 onPreviewTap = { x, y, width, height -> handlePreviewTap(x, y, width, height) },
                 onSetCaliperAFromPreview = { x, width, height -> setCaliperLineFromPreview(SetupAdjustmentTarget.CaliperA, x, width, height) },
                 onSetCaliperBFromPreview = { x, width, height -> setCaliperLineFromPreview(SetupAdjustmentTarget.CaliperB, x, width, height) },
@@ -466,6 +478,9 @@ class MainActivity : ComponentActivity() {
 
     private fun enterSetupMode() {
         appMode = SpeedBallAppMode.Setup
+        cancelReportAutoClear()
+        currentVisualEstimateReport = null
+        dismissedVisualEstimateAttemptId = visualEstimateAttemptId
         stopVoiceRecordListener()
         runCommandState = SpeedBallRunCommandState.SetupInvalid(shootNotReadyStatus() ?: "Setup mode")
         updateShellState(status = "Setup mode")
@@ -488,9 +503,13 @@ class MainActivity : ComponentActivity() {
             speechRecognizer = it
         }
         if (appMode == SpeedBallAppMode.Run && runCommandState !is SpeedBallRunCommandState.Capturing) {
-            runCommandState = SpeedBallRunCommandState.ManualReady
+            runCommandState = if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+                SpeedBallRunCommandState.Reporting
+            } else {
+                SpeedBallRunCommandState.ManualReady
+            }
         }
-        updateShellState(status = "Say shoot or record")
+        updateShellState(status = if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) "Say clear to restart" else VOICE_RUN_PROMPT)
         recognizer.startListening(voiceRecognizerIntent())
     }
 
@@ -539,11 +558,15 @@ class MainActivity : ComponentActivity() {
                         updateShellState(status = notReadyStatus)
                         return
                     }
-                    if (currentVisualEstimateReport?.kind != VisualEstimateReportKind.Success) {
+                    if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+                        runCommandState = SpeedBallRunCommandState.Reporting
+                        updateShellState(status = "Say clear to restart")
+                        return
+                    } else {
                         runCommandState = SpeedBallRunCommandState.Listening
                     }
                 }
-                updateShellState(status = "Listening for shoot")
+                updateShellState(status = VOICE_LISTENING_PROMPT)
             }
 
             override fun onBeginningOfSpeech() = Unit
@@ -560,9 +583,13 @@ class MainActivity : ComponentActivity() {
                 if (isIdleVoiceRecognizerError(error)) {
                     voiceConsecutiveErrors = 0
                     val delayMillis = VOICE_IDLE_RESTART_DELAY_MILLIS
-                    runCommandState = SpeedBallRunCommandState.VoiceRetrying(0, delayMillis)
+                    if (appMode == SpeedBallAppMode.Run && currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+                        runCommandState = SpeedBallRunCommandState.Reporting
+                    } else if (appMode == SpeedBallAppMode.Run) {
+                        runCommandState = SpeedBallRunCommandState.Listening
+                    }
                     Log.i(logTag, "VOICE_RECORD_LISTEN_IDLE code=$error nextDelayMs=$delayMillis")
-                    updateShellState(status = "Listening restarting")
+                    updateShellState(status = if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) "Say clear to restart" else VOICE_LISTENING_PROMPT)
                     restartVoiceRecordListenerSoon(delayMillis)
                     return
                 }
@@ -585,7 +612,10 @@ class MainActivity : ComponentActivity() {
                 val heard = results
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     .orEmpty()
-                if (heard.any(::isShootCommand)) {
+                if (heard.any(::isClearCommand)) {
+                    Log.i(logTag, "VOICE_CLEAR_COMMAND recognized")
+                    handleClearCommand()
+                } else if (heard.any(::isShootCommand)) {
                     Log.i(logTag, "VOICE_SHOOT_COMMAND recognized")
                     handleShootCommand()
                 } else if (heard.any(::isRecordCommand)) {
@@ -594,7 +624,7 @@ class MainActivity : ComponentActivity() {
                     handleShootCommand()
                 } else {
                     Log.i(logTag, "VOICE_RECORD_IGNORED alternatives=${heard.size}")
-                    updateShellState(status = "Say shoot or record")
+                    updateShellState(status = VOICE_RUN_PROMPT)
                     restartVoiceRecordListenerSoon()
                 }
             }
@@ -603,13 +633,13 @@ class MainActivity : ComponentActivity() {
                 val heard = partialResults
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     .orEmpty()
-                if (heard.any(::isShootCommand)) {
-                    Log.i(logTag, "VOICE_SHOOT_COMMAND partial")
-                    handleShootCommand()
+                if (heard.any(::isClearCommand)) {
+                    Log.i(logTag, "VOICE_CLEAR_COMMAND partial")
+                    handleClearCommand()
+                } else if (heard.any(::isShootCommand)) {
+                    Log.i(logTag, "VOICE_SHOOT_COMMAND partial ignored")
                 } else if (heard.any(::isRecordCommand)) {
-                    Log.i(logTag, "VOICE_RECORD_COMMAND partial")
-                    stopVoiceRecordListener()
-                    handleShootCommand()
+                    Log.i(logTag, "VOICE_RECORD_COMMAND partial ignored")
                 }
             }
 
@@ -648,6 +678,19 @@ class MainActivity : ComponentActivity() {
         runCommandState = SpeedBallRunCommandState.Capturing
         updateShellState(status = "Arming impact audio")
         startSoundTriggeredRecordingEstimate()
+    }
+
+    private fun handleClearCommand() {
+        val report = visibleVisualEstimateReport()
+        if (report == null) {
+            if (appMode == SpeedBallAppMode.Run) {
+                resumeRunModeCommandPath()
+            }
+            return
+        }
+        Log.i(logTag, "VOICE_CLEAR_RESULT attempt=${report.attemptId}")
+        stopVoiceRecordListener()
+        dismissVisualEstimateReport(report.attemptId)
     }
 
     private fun shootNotReadyStatus(): String? {
@@ -786,6 +829,11 @@ class MainActivity : ComponentActivity() {
         text.lowercase(Locale.US)
             .split(Regex("[^a-z]+"))
             .any { it in VOICE_RECORD_COMMANDS }
+
+    private fun isClearCommand(text: String): Boolean =
+        text.lowercase(Locale.US)
+            .split(Regex("[^a-z]+"))
+            .any { it in VOICE_CLEAR_COMMANDS }
 
     private fun isIdleVoiceRecognizerError(error: Int): Boolean =
         error == SpeechRecognizer.ERROR_NO_MATCH ||
@@ -992,8 +1040,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun isCaptureActiveStatus(): Boolean =
-        captureStatus.contains("record", ignoreCase = true) ||
-            captureStatus.contains("running", ignoreCase = true)
+        captureStatus.equals("Recording", ignoreCase = true) ||
+            captureStatus.contains("running", ignoreCase = true) ||
+            captureStatus.contains("arming", ignoreCase = true) ||
+            captureStatus.contains("armed", ignoreCase = true) ||
+            captureStatus.contains("starting", ignoreCase = true) ||
+            captureStatus.contains("cueing", ignoreCase = true) ||
+            captureStatus.contains("window decoding", ignoreCase = true)
 
     private fun startSoundTriggeredRecordingEstimate() {
         readySignalPending = true
@@ -1098,6 +1151,7 @@ class MainActivity : ComponentActivity() {
             BurstOptions(
                 mode = mode,
                 durationMillis = SOUND_TRIGGER_TOTAL_RECORDING_MILLIS,
+                maxAutoExposureTimeNanos = RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS,
                 companionSurfaceMode = BurstCompanionSurfaceMode.OFFSCREEN_PREVIEW,
                 stopMode = BurstStopMode.ExternalStop,
                 onFirstFrameAnchor = { anchor ->
@@ -1299,6 +1353,7 @@ class MainActivity : ComponentActivity() {
                 request = ImpactWindowRequest(
                     impactElapsedRealtimeNanos = result.event.elapsedRealtimeNanos,
                     requestedFps = mode.fps,
+                    preImpactMillis = SOUND_TRIGGER_PRE_IMPACT_CAPTURE_MILLIS,
                     postImpactMillis = SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS,
                     maxPreImpactMarginFrames = SOUND_TRIGGER_MAX_PRE_IMPACT_FRAMES,
                 ),
@@ -1389,6 +1444,7 @@ class MainActivity : ComponentActivity() {
             BurstOptions(
                 mode,
                 durationMillis = AUTO_RECORD_ESTIMATE_DURATION_MILLIS,
+                maxAutoExposureTimeNanos = RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS,
                 companionSurfaceMode = BurstCompanionSurfaceMode.OFFSCREEN_PREVIEW,
             ),
             previewSurface,
@@ -1694,6 +1750,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginVisualEstimateAttempt() {
+        cancelReportAutoClear()
         visualEstimateAttemptId += 1
         currentVisualEstimateReport = null
         dismissedVisualEstimateAttemptId = null
@@ -1701,6 +1758,7 @@ class MainActivity : ComponentActivity() {
 
     private fun dismissVisualEstimateReport(attemptId: Long) {
         if (currentVisualEstimateReport?.attemptId != attemptId) return
+        cancelReportAutoClear()
         dismissedVisualEstimateAttemptId = attemptId
         currentVisualEstimateReport = null
         if (appMode == SpeedBallAppMode.Run) {
@@ -1713,18 +1771,42 @@ class MainActivity : ComponentActivity() {
     private fun visibleVisualEstimateReport(): VisualEstimateReport? =
         currentVisualEstimateReport?.takeUnless { it.attemptId == dismissedVisualEstimateAttemptId }
 
+    private fun scheduleReportAutoClear(report: VisualEstimateReport?) {
+        cancelReportAutoClear()
+        if (appMode != SpeedBallAppMode.Run || report == null) return
+        val attemptId = report.attemptId
+        val runnable = Runnable {
+            reportAutoClearRunnable = null
+            if (currentVisualEstimateReport?.attemptId == attemptId) {
+                Log.i(logTag, "REPORT_AUTO_CLEAR attempt=$attemptId")
+                dismissVisualEstimateReport(attemptId)
+            }
+        }
+        reportAutoClearRunnable = runnable
+        mainHandler.postDelayed(runnable, REPORT_AUTO_CLEAR_DELAY_MILLIS)
+    }
+
+    private fun cancelReportAutoClear() {
+        reportAutoClearRunnable?.let { mainHandler.removeCallbacks(it) }
+        reportAutoClearRunnable = null
+    }
+
     private fun resumeRunModeCommandPath() {
         if (appMode != SpeedBallAppMode.Run) return
+        if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
+            runCommandState = SpeedBallRunCommandState.Reporting
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startVoiceRecordListener()
+            } else {
+                stopVoiceRecordListener()
+                updateShellState(status = captureStatus)
+            }
+            return
+        }
         val notReadyStatus = shootNotReadyStatus()
         if (notReadyStatus != null) {
             runCommandState = SpeedBallRunCommandState.SetupInvalid(notReadyStatus)
             updateShellState(status = notReadyStatus)
-            return
-        }
-        if (currentVisualEstimateReport?.kind == VisualEstimateReportKind.Success) {
-            runCommandState = SpeedBallRunCommandState.Reporting
-            stopVoiceRecordListener()
-            updateShellState(status = captureStatus)
             return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
@@ -1751,6 +1833,7 @@ class MainActivity : ComponentActivity() {
                     outcome = outcome.estimateOutcome,
                     captureProof = outcome.captureProof.withAttemptId(visualEstimateAttemptId),
                 )
+                scheduleReportAutoClear(currentVisualEstimateReport)
                 reportKind = currentVisualEstimateReport?.kind ?: VisualEstimateReportKind.NoRead
                 Log.i(
                     logTag,
@@ -1779,6 +1862,7 @@ class MainActivity : ComponentActivity() {
                     failure = true,
                     captureProof = outcome.captureProof?.withAttemptId(visualEstimateAttemptId),
                 )
+                scheduleReportAutoClear(currentVisualEstimateReport)
                 reportKind = VisualEstimateReportKind.Failure
                 val proofSummary = outcome.captureProof?.detectorSummary
                 Log.i(
@@ -2280,6 +2364,53 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun updateCalibrationPlaneDepthFeetInput(text: String) {
+        calibrationPlaneDepthFeetText = text
+        updateShellState(status = depthCorrectionStatus())
+    }
+
+    private fun updateBallPlaneDepthFeetInput(text: String) {
+        ballPlaneDepthFeetText = text
+        updateShellState(status = depthCorrectionStatus())
+    }
+
+    private fun updateMotionBlobSideRatioInput(text: String) {
+        motionBlobSideRatioText = text
+        val ratio = parseMotionBlobSideRatio(text)
+        updateShellState(status = if (ratio == null) "Enter ball shape ratio >= 1.0" else "Ball shape ratio ${ratio.format(2)}")
+    }
+
+    private fun updateLaunchHeightFeetInput(text: String) {
+        launchHeightFeetText = text
+        val heightFeet = parseLaunchHeightFeet(text)
+        updateShellState(status = if (heightFeet == null) "Enter launch height >= 0 ft" else "Launch height ${heightFeet.format(1)} ft")
+    }
+
+    private fun depthCorrectionStatus(): String =
+        when (currentScaleModeOrNull()) {
+            null -> "Enter both plane depths in feet"
+            VisualEstimateScaleMode.SamePlane -> "Depth correction off"
+            is VisualEstimateScaleMode.DepthCorrected -> "Depth correction ready"
+        }
+
+    private fun currentScaleModeOrNull(): VisualEstimateScaleMode? {
+        val calibrationText = calibrationPlaneDepthFeetText.trim()
+        val ballText = ballPlaneDepthFeetText.trim()
+        if (calibrationText.isEmpty() && ballText.isEmpty()) return VisualEstimateScaleMode.SamePlane
+        val calibrationDepthFeet = parsePositiveFeet(calibrationText) ?: return null
+        val ballDepthFeet = parsePositiveFeet(ballText) ?: return null
+        return VisualEstimateScaleMode.DepthCorrected(
+            ballPlaneDepthFeet = ballDepthFeet,
+            calibrationPlaneDepthFeet = calibrationDepthFeet,
+        )
+    }
+
+    private fun parseMotionBlobSideRatio(text: String): Double? =
+        text.trim().toDoubleOrNull()?.takeIf { it.isFinite() && it >= 1.0 }
+
+    private fun parseLaunchHeightFeet(text: String): Double? =
+        text.trim().toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0.0 }
+
     private fun handlePreviewTap(
         x: Float,
         y: Float,
@@ -2577,6 +2708,7 @@ class MainActivity : ComponentActivity() {
             outcome = outcome,
             captureProof = proof?.withAttemptId(visualEstimateAttemptId),
         )
+        scheduleReportAutoClear(currentVisualEstimateReport)
         dismissedVisualEstimateAttemptId = null
         visualEstimateOutcomeUiLines(outcome).forEach { line ->
             Log.i(logTag, "RECORDED_HFR_ESTIMATE_RESULT ${line.compactForLog()}")
@@ -2610,6 +2742,7 @@ class MainActivity : ComponentActivity() {
             failure = failure,
             captureProof = proof?.withAttemptId(visualEstimateAttemptId),
         )
+        scheduleReportAutoClear(currentVisualEstimateReport)
         dismissedVisualEstimateAttemptId = null
         visualEstimateOutcomeUiLines(noRead).forEach { line ->
             Log.i(logTag, "RECORDED_HFR_ESTIMATE_RESULT ${line.compactForLog()}")
@@ -2778,9 +2911,10 @@ class MainActivity : ComponentActivity() {
                 maxProofFrames = VisualEstimateCaptureProofBuilder.DEFAULT_MAX_PROOF_FRAMES,
                 proofThumbnailMaxWidth = RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH,
                 proofThumbnailMaxHeight = RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT,
-                motionDetectorConfig = RecordedHfrMotionDetectorConfig(),
+                motionDetectorConfig = runtimeConfig.motionDetectorConfig ?: RecordedHfrMotionDetectorConfig(),
             ),
         )
+        logMotionScoutSelection(estimate.motionScoutSelection, window = false)
         val gateValidation = RecordedHfrCaptureGate.validate(
             metadataSampleCount = metadata.sampleCount,
             scannedFrameCount = estimate.scannedFrameCount,
@@ -2974,6 +3108,7 @@ class MainActivity : ComponentActivity() {
                 targetWidth = workingResolution.working.width,
                 targetHeight = workingResolution.working.height,
                 maxDecodeWallClockMillis = RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS,
+                sourceMotionScoutConfig = RecordedHfrMotionScoutConfig(),
             )
         ) {
             is ImportValidationResult.NoRead -> return ImportRunOutcome.NoRead(
@@ -2998,10 +3133,12 @@ class MainActivity : ComponentActivity() {
                 proofThumbnailMaxHeight = RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT,
                 timingMode = RecordedHfrStreamingTimingMode.CONTAINER_PTS_DELTAS,
                 proofOnly = earlyExposureNoRead != null,
-                motionDetectorConfig = RecordedHfrMotionDetectorConfig(),
+                motionDetectorConfig = runtimeConfig.motionDetectorConfig ?: RecordedHfrMotionDetectorConfig(),
+                motionScoutConfig = RecordedHfrMotionScoutConfig(enabled = false),
             ),
             cancellationSignal = windowCancellation,
         )
+        logMotionScoutSelection(source.sourceMotionScoutSelection ?: estimate.motionScoutSelection, window = true)
         val decodeProof = source.proof
         val terminalNoReadMessage = source.terminalNoReadMessage()
         Log.i(
@@ -3020,7 +3157,7 @@ class MainActivity : ComponentActivity() {
         )
         val gateValidation = RecordedHfrWindowCaptureGate.validate(
             metadataSampleCount = metadata.sampleCount,
-            decodedWindowFrameCount = estimate.scannedFrameCount,
+            decodedWindowFrameCount = decodeProof.emittedFrameCount,
             requestedWindowFrameCount = mapping.window.maxFrames,
             minUsableFrameCount = RECORDED_HFR_WINDOW_MIN_USABLE_FRAMES,
             diagnostics = diagnostics,
@@ -3214,6 +3351,20 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun logMotionScoutSelection(selection: RecordedHfrMotionScoutSelection?, window: Boolean) {
+        val selected = selection ?: run {
+            Log.i(logTag, "RECORDED_HFR_MOTION_SCOUT window=$window selected=false")
+            return
+        }
+        Log.i(
+            logTag,
+            "RECORDED_HFR_MOTION_SCOUT window=$window selected=true " +
+                "sourceFrames=${selected.sourceFrameCount} dense=${selected.denseStartIndex}-${selected.denseEndIndexInclusive} " +
+                "run=${selected.runStartIndex}-${selected.runEndIndexInclusive} runFrames=${selected.runFrameCount} " +
+                "travelPx=${selected.runTravelPx.format(2)} meanAreaPx=${selected.meanComponentAreaPx.format(2)}",
+        )
+    }
+
     private fun buildRecordedHfrExposureNoRead(
         diagnostics: BurstDiagnostics,
         outcome: VisualEstimateOutcome?,
@@ -3270,6 +3421,7 @@ class MainActivity : ComponentActivity() {
             debugVisualEstimateKnownBallDiameterFeet
         }
         if (calibration.pixelsPerFoot() is CalibrationResult.Failure && knownBallDiameterFeet == null) return null
+        val scaleMode = currentScaleModeOrNull() ?: return null
         return ImportEstimateRuntimeConfig(
             calibration = calibration,
             framePipelineConfig = VisualEstimateFramePipelineConfig(
@@ -3296,12 +3448,14 @@ class MainActivity : ComponentActivity() {
                 ),
                 estimateConfig = VisualEstimatePipelineConfig(
                     maxEstimateRmsResidualPx = if (knownBallDiameterFeet != null) BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX else IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX,
-                    maxOutlierPasses = 2,
+                    maxEstimateRmsResidualDiameterFraction = ESTIMATE_RESIDUAL_BLOB_DIAMETER_FRACTION,
+                    maxOutlierPasses = 0,
                     maxRejectedOutlierCount = 4,
                     knownBallDiameterFeet = knownBallDiameterFeet,
                     allowApparentScaleChangeEstimate = knownBallDiameterFeet != null,
                     requireFittedPathProgression = false,
                     minEstimateMilesPerHour = HIT_BALL_MIN_ESTIMATE_MPH,
+                    scaleMode = scaleMode,
                     levelReference = phase14WorkflowState.levelReference,
                 ),
                 timing = VisualEstimateFrameTiming.RequireRealTimestamps,
@@ -3337,6 +3491,9 @@ class MainActivity : ComponentActivity() {
             debugVisualEstimateKnownBallDiameterFeet
         }
         if (calibration.pixelsPerFoot() is CalibrationResult.Failure && knownBallDiameterFeet == null) return null
+        val scaleMode = currentScaleModeOrNull() ?: return null
+        val motionBlobSideRatio = parseMotionBlobSideRatio(motionBlobSideRatioText) ?: return null
+        val launchHeightFeet = parseLaunchHeightFeet(launchHeightFeetText) ?: return null
         val workingPixels = workingResolution.working.width * workingResolution.working.height
         return ImportEstimateRuntimeConfig(
             calibration = calibration,
@@ -3361,6 +3518,7 @@ class MainActivity : ComponentActivity() {
                     maxFrameToFrameJumpPx = workingResolution.working.width.toDouble(),
                     maxInteriorMisses = 1,
                     allowDirectionalCandidateSelection = true,
+                    maxCandidateTimestampGapSpreadRatio = 2.5,
                     candidateReductionBudget = CandidateReductionBudget(
                         maxBlobsPerFrame = RECORDED_HFR_MAX_BLOBS_PER_FRAME,
                         maxTotalCandidateBlobs = RECORDED_HFR_MAX_TOTAL_CANDIDATE_BLOBS,
@@ -3371,16 +3529,22 @@ class MainActivity : ComponentActivity() {
                 ),
                 estimateConfig = VisualEstimatePipelineConfig(
                     maxEstimateRmsResidualPx = if (knownBallDiameterFeet != null) BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX else IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX,
-                    maxOutlierPasses = 2,
+                    maxEstimateRmsResidualDiameterFraction = ESTIMATE_RESIDUAL_BLOB_DIAMETER_FRACTION,
+                    maxOutlierPasses = 0,
                     maxRejectedOutlierCount = 4,
                     knownBallDiameterFeet = knownBallDiameterFeet,
-                    allowApparentScaleChangeEstimate = knownBallDiameterFeet != null,
+                    allowApparentScaleChangeEstimate = true,
                     requireFittedPathProgression = false,
-                    minEstimateMilesPerHour = RECORDED_HFR_MOTION_MIN_ESTIMATE_MPH,
-                    minimumSpeedGatePolicy = MinimumSpeedGatePolicy.SAME_PLANE_ONLY,
+                    minEstimateMilesPerHour = null,
+                    minimumSpeedGatePolicy = MinimumSpeedGatePolicy.DISABLED,
+                    scaleMode = scaleMode,
                     levelReference = phase14WorkflowState.levelReference,
+                    launchHeightFeet = launchHeightFeet,
                 ),
                 timing = VisualEstimateFrameTiming.RequireRealTimestamps,
+            ),
+            motionDetectorConfig = RecordedHfrMotionDetectorConfig(
+                maxCandidatePrincipalAxisRatio = motionBlobSideRatio,
             ),
         )
     }
@@ -3557,6 +3721,7 @@ class MainActivity : ComponentActivity() {
                 ),
                 estimateConfig = VisualEstimatePipelineConfig(
                     maxEstimateRmsResidualPx = if (knownBallDiameterFeet != null) BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX else 2.0,
+                    maxEstimateRmsResidualDiameterFraction = ESTIMATE_RESIDUAL_BLOB_DIAMETER_FRACTION,
                     knownBallDiameterFeet = knownBallDiameterFeet,
                     allowApparentScaleChangeEstimate = knownBallDiameterFeet != null,
                     minEstimateMilesPerHour = HIT_BALL_MIN_ESTIMATE_MPH,
@@ -3628,6 +3793,10 @@ class MainActivity : ComponentActivity() {
             exportEvidenceText = lastImportExportText,
             setupAdjustmentTargetLabel = setupAdjustmentTarget.label,
             knownDistanceFeetText = knownDistanceFeetText,
+            calibrationPlaneDepthFeetText = calibrationPlaneDepthFeetText,
+            ballPlaneDepthFeetText = ballPlaneDepthFeetText,
+            motionBlobSideRatioText = motionBlobSideRatioText,
+            launchHeightFeetText = launchHeightFeetText,
             previewRotationDegrees = previewRotationDegrees,
             visualEstimateReport = visibleVisualEstimateReport(),
             workflowFrameWidth = selectedMode?.width ?: 0,
@@ -3800,6 +3969,7 @@ class MainActivity : ComponentActivity() {
     private data class ImportEstimateRuntimeConfig(
         val calibration: MeasurementCalibrationState,
         val framePipelineConfig: VisualEstimateFramePipelineConfig,
+        val motionDetectorConfig: RecordedHfrMotionDetectorConfig? = null,
     )
 
     private sealed interface ImportRunOutcome {
@@ -3931,18 +4101,18 @@ class MainActivity : ComponentActivity() {
         const val RECORDED_HFR_PROOF_THUMBNAIL_MAX_WIDTH = 96
         const val RECORDED_HFR_PROOF_THUMBNAIL_MAX_HEIGHT = 54
         const val RECORDED_HFR_WINDOW_MIN_USABLE_FRAMES = 4
-        const val RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS = 10_000L
-        const val RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS = 2_000_000L
+        const val RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS = 300_000L
+        const val RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS = 12_000_000L
         const val RECORDED_HFR_MAX_BLOBS_PER_FRAME = 32
-        const val RECORDED_HFR_MAX_TOTAL_CANDIDATE_BLOBS = 90
+        const val RECORDED_HFR_MAX_TOTAL_CANDIDATE_BLOBS = 150
         const val RECORDED_HFR_MAX_RANSAC_CANDIDATES = 90
         const val RECORDED_HFR_MAX_RANSAC_PAIR_HYPOTHESES = 4_096
         const val RECORDED_HFR_RANSAC_CANCELLATION_CHECK_INTERVAL = 128
         const val BALL_DIAMETER_ESTIMATE_MAX_RMS_RESIDUAL_PX = 24.0
         const val IMPORT_ESTIMATE_MAX_RMS_RESIDUAL_PX = 8.0
+        const val ESTIMATE_RESIDUAL_BLOB_DIAMETER_FRACTION = 0.35
         const val IMPORT_ESTIMATE_MIN_BLOB_AREA_PX = 4
         const val HIT_BALL_MIN_ESTIMATE_MPH = 25.0
-        const val RECORDED_HFR_MOTION_MIN_ESTIMATE_MPH = 35.0
         const val AUTO_RECORD_ESTIMATE_DURATION_MILLIS = 3_000L
         const val SOUND_TRIGGER_SAMPLE_RATE_HZ = 48_000
         const val SOUND_TRIGGER_BASELINE_SAMPLES = 960
@@ -3952,7 +4122,8 @@ class MainActivity : ComponentActivity() {
         const val SOUND_TRIGGER_MINIMUM_BASELINE_RMS = 25.0
         const val SOUND_TRIGGER_COOLDOWN_SAMPLES = 4_800
         const val SOUND_TRIGGER_USER_ACTIONABLE_MILLIS = 5_000L
-        const val SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS = 200L
+        const val SOUND_TRIGGER_PRE_IMPACT_CAPTURE_MILLIS = 1_000L
+        const val SOUND_TRIGGER_POST_IMPACT_CAPTURE_MILLIS = 1_000L
         const val SOUND_TRIGGER_AUDIO_ARM_BUDGET_MILLIS = 1_500L
         const val SOUND_TRIGGER_HFR_START_BUDGET_MILLIS = 2_500L
         const val SOUND_TRIGGER_READY_CUE_BUDGET_MILLIS = 2_000L
@@ -3972,6 +4143,7 @@ class MainActivity : ComponentActivity() {
         const val VOICE_RESTART_DELAY_MILLIS = 350L
         const val VOICE_RESTART_MAX_DELAY_MILLIS = 2_800L
         const val VOICE_RESTART_MAX_CONSECUTIVE_ERRORS = 3
+        const val REPORT_AUTO_CLEAR_DELAY_MILLIS = 10_000L
         const val READY_BEEP_COUNT = 3
         const val READY_BEEP_DURATION_MILLIS = 110
         const val READY_BEEP_SPACING_MILLIS = 170L
@@ -3980,20 +4152,26 @@ class MainActivity : ComponentActivity() {
         const val READY_TTS_MAX_WAIT_MILLIS = 1_500L
         const val READY_CUE_ACCEPT_MARGIN_MILLIS = 150L
         const val READY_TTS_UTTERANCE_ID = "ready-to-shoot"
+        const val VOICE_RUN_PROMPT = "Say shoot, record, cheese, or smile"
+        const val VOICE_LISTENING_PROMPT = "Listening for shoot/record/cheese/smile"
         val VOICE_SHOOT_COMMANDS = setOf(
             "shoot",
-            "shot",
         )
         val VOICE_RECORD_COMMANDS = setOf(
             "record",
-            "recording",
-            "shutter",
-            "capture",
             "cheese",
-            "start",
-            "go",
+            "smile",
+        )
+        val VOICE_CLEAR_COMMANDS = setOf(
+            "clear",
+            "reset",
+            "restart",
         )
         const val INITIAL_KNOWN_DISTANCE_FEET_TEXT = "11.0"
+        const val INITIAL_CALIBRATION_PLANE_DEPTH_FEET_TEXT = ""
+        const val INITIAL_BALL_PLANE_DEPTH_FEET_TEXT = ""
+        const val INITIAL_MOTION_BLOB_SIDE_RATIO_TEXT = "2.00"
+        const val INITIAL_LAUNCH_HEIGHT_FEET_TEXT = "4.0"
         const val COLOR_SAMPLE_RADIUS_PX = 4
         const val DEFAULT_PHASE14_BALL_DIAMETER_FEET = 3.8 / 12.0
         val DEFAULT_CALIPER_POINT_A = NormalizedFramePoint(0.20, 0.50)

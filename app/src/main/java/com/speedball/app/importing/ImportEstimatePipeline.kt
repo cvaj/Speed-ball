@@ -87,6 +87,7 @@ object ImportEstimatePipeline {
                 milesPerHour = milesPerHour,
                 launchAngleDegrees = launchAngleDegrees,
                 diagnostics = diagnostics.withImportTimingProvenance(timing),
+                launchHeightFeet = launchHeightFeet,
             )
             is VisualEstimateOutcome.NoRead -> copy(
                 diagnostics = diagnostics?.withImportTimingProvenance(timing)

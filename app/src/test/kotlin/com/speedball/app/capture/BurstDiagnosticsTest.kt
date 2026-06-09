@@ -191,6 +191,7 @@ class BurstDiagnosticsTest {
         val mode = HighSpeedMode(1280, 720, 120, 120, 120, recordSupported = true)
 
         assertNull(BurstOptions(mode).preferredExposureTimeNanos)
+        assertNull(BurstOptions(mode).maxAutoExposureTimeNanos)
     }
 
     @Test

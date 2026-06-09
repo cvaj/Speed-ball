@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -44,11 +45,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntSize
@@ -76,6 +79,10 @@ fun SpeedBallApp(
     state: SpeedBallShellState = speedBallPlaceholderState(),
     onPreviewSurface: (Surface?) -> Unit = {},
     onKnownDistanceChanged: (String) -> Unit = {},
+    onCalibrationPlaneDepthChanged: (String) -> Unit = {},
+    onBallPlaneDepthChanged: (String) -> Unit = {},
+    onMotionBlobSideRatioChanged: (String) -> Unit = {},
+    onLaunchHeightChanged: (String) -> Unit = {},
     onPreviewTap: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
     onSetCaliperAFromPreview: (Float, Int, Int) -> Unit = { _, _, _ -> },
     onSetCaliperBFromPreview: (Float, Int, Int) -> Unit = { _, _, _ -> },
@@ -123,6 +130,10 @@ fun SpeedBallApp(
                     phase14State = state.phase14State,
                     onPreviewSurface = onPreviewSurface,
                     onKnownDistanceChanged = onKnownDistanceChanged,
+                    onCalibrationPlaneDepthChanged = onCalibrationPlaneDepthChanged,
+                    onBallPlaneDepthChanged = onBallPlaneDepthChanged,
+                    onMotionBlobSideRatioChanged = onMotionBlobSideRatioChanged,
+                    onLaunchHeightChanged = onLaunchHeightChanged,
                     onPreviewTap = onPreviewTap,
                     onSetCaliperAFromPreview = onSetCaliperAFromPreview,
                     onSetCaliperBFromPreview = onSetCaliperBFromPreview,
@@ -163,6 +174,10 @@ private fun SetupPreviewSurface(
     phase14State: Phase14WorkflowState,
     onPreviewSurface: (Surface?) -> Unit,
     onKnownDistanceChanged: (String) -> Unit,
+    onCalibrationPlaneDepthChanged: (String) -> Unit,
+    onBallPlaneDepthChanged: (String) -> Unit,
+    onMotionBlobSideRatioChanged: (String) -> Unit,
+    onLaunchHeightChanged: (String) -> Unit,
     onPreviewTap: (Float, Float, Int, Int) -> Unit,
     onSetCaliperAFromPreview: (Float, Int, Int) -> Unit,
     onSetCaliperBFromPreview: (Float, Int, Int) -> Unit,
@@ -489,7 +504,15 @@ private fun SetupPreviewSurface(
                     statusText = state.captureStatus,
                     setupTarget = state.setupAdjustmentTargetLabel,
                     knownDistanceFeetText = state.knownDistanceFeetText,
+                    calibrationPlaneDepthFeetText = state.calibrationPlaneDepthFeetText,
+                    ballPlaneDepthFeetText = state.ballPlaneDepthFeetText,
+                    motionBlobSideRatioText = state.motionBlobSideRatioText,
+                    launchHeightFeetText = state.launchHeightFeetText,
                     onKnownDistanceChanged = onKnownDistanceChanged,
+                    onCalibrationPlaneDepthChanged = onCalibrationPlaneDepthChanged,
+                    onBallPlaneDepthChanged = onBallPlaneDepthChanged,
+                    onMotionBlobSideRatioChanged = onMotionBlobSideRatioChanged,
+                    onLaunchHeightChanged = onLaunchHeightChanged,
                     onUseKnownDistance = onUseKnownDistance,
                     onRequestPermission = onRequestPermission,
                     onRefreshModes = onRefreshModes,
@@ -919,7 +942,15 @@ private fun ApplicationSettingsPanel(
     statusText: String,
     setupTarget: String,
     knownDistanceFeetText: String,
+    calibrationPlaneDepthFeetText: String,
+    ballPlaneDepthFeetText: String,
+    motionBlobSideRatioText: String,
+    launchHeightFeetText: String,
     onKnownDistanceChanged: (String) -> Unit,
+    onCalibrationPlaneDepthChanged: (String) -> Unit,
+    onBallPlaneDepthChanged: (String) -> Unit,
+    onMotionBlobSideRatioChanged: (String) -> Unit,
+    onLaunchHeightChanged: (String) -> Unit,
     onUseKnownDistance: () -> Unit,
     onRequestPermission: () -> Unit,
     onRefreshModes: () -> Unit,
@@ -947,9 +978,36 @@ private fun ApplicationSettingsPanel(
     ) {
         StatusStrip(statusText = statusText, setupTarget = setupTarget)
         DistanceInputOverlay(
+            label = "Distance ft",
             value = knownDistanceFeetText,
             onValueChange = onKnownDistanceChanged,
         )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            DistanceInputOverlay(
+                label = "Cal plane ft",
+                value = calibrationPlaneDepthFeetText,
+                onValueChange = onCalibrationPlaneDepthChanged,
+                modifier = Modifier.weight(1f),
+            )
+            DistanceInputOverlay(
+                label = "Ball plane ft",
+                value = ballPlaneDepthFeetText,
+                onValueChange = onBallPlaneDepthChanged,
+                modifier = Modifier.weight(1f),
+            )
+            DistanceInputOverlay(
+                label = "Shape ratio",
+                value = motionBlobSideRatioText,
+                onValueChange = onMotionBlobSideRatioChanged,
+                modifier = Modifier.weight(1f),
+            )
+            DistanceInputOverlay(
+                label = "Launch ft",
+                value = launchHeightFeetText,
+                onValueChange = onLaunchHeightChanged,
+                modifier = Modifier.weight(1f),
+            )
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             OverlayButton("Apply Distance", onUseKnownDistance, Modifier.weight(1f))
             OverlayButton("Permission", onRequestPermission, Modifier.weight(1f))
@@ -1130,11 +1188,13 @@ private fun runStatusColor(state: SpeedBallRunCommandState): Color =
 
 @Composable
 private fun DistanceInputOverlay(
+    label: String = "Distance ft",
     value: String,
     onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .height(34.dp)
             .background(Color(0x660b0f10), RoundedCornerShape(5.dp))
@@ -1142,13 +1202,19 @@ private fun DistanceInputOverlay(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text(text = "Distance ft", color = Color.White, style = MaterialTheme.typography.labelSmall)
+        Text(text = label, color = Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
         BasicTextField(
             value = value,
             onValueChange = onValueChange,
             singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
-            modifier = Modifier.weight(1f),
+            cursorBrush = SolidColor(Color.White),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .background(Color(0xAA142023), RoundedCornerShape(4.dp))
+                .padding(horizontal = 6.dp, vertical = 7.dp),
         )
     }
 }

@@ -19,7 +19,7 @@ class RecordedHfrMotionBallDetectorTest {
         val outcome = RecordedHfrMotionBallDetector.detect(
             frames = frames,
             detectorConfig = detectorConfig(width = 80, height = 48),
-            motionConfig = RecordedHfrMotionDetectorConfig(openRadiusPx = 0, closeRadiusPx = 1),
+            motionConfig = smallFixtureMotionConfig(),
         )
 
         val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
@@ -49,13 +49,58 @@ class RecordedHfrMotionBallDetectorTest {
     }
 
     @Test
+    fun productionConfigKeepsElongatedMotionBlurForTrackSelection() {
+        val frames = List(7) { index ->
+            frame(width = 640, height = 360, timestampSeconds = index / 120.0) {
+                rect(left = 40 + index * 80, top = 140, width = 70, height = 14, color = WHITE)
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = detectorConfig(width = 640, height = 360),
+            motionConfig = RecordedHfrMotionDetectorConfig(openRadiusPx = 0, closeRadiusPx = 0),
+        )
+
+        val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
+        assertTrue(success.frames.size >= 4)
+        assertTrue(success.frames.all { frame ->
+            frame.blobs.any { blob -> blob.bounds.width > blob.bounds.height * 4 }
+        })
+        val selectedCentroids = success.frames.map { frame ->
+            frame.blobs.maxBy { blob -> blob.bounds.width }.centroid
+        }
+        assertTrue(selectedCentroids.zipWithNext().all { (previous, current) ->
+            current.xPx > previous.xPx
+        })
+    }
+
+    @Test
+    fun productionConfigRejectsTooThinMovingStreaksByMinimumShortSide() {
+        val frames = List(7) { index ->
+            frame(width = 640, height = 360, timestampSeconds = index / 120.0) {
+                rect(left = 80 + index * 30, top = 140, width = 110, height = 8, color = WHITE)
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = detectorConfig(width = 640, height = 360),
+            motionConfig = RecordedHfrMotionDetectorConfig(openRadiusPx = 0, closeRadiusPx = 0),
+        )
+
+        val failure = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Failure::class.java, outcome, outcome.toString())
+        assertEquals(VisualEstimateNoReadReason.BALL_NOT_ISOLATED, failure.reason)
+    }
+
+    @Test
     fun closeBallBoundaryIsConfigurableButDefaultRejectsOversizedShortSide() {
         val frames = List(7) { index ->
             frame(width = 320, height = 240, timestampSeconds = index / 120.0) {
                 disk(cx = 60 + index * 25, cy = 120, radius = 34, color = WHITE)
             }
         }
-        val baseConfig = RecordedHfrMotionDetectorConfig(openRadiusPx = 0, closeRadiusPx = 1)
+        val baseConfig = smallFixtureMotionConfig()
 
         val defaultOutcome = RecordedHfrMotionBallDetector.detect(
             frames = frames,
@@ -76,6 +121,98 @@ class RecordedHfrMotionBallDetectorTest {
             assertInstanceOf(RecordedHfrMotionDetectionOutcome.Failure::class.java, defaultOutcome).reason,
         )
         assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, tunedOutcome, tunedOutcome.toString())
+    }
+
+    @Test
+    fun foregroundFragmentsAreRankedByColorCircularShapeBeforePathSelection() {
+        val frames = List(8) { index ->
+            frame(width = 160, height = 90, timestampSeconds = index / 120.0) {
+                disk(cx = 14 + index * 14, cy = 45, radius = 5, color = GREEN)
+                rect(left = 74 + index, top = 18, width = 54, height = 24, color = WHITE)
+                repeat(8) { order ->
+                    disk(
+                        cx = 14 + order * 17 + index % 2,
+                        cy = 10 + (order % 4) * 18,
+                        radius = 3,
+                        color = WHITE,
+                    )
+                }
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = detectorConfig(width = 160, height = 90),
+            motionConfig = RecordedHfrMotionDetectorConfig(
+                openRadiusPx = 0,
+                closeRadiusPx = 1,
+                minCandidateAreaPx = 60,
+                minCandidateShortSidePx = 7,
+                maxCandidateBlobsPerFrame = 4,
+            ),
+        )
+
+        val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
+        assertTrue(success.frames.size >= 4)
+        assertTrue(success.frames.all { frame -> frame.blobs.size <= 4 })
+        assertTrue(success.frames.zipWithNext().any { (previous, current) ->
+            current.blobs.any { currentBlob ->
+                previous.blobs.any { previousBlob ->
+                    currentBlob.centroid.xPx - previousBlob.centroid.xPx > 6.0
+                }
+            }
+        })
+    }
+
+    @Test
+    fun colorSeedSplitsBallFromOversizedMovingForegroundParent() {
+        val frames = List(7) { index ->
+            frame(width = 360, height = 160, timestampSeconds = index / 120.0) {
+                val ballX = 40 + index * 42
+                rect(left = ballX - 10, top = 58, width = 74, height = 38, color = WHITE)
+                disk(cx = ballX, cy = 78, radius = 10, color = YELLOW)
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = yellowDetectorConfig(width = 360, height = 160),
+            motionConfig = RecordedHfrMotionDetectorConfig(
+                openRadiusPx = 0,
+                closeRadiusPx = 1,
+                minCandidateAreaPx = 60,
+                minCandidateShortSidePx = 8,
+                maxCandidatePrincipalAxisRatio = 1.4,
+            ),
+        )
+
+        val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
+        assertTrue(success.frames.size >= 4)
+        assertTrue(success.frames.all { frame -> frame.blobs.single().motionMetrics?.parentAreaRatio ?: 1.0 < 0.8 })
+        assertTrue(success.frames.zipWithNext().all { (previous, current) ->
+            current.blobs.single().centroid.xPx > previous.blobs.single().centroid.xPx
+        })
+    }
+
+    @Test
+    fun productionConfigRejectsTwentyPixelSpecksAsBallCandidates() {
+        val frames = List(7) { index ->
+            frame(width = 640, height = 360, timestampSeconds = index / 120.0) {
+                repeat(6) { order ->
+                    rect(left = 80 + order * 70 + index % 2, top = 80 + order * 20, width = 5, height = 4, color = WHITE)
+                }
+            }
+        }
+
+        val outcome = RecordedHfrMotionBallDetector.detect(
+            frames = frames,
+            detectorConfig = detectorConfig(width = 640, height = 360),
+            motionConfig = RecordedHfrMotionDetectorConfig(openRadiusPx = 0, closeRadiusPx = 0),
+        )
+
+        val failure = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Failure::class.java, outcome, outcome.toString())
+        assertEquals(VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS, failure.reason)
+        assertTrue(failure.message.contains("no moving ball blobs in the camera frame view"), failure.message)
     }
 
     @Test
@@ -119,7 +256,7 @@ class RecordedHfrMotionBallDetectorTest {
     }
 
     @Test
-    fun savedTennisImpactWindowFailsAsBallNotIsolatedThroughProductionDetector() {
+    fun savedTennisImpactWindowCanRetainBoundedCandidatesThroughProductionDetector() {
         val directory = fixtureDirectory(".interagent/tmp/field-proof-recovery/extracted-1780862777355/impact-window-frames-ppm")
         assumeTrue(directory.isDirectory, "saved impact-window PPM frames are local field-proof artifacts")
         val frames = directory.listFiles { file -> file.extension.equals("ppm", ignoreCase = true) }
@@ -134,9 +271,18 @@ class RecordedHfrMotionBallDetectorTest {
             motionConfig = RecordedHfrMotionDetectorConfig(openRadiusPx = 0, closeRadiusPx = 1),
         )
 
-        val failure = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Failure::class.java, outcome, outcome.toString())
-        assertEquals(VisualEstimateNoReadReason.BALL_NOT_ISOLATED, failure.reason)
+        val success = assertInstanceOf(RecordedHfrMotionDetectionOutcome.Success::class.java, outcome, outcome.toString())
+        assertTrue(success.frames.size >= 4)
+        assertTrue(success.frames.all { frame -> frame.blobs.size <= RecordedHfrMotionDetectorConfig().maxCandidateBlobsPerFrame })
     }
+
+    private fun smallFixtureMotionConfig(): RecordedHfrMotionDetectorConfig =
+        RecordedHfrMotionDetectorConfig(
+            openRadiusPx = 0,
+            closeRadiusPx = 1,
+            minCandidateAreaPx = 20,
+            minCandidateShortSidePx = 4,
+        )
 
     private fun detectorConfig(width: Int, height: Int): BlobDetectionConfig =
         BlobDetectionConfig(
@@ -155,6 +301,14 @@ class RecordedHfrMotionBallDetectorTest {
                 maxThresholdPixels = width * height,
                 maxComponentsPerFrame = width * height,
                 maxOperationsPerFrame = width * height * 80,
+            ),
+        )
+
+    private fun yellowDetectorConfig(width: Int, height: Int): BlobDetectionConfig =
+        detectorConfig(width, height).copy(
+            threshold = HsvThreshold(
+                center = HsvColor(60.0, 1.0, 1.0),
+                tolerance = HsvTolerance(30.0, 0.5, 0.5),
             ),
         )
 
@@ -262,6 +416,8 @@ class RecordedHfrMotionBallDetectorTest {
     private companion object {
         const val DARK_GRAY = 0xff202020.toInt()
         const val WHITE = 0xffffffff.toInt()
+        const val GREEN = 0xff00ff00.toInt()
+        const val YELLOW = 0xffffff00.toInt()
         fun gray(value: Int): Int = 0xff000000.toInt() or (value shl 16) or (value shl 8) or value
     }
 }

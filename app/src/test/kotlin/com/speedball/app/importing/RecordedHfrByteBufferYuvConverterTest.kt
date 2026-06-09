@@ -116,6 +116,28 @@ class RecordedHfrByteBufferYuvConverterTest {
     }
 
     @Test
+    fun convertsLumaWithoutAllocatingArgbFrame() {
+        val buffer = nv12(width = 4, height = 2, stride = 8, sliceHeight = 4) { x, y ->
+            16 + x * 20 + y * 40
+        }
+
+        val luma = assertLumaSuccess(
+            RecordedHfrByteBufferYuvConverter.convertLuma(
+                buffer = buffer,
+                sourceWidth = 4,
+                sourceHeight = 2,
+                targetWidth = 2,
+                targetHeight = 2,
+                colorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar,
+                stride = 8,
+                sliceHeight = 4,
+            ),
+        )
+
+        assertEquals(listOf(16, 56, 56, 96), luma.toList())
+    }
+
+    @Test
     fun rejectsUnsupportedNv21LikeFormatAndInvalidCapacity() {
         val buffer = nv12(width = 4, height = 2, stride = 4, sliceHeight = 2) { _, _ -> 235 }
 
@@ -238,6 +260,9 @@ class RecordedHfrByteBufferYuvConverterTest {
 
     private fun assertSuccess(result: ImportValidationResult<ImportVideoFrame>): ImportVideoFrame =
         assertInstanceOf(ImportValidationResult.Success::class.java, result).value as ImportVideoFrame
+
+    private fun assertLumaSuccess(result: ImportValidationResult<IntArray>): IntArray =
+        assertInstanceOf(ImportValidationResult.Success::class.java, result).value as IntArray
 
     private fun assertNoRead(result: ImportValidationResult<ImportVideoFrame>, expected: String) {
         val noRead = assertInstanceOf(ImportValidationResult.NoRead::class.java, result)

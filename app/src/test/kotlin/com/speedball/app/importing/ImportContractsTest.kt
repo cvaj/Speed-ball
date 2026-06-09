@@ -205,6 +205,8 @@ class ImportContractsTest {
             .substringBefore("private fun reconcileImportTiming(")
         val liveShootPath = source.substringAfter("private fun startSoundTriggeredRecordingEstimate(")
             .substringBefore("private fun startTimedRecordingEstimate(")
+        val recordedConfigPath = source.substringAfter("private fun buildRecordedEstimateConfig(")
+            .substringBefore("private fun buildImportCalibration(")
         val constantsPath = source.substringAfter("companion object")
         assertFalse(importPath.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
         assertTrue(recordedPath.contains("ImportResultSourceKind.RECORDED_ESTIMATE"))
@@ -220,12 +222,15 @@ class ImportContractsTest {
         assertFalse(liveShootPath.contains("startRecordedEstimate(outcome)"))
         assertTrue(recordedPath.contains("RecordedHfrStreamingEstimate.estimate("))
         assertTrue(recordedPath.contains("RecordedHfrStreamingEstimateConfig("))
-        assertTrue(recordedPath.contains("motionDetectorConfig = RecordedHfrMotionDetectorConfig()"))
+        assertTrue(recordedPath.contains("motionDetectorConfig = runtimeConfig.motionDetectorConfig ?: RecordedHfrMotionDetectorConfig()"))
+        assertTrue(source.contains("maxCandidatePrincipalAxisRatio = motionBlobSideRatio"))
+        assertTrue(recordedConfigPath.contains("maxOutlierPasses = 0"))
+        assertFalse(recordedConfigPath.contains("maxOutlierPasses = 2"))
         assertFalse(recordedPath.contains("physicalDetectorConfig = RecordedHfrPhysicalDetectorConfig()"))
         assertTrue(recordedPath.contains("RecordedHfrWindowCaptureGate.validate("))
         assertTrue(recordedPath.contains("val decodedWindowValidation = RecordedHfrDecodedWindowValidator.validate("))
-        assertTrue(constantsPath.contains("RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS = 10_000L"))
-        assertTrue(constantsPath.contains("RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS = 2_000_000L"))
+        assertTrue(constantsPath.contains("RECORDED_HFR_WINDOW_DECODE_TIMEOUT_MILLIS = 300_000L"))
+        assertTrue(constantsPath.contains("RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS = 12_000_000L"))
         assertTrue(source.contains("RECORDED_HFR_BYTEBUFFER_SPIKE_RESULT"))
         assertTrue(source.contains("!intent.getBooleanExtra(\"autoProbeRecordedHfrByteBuffer\", false) || !isDebuggableBuild()"))
         assertTrue(source.contains("latestRecordedHfrMovieFile()"))
@@ -260,7 +265,7 @@ class ImportContractsTest {
     }
 
     @Test
-    fun highSpeedRecorderDefaultsToAutoExposureAndKeepsExplicitManualSupport() {
+    fun highSpeedRecorderStartsWithAutoExposureAndCapsOnlySlowAe() {
         val recorder = listOf(
             Path.of("app/src/main/java/com/speedball/app/capture/HighSpeedBurstRecorder.kt"),
             Path.of("src/main/java/com/speedball/app/capture/HighSpeedBurstRecorder.kt"),
@@ -269,11 +274,17 @@ class ImportContractsTest {
             Path.of("app/src/main/java/com/speedball/app/capture/HighSpeedMode.kt"),
             Path.of("src/main/java/com/speedball/app/capture/HighSpeedMode.kt"),
         ).first { Files.exists(it) }
+        val activity = listOf(
+            Path.of("app/src/main/java/com/speedball/app/MainActivity.kt"),
+            Path.of("src/main/java/com/speedball/app/MainActivity.kt"),
+        ).first { Files.exists(it) }
         val recorderSource = Files.readAllLines(recorder).joinToString("\n")
         val modeSource = Files.readAllLines(mode).joinToString("\n")
+        val activitySource = Files.readAllLines(activity).joinToString("\n")
 
         assertTrue(modeSource.contains("DEFAULT_FAST_SHUTTER_EXPOSURE_NANOS"))
         assertTrue(modeSource.contains("preferredExposureTimeNanos: Long? = null"))
+        assertTrue(modeSource.contains("maxAutoExposureTimeNanos: Long? = null"))
         assertTrue(recorderSource.contains("CaptureRequest.CONTROL_AE_MODE_ON"))
         assertTrue(recorderSource.contains("REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR"))
         assertTrue(recorderSource.contains("SENSOR_INFO_EXPOSURE_TIME_RANGE"))
@@ -281,6 +292,11 @@ class ImportContractsTest {
         assertTrue(recorderSource.contains("CaptureRequest.SENSOR_EXPOSURE_TIME"))
         assertTrue(recorderSource.contains("CaptureResult.SENSOR_EXPOSURE_TIME"))
         assertTrue(recorderSource.contains("createHighSpeedRequestListWithFallback"))
+        assertTrue(recorderSource.contains("maxAutoExposureTimeNanos?.takeIf"))
+        assertTrue(recorderSource.contains("exposureTimeNanos > maxAutoExposureNanos"))
+        assertTrue(recorderSource.contains("autoExposureCapApplied.compareAndSet(false, true)"))
+        assertTrue(recorderSource.contains("highSpeedSession.setRepeatingBurst(cappedAutoBurst"))
+        assertTrue(activitySource.contains("maxAutoExposureTimeNanos = RECORDED_HFR_MAX_ESTIMATE_EXPOSURE_NANOS"))
     }
 
     private fun assertImportNoRead(

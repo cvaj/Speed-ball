@@ -341,7 +341,7 @@ class VisualEstimateFramePipelineTest {
     }
 
     @Test
-    fun candidateReducerWithoutBudgetKeepsSiblingBehaviorAboveRecordedHfrCap() {
+    fun candidateHeavyRecordedHfrUsesDirectionalSelectorBeforeRunawayWindowCap() {
         val candidates = noisyCandidateFrames(totalBlobsPerFrame = 25)
         val noBudget = VisualEstimateCandidateReducer.reduce(
             frameCandidates = candidates,
@@ -352,7 +352,19 @@ class VisualEstimateFramePipelineTest {
             config = reducerTrackConfig(
                 candidateReductionBudget = CandidateReductionBudget(
                     maxBlobsPerFrame = 32,
-                    maxTotalCandidateBlobs = 90,
+                    maxTotalCandidateBlobs = 150,
+                    maxRansacCandidates = 90,
+                    maxRansacPairHypotheses = 4_096,
+                    ransacCancellationCheckInterval = 128,
+                ),
+            ),
+        )
+        val runawayBudget = VisualEstimateCandidateReducer.reduce(
+            frameCandidates = noisyCandidateFrames(totalBlobsPerFrame = 50),
+            config = reducerTrackConfig(
+                candidateReductionBudget = CandidateReductionBudget(
+                    maxBlobsPerFrame = 64,
+                    maxTotalCandidateBlobs = 150,
                     maxRansacCandidates = 90,
                     maxRansacPairHypotheses = 4_096,
                     ransacCancellationCheckInterval = 128,
@@ -361,32 +373,72 @@ class VisualEstimateFramePipelineTest {
         )
 
         assertInstanceOf(VisualEstimateCandidateReductionOutcome.Success::class.java, noBudget)
-        val budgetFailure = assertInstanceOf(VisualEstimateCandidateReductionOutcome.Failure::class.java, recordedBudget)
-        assertEquals(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, budgetFailure.reason)
-        assertTrue(budgetFailure.message.contains("window cap"))
+        assertInstanceOf(VisualEstimateCandidateReductionOutcome.Success::class.java, recordedBudget)
+        val runawayFailure = assertInstanceOf(VisualEstimateCandidateReductionOutcome.Failure::class.java, runawayBudget)
+        assertEquals(VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED, runawayFailure.reason)
+        assertTrue(runawayFailure.message.contains("window cap"))
     }
 
     @Test
-    fun recordedHfrBudgetCandidateCeilingIsCoherentWithPairCeiling() {
+    fun recordedHfrBudgetCanExceedRansacCeilingWhenDirectionalSelectorCanRunFirst() {
         val budget = CandidateReductionBudget(
             maxBlobsPerFrame = 32,
-            maxTotalCandidateBlobs = 90,
+            maxTotalCandidateBlobs = 150,
             maxRansacCandidates = 90,
             maxRansacPairHypotheses = 4_096,
             ransacCancellationCheckInterval = 128,
         )
         val invalid = CandidateReductionBudget(
             maxBlobsPerFrame = 32,
-            maxTotalCandidateBlobs = 92,
+            maxTotalCandidateBlobs = 150,
             maxRansacCandidates = 92,
             maxRansacPairHypotheses = 4_096,
             ransacCancellationCheckInterval = 128,
         )
 
         assertEquals(null, budget.validate())
+        assertTrue(budget.maxTotalCandidateBlobs > budget.maxRansacCandidates)
         assertEquals(4_005, budget.maxRansacCandidates * (budget.maxRansacCandidates - 1) / 2)
         assertEquals(4_186, invalid.maxRansacCandidates * (invalid.maxRansacCandidates - 1) / 2)
         assertEquals(MeasurementRunFailure.RESOURCE_LIMIT_EXCEEDED, invalid.validate()?.reason)
+    }
+
+    @Test
+    fun recordedHfrReducerPrefersLongestPhysicsValidTrackBeforeScoreTiebreakers() {
+        val candidates = List(14) { frameIndex ->
+            val longTrack = testBlob(x = 105 - frameIndex * 7, y = 20 + frameIndex)
+            val shortFastDecoy = if (frameIndex < 4) {
+                listOf(testBlob(x = 8 + frameIndex * 22, y = 64))
+            } else {
+                emptyList()
+            }
+            VisualEstimateCandidateFrame(
+                compactPosition = frameIndex,
+                originalFrameIndex = frameIndex,
+                timestampSeconds = frameIndex / 120.0,
+                width = 120,
+                height = 80,
+                blobs = listOf(longTrack) + shortFastDecoy,
+            )
+        }
+
+        val result = VisualEstimateCandidateReducer.reduce(
+            frameCandidates = candidates,
+            config = reducerTrackConfig(
+                candidateReductionBudget = CandidateReductionBudget(
+                    maxBlobsPerFrame = 4,
+                    maxTotalCandidateBlobs = 40,
+                    maxRansacCandidates = 40,
+                    maxRansacPairHypotheses = 780,
+                    ransacCancellationCheckInterval = 8,
+                ),
+            ),
+        )
+
+        val success = assertInstanceOf(VisualEstimateCandidateReductionOutcome.Success::class.java, result, result.toString())
+        assertEquals(14, success.selected.size)
+        assertEquals((0 until 14).toList(), success.selected.map { it.first.originalFrameIndex })
+        assertTrue(success.selected.zipWithNext().all { (a, b) -> b.second.centroid.xPx < a.second.centroid.xPx })
     }
 
     @Test

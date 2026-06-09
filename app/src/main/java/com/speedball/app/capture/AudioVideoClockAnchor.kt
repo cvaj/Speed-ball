@@ -44,7 +44,8 @@ data class AudioVideoClockAnchor(
 data class ImpactWindowRequest(
     val impactElapsedRealtimeNanos: Long,
     val requestedFps: Int,
-    val postImpactMillis: Long = 200L,
+    val preImpactMillis: Long = 1_000L,
+    val postImpactMillis: Long = 1_000L,
     val maxPreImpactMarginFrames: Int = 12,
 )
 
@@ -74,7 +75,7 @@ object ImpactWindowMapper {
         if (anchor.status != AudioVideoClockAnchorStatus.OK) {
             return noRead("Impact window anchor is not trustworthy: ${anchor.status}.")
         }
-        if (request.requestedFps <= 0 || request.postImpactMillis <= 0L || request.maxPreImpactMarginFrames < 0) {
+        if (request.requestedFps <= 0 || request.preImpactMillis < 0L || request.postImpactMillis <= 0L || request.maxPreImpactMarginFrames < 0) {
             return noRead("Impact window request must use positive fps and duration limits.")
         }
         if (request.impactElapsedRealtimeNanos <= anchor.firstFrameElapsedRealtimeNanos) {
@@ -88,8 +89,10 @@ object ImpactWindowMapper {
         val impactOffsetNanos = request.impactElapsedRealtimeNanos - anchor.firstFrameElapsedRealtimeNanos
         val impactOffsetUs = (impactOffsetNanos / 1_000L).coerceAtLeast(0L)
         val preImpactMarginUs = (preImpactMarginFrames * frameIntervalNanos / 1_000.0).toLong()
+        val requestedPreImpactFrameCount = ceil(request.requestedFps * (request.preImpactMillis / 1_000.0)).toInt()
+        val requestedPreImpactUs = request.preImpactMillis * 1_000L
         val postImpactFrameCount = ceil(request.requestedFps * (request.postImpactMillis / 1_000.0)).toInt()
-        val windowStartUs = (impactOffsetUs - preImpactMarginUs).coerceAtLeast(0L)
+        val windowStartUs = (impactOffsetUs - requestedPreImpactUs - preImpactMarginUs).coerceAtLeast(0L)
         val windowEndUs = impactOffsetUs + request.postImpactMillis * 1_000L
         if (windowEndUs <= windowStartUs) return noRead("Impact container-time window must be positive.")
         return ImportValidationResult.Success(
@@ -102,7 +105,7 @@ object ImpactWindowMapper {
                     windowEndUs = windowEndUs,
                     postImpactFrameCount = postImpactFrameCount,
                     preImpactMarginFrames = preImpactMarginFrames,
-                    maxFrames = postImpactFrameCount + preImpactMarginFrames,
+                    maxFrames = requestedPreImpactFrameCount + postImpactFrameCount + preImpactMarginFrames,
                 ),
             ),
         )

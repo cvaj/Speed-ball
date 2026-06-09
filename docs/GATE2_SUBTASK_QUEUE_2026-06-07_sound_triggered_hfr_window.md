@@ -196,7 +196,7 @@ Files:
 
 Implementation requirements:
 
-- Use `MediaExtractor.seekTo(windowStartUs, SEEK_TO_CLOSEST_SYNC)`.
+- Use `MediaExtractor.seekTo(windowStartUs, SEEK_TO_PREVIOUS_SYNC)`.
 - Use `MediaCodec` to decode forward until container PTS reaches
   `windowStartUs`, then emit frames whose PTS are inside
   `[windowStartUs, windowEndUs]`, capped at `maxFrames`.

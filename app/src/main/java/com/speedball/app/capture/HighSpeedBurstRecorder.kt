@@ -17,6 +17,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.util.Log
 import android.util.Range
 import android.view.Surface
 import java.io.File
@@ -38,12 +39,18 @@ class HighSpeedBurstRecorder(private val context: Context) {
     private var outputFile: File? = null
     private var timestamps = mutableListOf<Long>()
     private var actualExposureTimeNanos = mutableListOf<Long>()
+    private var requestedExposureTimeNanos: Long? = null
     private var callbackCount = AtomicInteger(0)
     private var firstAnchorSent = AtomicBoolean(false)
+    private var autoExposureCapApplied = AtomicBoolean(false)
     private var recorderStartCommandElapsedNanos = 0L
     private var completion: ((BurstOutcome) -> Unit)? = null
     private var options: BurstOptions? = null
     private val terminalGate = TerminalCompletionGate()
+
+    private companion object {
+        private const val TAG = "HighSpeedBurstRecorder"
+    }
 
     fun currentState(): BurstRecorderState = synchronized(lock) { state }
 
@@ -61,8 +68,10 @@ class HighSpeedBurstRecorder(private val context: Context) {
             completion = onComplete
             timestamps = mutableListOf()
             actualExposureTimeNanos = mutableListOf()
+            requestedExposureTimeNanos = null
             callbackCount = AtomicInteger(0)
             firstAnchorSent = AtomicBoolean(false)
+            autoExposureCapApplied = AtomicBoolean(false)
             recorderStartCommandElapsedNanos = 0L
             recorderStarted = false
             terminalGate.reset()
@@ -199,12 +208,28 @@ class HighSpeedBurstRecorder(private val context: Context) {
         try {
             val baseRequest = buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = null)
             val preferredExposureNanos = options?.preferredExposureTimeNanos
+            val maxAutoExposureNanos = options?.maxAutoExposureTimeNanos?.takeIf { it.isFinitePositiveExposure() }
             val timestampSource = readTimestampSourceLabel(manager, cameraId)
-            val manualRequest = resolveManualExposureTimeNanos(manager, cameraId, preferredExposureNanos)
+            val preferredManualExposureNanos = resolveManualExposureTimeNanos(manager, cameraId, preferredExposureNanos)
+            val manualRequest = preferredManualExposureNanos
                 ?.let { exposureNanos ->
+                    synchronized(lock) { requestedExposureTimeNanos = exposureNanos }
                     buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = exposureNanos)
                 }
             val burst = createHighSpeedRequestListWithFallback(highSpeedSession, manualRequest, baseRequest)
+            val cappedAutoExposureNanos = if (preferredManualExposureNanos == null) {
+                resolveManualExposureTimeNanos(manager, cameraId, maxAutoExposureNanos)
+            } else {
+                null
+            }
+            val cappedAutoBurst = cappedAutoExposureNanos
+                ?.let { exposureNanos ->
+                    buildRecordingRequest(device, previewSurface, recorderSurface, mode, exposureTimeNanos = exposureNanos)
+                }
+                ?.let { cappedRequest -> createHighSpeedRequestListOrNull(highSpeedSession, cappedRequest) }
+            if (maxAutoExposureNanos != null && cappedAutoBurst == null) {
+                Log.w(TAG, "RECORDED_HFR_EXPOSURE_CAP_UNAVAILABLE capNs=$maxAutoExposureNanos")
+            }
             val captureCallback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(
                     session: CameraCaptureSession,
@@ -212,6 +237,41 @@ class HighSpeedBurstRecorder(private val context: Context) {
                     result: TotalCaptureResult,
                 ) {
                     callbackCount.incrementAndGet()
+                    val exposureTimeNanos = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    if (exposureTimeNanos != null && exposureTimeNanos > 0L) {
+                        synchronized(lock) { actualExposureTimeNanos.add(exposureTimeNanos) }
+                    }
+                    if (
+                        cappedAutoExposureNanos != null &&
+                        cappedAutoBurst != null &&
+                        request.get(CaptureRequest.SENSOR_EXPOSURE_TIME) != cappedAutoExposureNanos
+                    ) {
+                        if (maxAutoExposureNanos != null && exposureTimeNanos != null && exposureTimeNanos > maxAutoExposureNanos) {
+                            if (autoExposureCapApplied.compareAndSet(false, true)) {
+                                synchronized(lock) { requestedExposureTimeNanos = cappedAutoExposureNanos }
+                                Log.i(
+                                    TAG,
+                                    "RECORDED_HFR_EXPOSURE_CAP_APPLIED aeExposureNs=$exposureTimeNanos " +
+                                        "capNs=$maxAutoExposureNanos requestedNs=$cappedAutoExposureNanos",
+                                )
+                                try {
+                                    highSpeedSession.setRepeatingBurst(cappedAutoBurst, this, backgroundHandler)
+                                } catch (exception: RuntimeException) {
+                                    complete(
+                                        BurstOutcome.Failure(
+                                            BurstFailure.RECORDING_FAILED,
+                                            "High-speed exposure cap failed: ${exception.message ?: exception.javaClass.simpleName}.",
+                                        ),
+                                        stopRecorder = recorderStarted,
+                                    )
+                                }
+                            }
+                            return
+                        }
+                        if (autoExposureCapApplied.get()) {
+                            return
+                        }
+                    }
                     result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { timestamp ->
                         if (timestamp > 0L) {
                             synchronized(lock) { timestamps.add(timestamp) }
@@ -229,11 +289,6 @@ class HighSpeedBurstRecorder(private val context: Context) {
                                     ),
                                 )
                             }
-                        }
-                    }
-                    result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { exposureTimeNanos ->
-                        if (exposureTimeNanos > 0L) {
-                            synchronized(lock) { actualExposureTimeNanos.add(exposureTimeNanos) }
                         }
                     }
                 }
@@ -289,6 +344,16 @@ class HighSpeedBurstRecorder(private val context: Context) {
             } catch (_: RuntimeException) {
                 highSpeedSession.createHighSpeedRequestList(fallbackRequest)
             }
+        }
+
+    private fun createHighSpeedRequestListOrNull(
+        highSpeedSession: CameraConstrainedHighSpeedCaptureSession,
+        request: CaptureRequest,
+    ): List<CaptureRequest>? =
+        try {
+            highSpeedSession.createHighSpeedRequestList(request)
+        } catch (_: RuntimeException) {
+            null
         }
 
     private fun resolveManualExposureTimeNanos(
@@ -413,6 +478,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
         val output = outputFile
         val timestampCopy = synchronized(lock) { timestamps.toList() }
         val exposureCopy = synchronized(lock) { actualExposureTimeNanos.toList() }
+        val requestedExposure = synchronized(lock) { requestedExposureTimeNanos } ?: safeOptions.preferredExposureTimeNanos
         val outcome = buildBurstOutcome(
             timestampsNanos = timestampCopy,
             callbackCount = callbackCount.get(),
@@ -420,7 +486,7 @@ class HighSpeedBurstRecorder(private val context: Context) {
             fps = safeOptions.mode.fps,
             outputPath = output?.absolutePath.orEmpty(),
             fileBytes = output?.length() ?: 0L,
-            requestedExposureTimeNanos = safeOptions.preferredExposureTimeNanos,
+            requestedExposureTimeNanos = requestedExposure,
             actualExposureTimeNanos = exposureCopy,
         )
         return if (outcome is BurstOutcome.Success) {

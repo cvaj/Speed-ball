@@ -28,6 +28,10 @@ import com.speedball.app.measurement.VisualEstimateNoReadReason
 import com.speedball.app.measurement.VisualEstimateOutcome
 import com.speedball.app.measurement.VisualEstimatePipeline
 import com.speedball.app.measurement.VisualEstimateProofThumbnailFrame
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -51,13 +55,74 @@ data class RecordedHfrStreamingEstimateConfig(
     val proofOnly: Boolean = false,
     val physicalDetectorConfig: RecordedHfrPhysicalDetectorConfig? = null,
     val motionDetectorConfig: RecordedHfrMotionDetectorConfig? = null,
+    val motionScoutConfig: RecordedHfrMotionScoutConfig = RecordedHfrMotionScoutConfig(),
 )
+
+/**
+ * Low-resolution pre-pass that narrows fixed-camera motion detection to the
+ * padded interval where a foreground object actually travels across the frame.
+ */
+data class RecordedHfrMotionScoutConfig(
+    val enabled: Boolean = true,
+    val scoutWidth: Int = 80,
+    val scoutHeight: Int = 45,
+    val lumaDifferenceThreshold: Int = 7,
+    val minComponentAreaPx: Int = 3,
+    val maxComponentAxisRatio: Double = 4.0,
+    val maxRunGapFrames: Int = 2,
+    val densePaddingFrames: Int = 10,
+    val minDenseFrameCount: Int = 32,
+    val minRunFrameCount: Int = 4,
+    val minRunTravelPx: Double = 8.0,
+    val minRunMeanAreaPx: Double = 8.0,
+) {
+    fun validate(): VisualEstimateOutcome.NoRead? {
+        if (
+            scoutWidth <= 0 ||
+            scoutHeight <= 0 ||
+            lumaDifferenceThreshold !in 1..255 ||
+            minComponentAreaPx <= 0 ||
+            maxComponentAxisRatio < 1.0 ||
+            maxRunGapFrames < 0 ||
+            densePaddingFrames < 0 ||
+            minDenseFrameCount <= 0 ||
+            minRunFrameCount <= 0 ||
+            !minRunTravelPx.isFinite() ||
+            minRunTravelPx <= 0.0 ||
+            !minRunMeanAreaPx.isFinite() ||
+            minRunMeanAreaPx <= 0.0
+        ) {
+            return VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.RESOURCE_LIMIT_EXCEEDED,
+                message = "Recorded-HFR motion scout reducer gates are invalid.",
+            )
+        }
+        return null
+    }
+}
 
 /** Estimate-only timing mode for recorded-HFR streaming candidates. */
 enum class RecordedHfrStreamingTimingMode {
     FRAME_INDEX_INTERVAL,
     CONTAINER_PTS_DELTAS,
 }
+
+/**
+ * Selected full-resolution frame interval from the low-resolution motion scout.
+ *
+ * All indexes are zero-based offsets into the decoded in-window frame list, not
+ * renumbered source frame indexes.
+ */
+data class RecordedHfrMotionScoutSelection(
+    val denseStartIndex: Int,
+    val denseEndIndexInclusive: Int,
+    val runStartIndex: Int,
+    val runEndIndexInclusive: Int,
+    val runFrameCount: Int,
+    val runTravelPx: Double,
+    val meanComponentAreaPx: Double,
+    val sourceFrameCount: Int,
+)
 
 /**
  * Streaming recorded-HFR estimate result.
@@ -82,6 +147,7 @@ data class RecordedHfrStreamingEstimateResult(
     val workingWidth: Int,
     val workingHeight: Int,
     val sourceValidity: RecordedHfrSourceValidity = RecordedHfrSourceValidity.NotEvaluated,
+    val motionScoutSelection: RecordedHfrMotionScoutSelection? = null,
 )
 
 /** Bounded luma proof that the decoded source window is not black/near-black. */
@@ -128,6 +194,7 @@ object RecordedHfrStreamingEstimate {
         val motionFrames = mutableListOf<RgbFrame>()
         val motionOriginalFrameIndexes = mutableListOf<Int>()
         val motionPresentationTimestampNanos = mutableListOf<Long?>()
+        var motionScoutSelection: RecordedHfrMotionScoutSelection? = null
         val sourceValidityAccumulator = SourceValidityAccumulator()
         var scannedFrameCount = 0
         var candidateBlobCount = 0
@@ -154,6 +221,9 @@ object RecordedHfrStreamingEstimate {
                     )
                 }
                 if (scannedFrameCount >= config.maxScannedFrames) {
+                    if ((source as? ImportFrameSourceScanLimitTerminal)?.isTerminalAtScannedFrameCount(scannedFrameCount) == true) {
+                        break
+                    }
                     return resourceNoRead(
                         message = "Recorded-HFR streaming decode exceeded the scanned-frame limit.",
                         config = config,
@@ -242,14 +312,12 @@ object RecordedHfrStreamingEstimate {
                     timestampSeconds = timestampSeconds,
                 )
                 sourceValidityAccumulator.add(frame, config.framePipelineConfig.trackConfig.detectorConfig.roi)
-                if (sourceThumbnails.size < config.maxProofFrames) {
-                    sourceThumbnails += frame.toProofThumbnail(
-                        compactPosition = scannedFrameCount - 1,
-                        timestampSeconds = timestampSeconds,
-                        maxWidth = config.proofThumbnailMaxWidth,
-                        maxHeight = config.proofThumbnailMaxHeight,
-                    )
-                }
+                sourceThumbnails += frame.toProofThumbnail(
+                    compactPosition = scannedFrameCount - 1,
+                    timestampSeconds = timestampSeconds,
+                    maxWidth = config.proofThumbnailMaxWidth,
+                    maxHeight = config.proofThumbnailMaxHeight,
+                )
                 if (config.proofOnly) continue
                 if (cancellationSignal.isCancelled()) {
                     return resourceNoRead(
@@ -417,13 +485,21 @@ object RecordedHfrStreamingEstimate {
                         workingHeight = workingHeight,
                     )
                 }
+                val motionInput = buildMotionDetectorInput(
+                    frames = motionFrames,
+                    originalFrameIndexes = motionOriginalFrameIndexes,
+                    presentationTimestampNanos = motionPresentationTimestampNanos,
+                    config = config.motionScoutConfig,
+                    isCancelled = cancellationSignal::isCancelled,
+                )
+                motionScoutSelection = motionInput.selection
                 when (
                     val motion = RecordedHfrMotionBallDetector.detect(
-                        frames = motionFrames,
+                        frames = motionInput.frames,
                         detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
                         motionConfig = config.motionDetectorConfig,
-                        originalFrameIndexes = motionOriginalFrameIndexes,
-                        presentationTimestampNanos = motionPresentationTimestampNanos,
+                        originalFrameIndexes = motionInput.originalFrameIndexes,
+                        presentationTimestampNanos = motionInput.presentationTimestampNanos,
                         isCancelled = cancellationSignal::isCancelled,
                     )
                 ) {
@@ -441,6 +517,7 @@ object RecordedHfrStreamingEstimate {
                             workingWidth = workingWidth,
                             workingHeight = workingHeight,
                             sourceValidity = sourceValidity,
+                            motionScoutSelection = motionScoutSelection,
                         )
                     }
                     is RecordedHfrMotionDetectionOutcome.Success -> {
@@ -489,7 +566,7 @@ object RecordedHfrStreamingEstimate {
                         }
                         candidates += motion.frames
                         candidateBlobCount = motion.candidateBlobCount
-                        candidateThumbnails += sourceThumbnails
+                        candidateThumbnails += remapSourceThumbnailsToCandidates(sourceThumbnails, motion.frames)
                     }
                 }
             }
@@ -520,7 +597,7 @@ object RecordedHfrStreamingEstimate {
                     is RecordedHfrPhysicalDetectionOutcome.Success -> {
                         candidates += physical.frames
                         candidateBlobCount = physical.candidateBlobCount
-                        candidateThumbnails += sourceThumbnails
+                        candidateThumbnails += remapSourceThumbnailsToCandidates(sourceThumbnails, physical.frames)
                     }
                 }
             }
@@ -537,6 +614,7 @@ object RecordedHfrStreamingEstimate {
                 workingWidth = workingWidth,
                 workingHeight = workingHeight,
                 cancellationSignal = cancellationSignal,
+                motionScoutSelection = motionScoutSelection,
             )
         } catch (_: RuntimeException) {
             resourceNoRead(
@@ -556,6 +634,287 @@ object RecordedHfrStreamingEstimate {
         }
     }
 
+    private data class MotionDetectorInput(
+        val frames: List<RgbFrame>,
+        val originalFrameIndexes: List<Int>,
+        val presentationTimestampNanos: List<Long?>,
+        val selection: RecordedHfrMotionScoutSelection?,
+    )
+
+    private data class ScoutHit(
+        val frameIndex: Int,
+        val centroidX: Double,
+        val centroidY: Double,
+        val areaPx: Int,
+    )
+
+    private data class ScoutRun(
+        val hits: List<ScoutHit>,
+    ) {
+        val frameCount: Int get() = hits.size
+        val startIndex: Int get() = hits.first().frameIndex
+        val endIndexInclusive: Int get() = hits.last().frameIndex
+        val travelPx: Double get() = hypot(
+            hits.last().centroidX - hits.first().centroidX,
+            hits.last().centroidY - hits.first().centroidY,
+        )
+        val meanAreaPx: Double get() = hits.sumOf { it.areaPx }.toDouble() / hits.size.toDouble()
+    }
+
+    private data class ScoutRunBuilder(
+        val hits: MutableList<ScoutHit>,
+    ) {
+        val last: ScoutHit get() = hits.last()
+        fun add(hit: ScoutHit) {
+            hits += hit
+        }
+        fun build(): ScoutRun = ScoutRun(hits.toList())
+    }
+
+    private data class ScoutComponent(
+        val areaPx: Int,
+        val centroidX: Double,
+        val centroidY: Double,
+        val width: Int,
+        val height: Int,
+    ) {
+        val axisRatio: Double get() = max(width, height).toDouble() / min(width, height).coerceAtLeast(1).toDouble()
+    }
+
+    private fun buildMotionDetectorInput(
+        frames: List<RgbFrame>,
+        originalFrameIndexes: List<Int>,
+        presentationTimestampNanos: List<Long?>,
+        config: RecordedHfrMotionScoutConfig,
+        isCancelled: () -> Boolean,
+    ): MotionDetectorInput {
+        val full = MotionDetectorInput(
+            frames = frames,
+            originalFrameIndexes = originalFrameIndexes,
+            presentationTimestampNanos = presentationTimestampNanos,
+            selection = null,
+        )
+        if (!config.enabled || frames.size <= config.minDenseFrameCount || frames.isEmpty()) return full
+        if (originalFrameIndexes.size != frames.size || presentationTimestampNanos.size != frames.size) return full
+        val selection = selectMotionScoutWindow(frames, config, isCancelled) ?: return full
+        return MotionDetectorInput(
+            frames = frames.subList(selection.denseStartIndex, selection.denseEndIndexInclusive + 1),
+            originalFrameIndexes = originalFrameIndexes.subList(selection.denseStartIndex, selection.denseEndIndexInclusive + 1),
+            presentationTimestampNanos = presentationTimestampNanos.subList(selection.denseStartIndex, selection.denseEndIndexInclusive + 1),
+            selection = selection,
+        )
+    }
+
+    private fun selectMotionScoutWindow(
+        frames: List<RgbFrame>,
+        config: RecordedHfrMotionScoutConfig,
+        isCancelled: () -> Boolean,
+    ): RecordedHfrMotionScoutSelection? {
+        val scoutWidth = min(config.scoutWidth, frames.first().width).coerceAtLeast(1)
+        val scoutHeight = min(config.scoutHeight, frames.first().height).coerceAtLeast(1)
+        val scoutFrames = frames.map { frame -> downsampleLuma(frame, scoutWidth, scoutHeight) }
+        val background = medianScoutBackground(scoutFrames, scoutWidth * scoutHeight, isCancelled) ?: return null
+        val hitsByFrame = scoutFrames.mapIndexed { frameIndex, luma ->
+            if (isCancelled()) return null
+            scoutFrameHits(
+                luma = luma,
+                background = background,
+                frameIndex = frameIndex,
+                width = scoutWidth,
+                height = scoutHeight,
+                config = config,
+            )
+        }
+        val runs = buildScoutRuns(hitsByFrame, config)
+        val best = runs
+            .filter {
+                it.frameCount >= config.minRunFrameCount &&
+                    it.travelPx >= config.minRunTravelPx &&
+                    it.meanAreaPx >= config.minRunMeanAreaPx
+            }
+            .maxWithOrNull(
+                compareBy<ScoutRun> { it.travelPx }
+                    .thenBy { it.frameCount }
+                    .thenBy { it.meanAreaPx },
+            ) ?: return null
+        val dense = paddedDenseRange(best, frames.size, config)
+        return RecordedHfrMotionScoutSelection(
+            denseStartIndex = dense.first,
+            denseEndIndexInclusive = dense.last,
+            runStartIndex = best.startIndex,
+            runEndIndexInclusive = best.endIndexInclusive,
+            runFrameCount = best.frameCount,
+            runTravelPx = best.travelPx,
+            meanComponentAreaPx = best.meanAreaPx,
+            sourceFrameCount = frames.size,
+        )
+    }
+
+    private fun downsampleLuma(frame: RgbFrame, targetWidth: Int, targetHeight: Int): IntArray {
+        val out = IntArray(targetWidth * targetHeight)
+        for (y in 0 until targetHeight) {
+            val sourceY = (y * frame.height / targetHeight).coerceIn(0, frame.height - 1)
+            for (x in 0 until targetWidth) {
+                val sourceX = (x * frame.width / targetWidth).coerceIn(0, frame.width - 1)
+                out[y * targetWidth + x] = frame.argbPixels[sourceY * frame.width + sourceX].luma()
+            }
+        }
+        return out
+    }
+
+    private fun medianScoutBackground(
+        frames: List<IntArray>,
+        pixelCount: Int,
+        isCancelled: () -> Boolean,
+    ): IntArray? {
+        val values = IntArray(frames.size)
+        return IntArray(pixelCount) { pixel ->
+            if (isCancelled()) return null
+            frames.forEachIndexed { index, frame -> values[index] = frame[pixel] }
+            values.sort()
+            values[values.size / 2]
+        }
+    }
+
+    private fun scoutFrameHits(
+        luma: IntArray,
+        background: IntArray,
+        frameIndex: Int,
+        width: Int,
+        height: Int,
+        config: RecordedHfrMotionScoutConfig,
+    ): List<ScoutHit> {
+        val mask = BooleanArray(luma.size)
+        for (index in luma.indices) {
+            if (abs(luma[index] - background[index]) >= config.lumaDifferenceThreshold) {
+                mask[index] = true
+            }
+        }
+        return collectScoutComponents(mask, width, height)
+            .asSequence()
+            .filter { it.areaPx >= config.minComponentAreaPx }
+            .filter { it.axisRatio <= config.maxComponentAxisRatio }
+            .sortedByDescending { it.areaPx }
+            .take(SCOUT_MAX_COMPONENTS_PER_FRAME)
+            .map { component ->
+                ScoutHit(
+                    frameIndex = frameIndex,
+                    centroidX = component.centroidX,
+                    centroidY = component.centroidY,
+                    areaPx = component.areaPx,
+                )
+            }
+            .toList()
+    }
+
+    private fun collectScoutComponents(mask: BooleanArray, width: Int, height: Int): List<ScoutComponent> {
+        val visited = BooleanArray(mask.size)
+        val queue = IntArray(mask.size)
+        val components = mutableListOf<ScoutComponent>()
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+            var head = 0
+            var tail = 0
+            queue[tail++] = start
+            visited[start] = true
+            var area = 0
+            var sumX = 0.0
+            var sumY = 0.0
+            var minX = Int.MAX_VALUE
+            var minY = Int.MAX_VALUE
+            var maxX = Int.MIN_VALUE
+            var maxY = Int.MIN_VALUE
+            while (head < tail) {
+                val index = queue[head++]
+                val x = index % width
+                val y = index / width
+                area += 1
+                sumX += x
+                sumY += y
+                if (x < minX) minX = x
+                if (y < minY) minY = y
+                if (x > maxX) maxX = x
+                if (y > maxY) maxY = y
+                tail = addScoutNeighbor(x - 1, y, width, height, mask, visited, queue, tail)
+                tail = addScoutNeighbor(x + 1, y, width, height, mask, visited, queue, tail)
+                tail = addScoutNeighbor(x, y - 1, width, height, mask, visited, queue, tail)
+                tail = addScoutNeighbor(x, y + 1, width, height, mask, visited, queue, tail)
+            }
+            components += ScoutComponent(
+                areaPx = area,
+                centroidX = sumX / area.toDouble(),
+                centroidY = sumY / area.toDouble(),
+                width = maxX - minX + 1,
+                height = maxY - minY + 1,
+            )
+        }
+        return components
+    }
+
+    private fun addScoutNeighbor(
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        mask: BooleanArray,
+        visited: BooleanArray,
+        queue: IntArray,
+        tail: Int,
+    ): Int {
+        if (x !in 0 until width || y !in 0 until height) return tail
+        val index = y * width + x
+        if (!mask[index] || visited[index]) return tail
+        visited[index] = true
+        queue[tail] = index
+        return tail + 1
+    }
+
+    private fun buildScoutRuns(
+        hitsByFrame: List<List<ScoutHit>>,
+        config: RecordedHfrMotionScoutConfig,
+    ): List<ScoutRun> {
+        val active = mutableListOf<ScoutRunBuilder>()
+        val completed = mutableListOf<ScoutRun>()
+        hitsByFrame.forEach { hits ->
+            val frameIndex = hits.firstOrNull()?.frameIndex
+            if (frameIndex != null) {
+                val expired = active.filter { frameIndex - it.last.frameIndex > config.maxRunGapFrames + 1 }
+                completed += expired.map { it.build() }
+                active.removeAll(expired.toSet())
+            }
+            val claimed = mutableSetOf<ScoutRunBuilder>()
+            hits.forEach { hit ->
+                val run = active
+                    .filterNot { it in claimed }
+                    .filter { hit.frameIndex - it.last.frameIndex in 1..(config.maxRunGapFrames + 1) }
+                    .minByOrNull { hypot(hit.centroidX - it.last.centroidX, hit.centroidY - it.last.centroidY) }
+                if (run == null) {
+                    active += ScoutRunBuilder(mutableListOf(hit))
+                } else {
+                    run.add(hit)
+                    claimed += run
+                }
+            }
+        }
+        completed += active.map { it.build() }
+        return completed
+    }
+
+    private fun paddedDenseRange(
+        run: ScoutRun,
+        frameCount: Int,
+        config: RecordedHfrMotionScoutConfig,
+    ): IntRange {
+        var start = (run.startIndex - config.densePaddingFrames).coerceAtLeast(0)
+        var end = (run.endIndexInclusive + config.densePaddingFrames).coerceAtMost(frameCount - 1)
+        while (end - start + 1 < config.minDenseFrameCount && (start > 0 || end < frameCount - 1)) {
+            if (start > 0) start -= 1
+            if (end - start + 1 >= config.minDenseFrameCount) break
+            if (end < frameCount - 1) end += 1
+        }
+        return start..end
+    }
+
     private fun finish(
         config: RecordedHfrStreamingEstimateConfig,
         candidates: List<VisualEstimateCandidateFrame>,
@@ -569,6 +928,7 @@ object RecordedHfrStreamingEstimate {
         workingWidth: Int,
         workingHeight: Int,
         cancellationSignal: ImportCancellationSignal,
+        motionScoutSelection: RecordedHfrMotionScoutSelection?,
     ): RecordedHfrStreamingEstimateResult {
         if (config.proofOnly) {
             return proofOnlyNoRead(
@@ -630,6 +990,8 @@ object RecordedHfrStreamingEstimate {
                 sourceHeight = sourceHeight,
                 workingWidth = workingWidth,
                 workingHeight = workingHeight,
+                sourceValidity = sourceValidity,
+                motionScoutSelection = motionScoutSelection,
             )
         }
         reduction as VisualEstimateCandidateReductionOutcome.Success
@@ -647,6 +1009,8 @@ object RecordedHfrStreamingEstimate {
                     sourceHeight = sourceHeight,
                     workingWidth = workingWidth,
                     workingHeight = workingHeight,
+                    sourceValidity = sourceValidity,
+                    motionScoutSelection = motionScoutSelection,
                 )
             }
         }
@@ -697,6 +1061,8 @@ object RecordedHfrStreamingEstimate {
                     sourceHeight = sourceHeight,
                     workingWidth = workingWidth,
                     workingHeight = workingHeight,
+                    sourceValidity = sourceValidity,
+                    motionScoutSelection = motionScoutSelection,
                 )
             }
             is ImportValidationResult.Success -> reconciled.value
@@ -735,6 +1101,8 @@ object RecordedHfrStreamingEstimate {
             sourceHeight = sourceHeight,
             workingWidth = workingWidth,
             workingHeight = workingHeight,
+            sourceValidity = sourceValidity,
+            motionScoutSelection = motionScoutSelection,
         )
     }
 
@@ -750,6 +1118,7 @@ object RecordedHfrStreamingEstimate {
         workingWidth: Int,
         workingHeight: Int,
     ): RecordedHfrStreamingEstimateResult {
+        val proofThumbnails = selectProofThumbnails(sourceThumbnails, emptySet(), config.maxProofFrames)
         val noRead = candidateNoRead(
             reason = VisualEstimateNoReadReason.EXCESSIVE_RESIDUAL,
             message = "Recorded-HFR proof-only window skipped candidate detection.",
@@ -765,10 +1134,10 @@ object RecordedHfrStreamingEstimate {
             outcome = noRead,
             trace = buildSourceTrace(
                 detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
-                thumbnails = sourceThumbnails,
+                thumbnails = proofThumbnails,
                 outcome = noRead,
             ),
-            proofThumbnails = sourceThumbnails,
+            proofThumbnails = proofThumbnails,
             scannedFrameCount = scannedFrameCount,
             candidateFrameCount = candidateFrameCount,
             candidateBlobCount = candidateBlobCount,
@@ -835,6 +1204,7 @@ object RecordedHfrStreamingEstimate {
         workingWidth: Int,
         workingHeight: Int,
     ): RecordedHfrStreamingEstimateResult {
+        val proofThumbnails = selectProofThumbnails(sourceThumbnails, emptySet(), config.maxProofFrames)
         val noRead = candidateNoRead(
             reason = VisualEstimateNoReadReason.DETECTION_FAILED,
             message = "Recorded window source frames were black or invalid.",
@@ -850,10 +1220,10 @@ object RecordedHfrStreamingEstimate {
             outcome = noRead,
             trace = buildSourceTrace(
                 detectorConfig = config.framePipelineConfig.trackConfig.detectorConfig,
-                thumbnails = sourceThumbnails,
+                thumbnails = proofThumbnails,
                 outcome = noRead,
             ),
-            proofThumbnails = sourceThumbnails,
+            proofThumbnails = proofThumbnails,
             scannedFrameCount = scannedFrameCount,
             candidateFrameCount = candidateFrameCount,
             candidateBlobCount = candidateBlobCount,
@@ -925,6 +1295,7 @@ object RecordedHfrStreamingEstimate {
         workingWidth: Int,
         workingHeight: Int,
         sourceValidity: RecordedHfrSourceValidity = RecordedHfrSourceValidity.NotEvaluated,
+        motionScoutSelection: RecordedHfrMotionScoutSelection? = null,
     ): RecordedHfrStreamingEstimateResult {
         val noRead = candidateNoRead(
             reason = reason,
@@ -961,6 +1332,7 @@ object RecordedHfrStreamingEstimate {
             workingWidth = workingWidth,
             workingHeight = workingHeight,
             sourceValidity = sourceValidity,
+            motionScoutSelection = motionScoutSelection,
         )
     }
 
@@ -977,6 +1349,7 @@ object RecordedHfrStreamingEstimate {
         workingWidth: Int,
         workingHeight: Int,
         sourceValidity: RecordedHfrSourceValidity = RecordedHfrSourceValidity.NotEvaluated,
+        motionScoutSelection: RecordedHfrMotionScoutSelection? = null,
     ): RecordedHfrStreamingEstimateResult =
         RecordedHfrStreamingEstimateResult(
             outcome = outcome,
@@ -993,6 +1366,7 @@ object RecordedHfrStreamingEstimate {
             workingWidth = workingWidth,
             workingHeight = workingHeight,
             sourceValidity = sourceValidity,
+            motionScoutSelection = motionScoutSelection,
         )
 
     private fun candidateNoRead(
@@ -1124,6 +1498,20 @@ object RecordedHfrStreamingEstimate {
         return (selected + fill).distinctBy { it.compactPosition }.sortedBy { it.compactPosition }
     }
 
+    private fun remapSourceThumbnailsToCandidates(
+        sourceThumbnails: List<VisualEstimateProofThumbnailFrame>,
+        candidates: List<VisualEstimateCandidateFrame>,
+    ): List<VisualEstimateProofThumbnailFrame> {
+        if (sourceThumbnails.isEmpty() || candidates.isEmpty()) return emptyList()
+        val sourceByOriginalFrame = sourceThumbnails.associateBy { it.originalFrameIndex }
+        return candidates.mapNotNull { candidate ->
+            sourceByOriginalFrame[candidate.originalFrameIndex]?.copy(
+                compactPosition = candidate.compactPosition,
+                timestampSeconds = candidate.timestampSeconds,
+            )
+        }
+    }
+
     private fun VisualEstimateOutcome.withRecordedTimingProvenance(
         timing: ImportTimingReconciliation,
         frameCount: Int,
@@ -1135,6 +1523,7 @@ object RecordedHfrStreamingEstimate {
             is VisualEstimateOutcome.Success -> VisualEstimateOutcome.Success(
                 milesPerHour = milesPerHour,
                 launchAngleDegrees = launchAngleDegrees,
+                launchHeightFeet = launchHeightFeet,
                 diagnostics = diagnostics.withRecordedTimingProvenance(
                     timing = timing,
                     frameCount = frameCount,
@@ -1177,7 +1566,7 @@ object RecordedHfrStreamingEstimate {
             detectionCount = selectedSampleCount,
             timingBasis = timing.basis.toEstimateTimingBasis(),
             timestampGapSummary = timing.timestampGapSummary,
-            confidence = timing.confidence,
+            confidence = confidence ?: timing.confidence,
             candidateFrameCount = candidateFrameCount,
             candidateBlobCount = candidateBlobCount,
             selectedSampleCount = selectedSampleCount,
@@ -1310,5 +1699,6 @@ object RecordedHfrStreamingEstimate {
     private const val SOURCE_VALIDITY_MIN_FRAME_MEAN_LUMA = 12.0
     private const val SOURCE_VALIDITY_MIN_BRIGHT_PIXEL_FRACTION = 0.001
 
+    private const val SCOUT_MAX_COMPONENTS_PER_FRAME = 8
     private const val MAX_TRACE_CANDIDATES_PER_FRAME = 16
 }

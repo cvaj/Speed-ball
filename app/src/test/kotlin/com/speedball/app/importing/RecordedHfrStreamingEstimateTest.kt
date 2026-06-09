@@ -1,5 +1,6 @@
 package com.speedball.app.importing
 
+import com.speedball.app.capture.ContainerTimeWindow
 import com.speedball.app.measurement.BlobDetectionConfig
 import com.speedball.app.measurement.CandidateReductionBudget
 import com.speedball.app.measurement.EstimateTimingBasis
@@ -14,6 +15,7 @@ import com.speedball.app.measurement.RecordedHfrMotionDetectorConfig
 import com.speedball.app.measurement.RecordedHfrPhysicalDetectorConfig
 import com.speedball.app.measurement.TrackExtractionConfig
 import com.speedball.app.measurement.VisualEstimateCandidateFrame
+import com.speedball.app.measurement.VisualEstimateCaptureProofBuilder
 import com.speedball.app.measurement.VisualEstimateConfidence
 import com.speedball.app.measurement.VisualEstimateFramePipelineConfig
 import com.speedball.app.measurement.VisualEstimateNoReadReason
@@ -50,6 +52,8 @@ class RecordedHfrStreamingEstimateTest {
         assertEquals(4, result.retainedCandidateFrameCount)
         assertEquals(4, result.candidateBlobCount)
         assertEquals(4, result.selectedSampleCount)
+        assertEquals("PASS", result.sourceValidity.verdict)
+        assertTrue(result.sourceValidity.passes)
         assertEquals(3, result.proofThumbnails.size)
         assertTrue(result.proofThumbnails.all { it.thumbnailWidth <= 16 && it.thumbnailHeight <= 9 })
         assertEquals(listOf(3, 3, 3), result.timing?.frameStepMultipliers)
@@ -126,6 +130,27 @@ class RecordedHfrStreamingEstimateTest {
         assertEquals(81.8181, indexSuccess.milesPerHour, 0.01)
         assertEquals(27.2727, ptsSuccess.milesPerHour, 0.01)
         assertEquals(EstimateTimingBasis.RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS, ptsSuccess.diagnostics.timingBasis)
+    }
+
+    @Test
+    fun recordedTimingProvenancePreservesDetectorConfidenceAfterValidTiming() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(
+                List(8) { index ->
+                    ballFrame(
+                        index = index,
+                        x = 2 + index * 3,
+                        ptsNanos = 1_000_000_000L + index * 8_333_333L,
+                    )
+                },
+            ),
+            config = streamingConfig(timingMode = RecordedHfrStreamingTimingMode.CONTAINER_PTS_DELTAS),
+        )
+
+        val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, result.outcome, result.outcome.toString())
+        assertEquals(8, result.selectedSampleCount)
+        assertEquals(EstimateTimingBasis.RECORDED_CONTAINER_PRESENTATION_TIMESTAMPS, success.diagnostics.timingBasis)
+        assertEquals(VisualEstimateConfidence.HIGH, success.diagnostics.confidence)
     }
 
     @Test
@@ -248,6 +273,40 @@ class RecordedHfrStreamingEstimateTest {
     }
 
     @Test
+    fun exactRecordedWindowFrameLimitCompletesDetectorInsteadOfResourceNoRead() {
+        val windowSource = assertInstanceOf(
+            RecordedHfrWindowFrameSource::class.java,
+            assertInstanceOf(
+                ImportValidationResult.Success::class.java,
+                RecordedHfrWindowFrameSource.create(
+                    upstream = FakeFrameSource(List(3) { index -> blankFrame(index, ptsNanos = index * 8_333_333L) }),
+                    window = ContainerTimeWindow(
+                        windowStartUs = 0,
+                        windowEndUs = 30_000,
+                        postImpactFrameCount = 3,
+                        preImpactMarginFrames = 0,
+                        maxFrames = 3,
+                    ),
+                ),
+            ).value,
+        )
+
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = windowSource,
+            config = streamingConfig(
+                maxScannedFrames = 3,
+                timingMode = RecordedHfrStreamingTimingMode.CONTAINER_PTS_DELTAS,
+            ),
+        )
+
+        val noRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, result.outcome)
+        assertEquals(VisualEstimateNoReadReason.DETECTION_FAILED, noRead.reason)
+        assertTrue(noRead.message.contains("black", ignoreCase = true), noRead.message)
+        assertEquals(3, result.scannedFrameCount)
+        assertTrue(result.proofThumbnails.isNotEmpty())
+    }
+
+    @Test
     fun retainedCandidateCapReturnsResourceNoReadWithoutCatchingOom() {
         val result = RecordedHfrStreamingEstimate.estimate(
             source = FakeFrameSource(List(8) { index -> ballFrame(index = index, x = 2 + index) }),
@@ -261,17 +320,17 @@ class RecordedHfrStreamingEstimateTest {
     }
 
     @Test
-    fun recordedBudgetCapsCandidateBlobsBeforeRansacWork() {
+    fun recordedBudgetCapsRunawayCandidateBlobsButAllowsDirectionalSelectionHeadroom() {
         val result = RecordedHfrStreamingEstimate.estimate(
             source = FakeFrameSource(
                 List(4) { frameIndex ->
-                    multiBlobFrame(index = frameIndex, blobCount = 25)
+                    multiBlobFrame(index = frameIndex, blobCount = 50)
                 },
             ),
             config = streamingConfig(
                 candidateReductionBudget = CandidateReductionBudget(
-                    maxBlobsPerFrame = 32,
-                    maxTotalCandidateBlobs = 90,
+                    maxBlobsPerFrame = 64,
+                    maxTotalCandidateBlobs = 150,
                     maxRansacCandidates = 90,
                     maxRansacPairHypotheses = 4_096,
                     ransacCancellationCheckInterval = 128,
@@ -317,7 +376,7 @@ class RecordedHfrStreamingEstimateTest {
     fun motionDetectorOptInFindsMovingObjectWithoutColorThreshold() {
         val result = RecordedHfrStreamingEstimate.estimate(
             source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
-            config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = 35.0),
+            config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = null),
         )
 
         val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, result.outcome, result.outcome.toString())
@@ -325,12 +384,106 @@ class RecordedHfrStreamingEstimateTest {
         assertEquals(7, result.retainedCandidateFrameCount)
         assertEquals(7, result.candidateBlobCount)
         assertTrue(result.detectorTrace.frames.all { frame -> frame.candidates.all { it.motionMetrics != null } })
-        assertTrue(success.milesPerHour > 35.0, "motion mph=${success.milesPerHour}")
+        assertTrue(success.milesPerHour > 0.0, "motion mph=${success.milesPerHour}")
+        val proof = VisualEstimateCaptureProofBuilder.buildFromThumbnails(
+            attemptId = 1L,
+            scannedFrameCount = result.scannedFrameCount,
+            frameAvailableCallbackCount = result.scannedFrameCount,
+            captureResultCallbackCount = result.scannedFrameCount,
+            uniqueSensorTimestampCount = result.scannedFrameCount,
+            readbackWidth = result.workingWidth,
+            readbackHeight = result.workingHeight,
+            trace = result.detectorTrace,
+            thumbnails = result.proofThumbnails,
+            sourceKind = "TEST_RECORDED_HFR",
+            sourceWidth = result.sourceWidth,
+            sourceHeight = result.sourceHeight,
+            workingWidth = result.workingWidth,
+            workingHeight = result.workingHeight,
+            decodedFrameCount = result.scannedFrameCount,
+            requestedFps = 120,
+            dropGateVerdict = "PASS",
+            cadenceGateVerdict = "PASS",
+        )
+        assertTrue(proof.frames.isNotEmpty())
+        assertTrue(proof.frames.all { it.selected != null }, "proof thumbnails must show selected ball-track frames")
     }
 
     @Test
-    fun motionDetectorRejectsSlowMediumMoverBySamePlaneSpeedFloorWhileFastCapsulePasses() {
-        val slow = RecordedHfrStreamingEstimate.estimate(
+    fun motionScoutReducerFeedsOnlyPaddedHighTravelWindowToMotionDetector() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionScoutFrames()),
+            config = motionStreamingConfig(
+                pixelsPerFoot = 50.0,
+                minEstimateMilesPerHour = null,
+                maxScannedFrames = 64,
+                motionScoutConfig = RecordedHfrMotionScoutConfig(
+                    enabled = true,
+                    scoutWidth = 80,
+                    scoutHeight = 45,
+                    lumaDifferenceThreshold = 7,
+                    minComponentAreaPx = 3,
+                    maxComponentAxisRatio = 4.0,
+                    densePaddingFrames = 4,
+                    minDenseFrameCount = 12,
+                    minRunTravelPx = 8.0,
+                ),
+            ),
+        )
+
+        val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, result.outcome, result.outcome.toString())
+        val selection = result.motionScoutSelection
+        assertTrue(selection != null, "motion scout must select the moving ball interval")
+        selection!!
+        assertEquals(48, result.scannedFrameCount)
+        assertTrue(selection.runStartIndex >= 26, "selection=$selection")
+        assertTrue(selection.denseStartIndex > 16, "slow foreground run must be outside the detector input: $selection")
+        assertTrue(selection.denseEndIndexInclusive < 47, "dense interval should not feed the whole source window: $selection")
+        assertTrue(result.detectorTrace.frames.all { it.originalFrameIndex >= selection.denseStartIndex })
+        assertTrue(result.retainedCandidateFrameCount <= 16, "candidate frames=${result.retainedCandidateFrameCount} selection=$selection")
+        assertTrue(success.milesPerHour > 0.0)
+    }
+
+    @Test
+    fun motionScoutRejectsWeakLateSpeckRunBeforeCroppingDetectorWindow() {
+        val result = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionScoutFramesWithWeakLateSpecks()),
+            config = motionStreamingConfig(
+                pixelsPerFoot = 50.0,
+                minEstimateMilesPerHour = null,
+                maxScannedFrames = 64,
+                motionScoutConfig = RecordedHfrMotionScoutConfig(
+                    enabled = true,
+                    scoutWidth = 80,
+                    scoutHeight = 45,
+                    lumaDifferenceThreshold = 7,
+                    minComponentAreaPx = 3,
+                    maxComponentAxisRatio = 4.0,
+                    densePaddingFrames = 4,
+                    minDenseFrameCount = 12,
+                    minRunTravelPx = 8.0,
+                    minRunMeanAreaPx = 8.0,
+                ),
+            ),
+        )
+
+        val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, result.outcome, result.outcome.toString())
+        val selection = result.motionScoutSelection
+        assertTrue(selection != null, "motion scout must select the stronger ball run")
+        selection!!
+        assertTrue(selection.runStartIndex in 8..16, "weak late specks must not define the crop: $selection")
+        assertTrue(selection.denseEndIndexInclusive < 32, "detector window must stay around the real ball run: $selection")
+        assertTrue(result.detectorTrace.frames.any { it.originalFrameIndex in 12..18 })
+        assertTrue(success.milesPerHour > 0.0)
+    }
+
+    @Test
+    fun optionalConfiguredMphFloorRunsAfterMotionShapeAndPathSelection() {
+        val noFloor = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
+            config = motionStreamingConfig(pixelsPerFoot = 200.0, minEstimateMilesPerHour = null),
+        )
+        val configuredFloor = RecordedHfrStreamingEstimate.estimate(
             source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
             config = motionStreamingConfig(pixelsPerFoot = 200.0, minEstimateMilesPerHour = 35.0),
         )
@@ -339,12 +492,44 @@ class RecordedHfrStreamingEstimateTest {
             config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = 35.0),
         )
 
-        val slowNoRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, slow.outcome, slow.outcome.toString())
+        val noFloorSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, noFloor.outcome, noFloor.outcome.toString())
+        val configuredNoRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, configuredFloor.outcome, configuredFloor.outcome.toString())
         val fastSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, fast.outcome, fast.outcome.toString())
-        assertEquals(VisualEstimateNoReadReason.AMBIGUOUS_TRACK, slowNoRead.reason)
-        assertTrue(slowNoRead.message.contains("speed threshold"), slowNoRead.message)
-        assertTrue(slow.retainedCandidateFrameCount >= 4, "slow path must reach speed discrimination, not fail shape detection")
+        assertTrue(noFloorSuccess.milesPerHour < 35.0, "no-floor mph=${noFloorSuccess.milesPerHour}")
+        assertEquals(VisualEstimateNoReadReason.AMBIGUOUS_TRACK, configuredNoRead.reason)
+        assertTrue(configuredNoRead.message.contains("speed threshold"), configuredNoRead.message)
+        assertTrue(configuredFloor.retainedCandidateFrameCount >= 4, "configured floor must run after shape/path candidate selection")
         assertTrue(fastSuccess.milesPerHour > 35.0, "fast mph=${fastSuccess.milesPerHour}")
+    }
+
+    @Test
+    fun motionDetectorRejectsStationaryAndNonDirectionalForegroundBeforeMph() {
+        val stationary = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFramesFromPositions(listOf(140, 140, 140, 140, 140, 140, 140))),
+            config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = null),
+        )
+        val sawTooth = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFramesFromPositions(listOf(40, 120, 200, 120, 40, 120, 200))),
+            config = motionStreamingConfig(pixelsPerFoot = 50.0, minEstimateMilesPerHour = null),
+        )
+
+        val stationaryNoRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, stationary.outcome, stationary.outcome.toString())
+        val sawToothNoRead = assertInstanceOf(VisualEstimateOutcome.NoRead::class.java, sawTooth.outcome, sawTooth.outcome.toString())
+        assertEquals(VisualEstimateNoReadReason.NO_FOREGROUND_MOTION, stationaryNoRead.reason)
+        assertEquals(VisualEstimateNoReadReason.AMBIGUOUS_TRACK, sawToothNoRead.reason)
+        assertFalse(stationaryNoRead.toString().contains("mph", ignoreCase = true))
+        assertFalse(sawToothNoRead.toString().contains("mph", ignoreCase = true))
+    }
+
+    @Test
+    fun runModeRecordedHfrDoesNotHardCodeConfiguredMphFloor() {
+        val noFloor = RecordedHfrStreamingEstimate.estimate(
+            source = FakeFrameSource(motionCapsuleFrames(stepPx = 60)),
+            config = motionStreamingConfig(pixelsPerFoot = 200.0, minEstimateMilesPerHour = null),
+        )
+
+        val noFloorSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, noFloor.outcome, noFloor.outcome.toString())
+        assertTrue(noFloorSuccess.milesPerHour < 40.0, "no-floor mph=${noFloorSuccess.milesPerHour}")
     }
 
     @Test
@@ -528,7 +713,9 @@ class RecordedHfrStreamingEstimateTest {
 
     private fun motionStreamingConfig(
         pixelsPerFoot: Double,
-        minEstimateMilesPerHour: Double,
+        minEstimateMilesPerHour: Double?,
+        maxScannedFrames: Int = 24,
+        motionScoutConfig: RecordedHfrMotionScoutConfig = RecordedHfrMotionScoutConfig(),
     ): RecordedHfrStreamingEstimateConfig =
         RecordedHfrStreamingEstimateConfig(
             frameIntervalSeconds = 1.0 / 120.0,
@@ -547,7 +734,7 @@ class RecordedHfrStreamingEstimateTest {
                             maxWidth = MOTION_WIDTH,
                             maxHeight = MOTION_HEIGHT,
                             maxPixels = MOTION_WIDTH * MOTION_HEIGHT,
-                            maxFrameCount = 24,
+                            maxFrameCount = maxScannedFrames,
                             maxThresholdPixels = MOTION_WIDTH * MOTION_HEIGHT,
                             maxComponentsPerFrame = MOTION_WIDTH * MOTION_HEIGHT,
                             maxOperationsPerFrame = MOTION_WIDTH * MOTION_HEIGHT * 80,
@@ -568,7 +755,7 @@ class RecordedHfrStreamingEstimateTest {
                     minimumSpeedGatePolicy = MinimumSpeedGatePolicy.SAME_PLANE_ONLY,
                 ),
             ),
-            maxScannedFrames = 24,
+            maxScannedFrames = maxScannedFrames,
             maxRetainedCandidateFrames = 12,
             maxProofFrames = 6,
             proofThumbnailMaxWidth = 64,
@@ -577,6 +764,7 @@ class RecordedHfrStreamingEstimateTest {
                 openRadiusPx = 0,
                 closeRadiusPx = 1,
             ),
+            motionScoutConfig = motionScoutConfig,
         )
 
     private fun calibration(pixels: Double, feet: Double): MeasurementCalibrationState =
@@ -681,12 +869,14 @@ class RecordedHfrStreamingEstimateTest {
     }
 
     private fun motionCapsuleFrames(stepPx: Int): List<ImportVideoFrame> =
-        List(7) { index ->
+        motionCapsuleFramesFromPositions(List(7) { index -> 40 + index * stepPx })
+
+    private fun motionCapsuleFramesFromPositions(leftPositions: List<Int>): List<ImportVideoFrame> =
+        leftPositions.mapIndexed { index, left ->
             val pixels = IntArray(MOTION_WIDTH * MOTION_HEIGHT) { DARK_GRAY }
-            val left = 40 + index * stepPx
             val top = 160
             for (py in top until top + 40) {
-                for (px in left until left + 100) {
+                for (px in left until left + 40) {
                     if (px in 0 until MOTION_WIDTH && py in 0 until MOTION_HEIGHT) {
                         pixels[py * MOTION_WIDTH + px] = WHITE
                     }
@@ -700,6 +890,62 @@ class RecordedHfrStreamingEstimateTest {
                 argbPixels = pixels,
             )
         }
+
+    private fun motionScoutFrames(): List<ImportVideoFrame> =
+        List(48) { index ->
+            val pixels = IntArray(MOTION_WIDTH * MOTION_HEIGHT) { DARK_GRAY }
+            if (index in 5..20) {
+                drawRect(pixels, MOTION_WIDTH, left = 80 + (index - 5), top = 42, widthPx = 32, heightPx = 32, color = WHITE)
+            }
+            if (index in 28..38) {
+                drawRect(pixels, MOTION_WIDTH, left = 40 + (index - 28) * 45, top = 160, widthPx = 40, heightPx = 40, color = WHITE)
+            }
+            ImportVideoFrame(
+                frameIndex = index,
+                presentationTimestampNanos = index * 8_333_333L,
+                width = MOTION_WIDTH,
+                height = MOTION_HEIGHT,
+                argbPixels = pixels,
+            )
+        }
+
+    private fun motionScoutFramesWithWeakLateSpecks(): List<ImportVideoFrame> =
+        List(48) { index ->
+            val pixels = IntArray(MOTION_WIDTH * MOTION_HEIGHT) { DARK_GRAY }
+            if (index in 10..18) {
+                drawRect(pixels, MOTION_WIDTH, left = 40 + (index - 10) * 45, top = 160, widthPx = 40, heightPx = 40, color = WHITE)
+            }
+            if (index in 28..42) {
+                drawRect(pixels, MOTION_WIDTH, left = 10 + (index - 28) * 12, top = 30, widthPx = 6, heightPx = 6, color = WHITE)
+            }
+            ImportVideoFrame(
+                frameIndex = index,
+                presentationTimestampNanos = index * 8_333_333L,
+                width = MOTION_WIDTH,
+                height = MOTION_HEIGHT,
+                argbPixels = pixels,
+            )
+        }
+
+    private fun drawRect(
+        pixels: IntArray,
+        frameWidth: Int,
+        left: Int,
+        top: Int,
+        widthPx: Int = 0,
+        heightPx: Int = 0,
+        color: Int,
+    ) {
+        val rectWidth = if (widthPx == 0) 1 else widthPx
+        val rectHeight = if (heightPx == 0) 1 else heightPx
+        for (py in top until top + rectHeight) {
+            for (px in left until left + rectWidth) {
+                if (px in 0 until MOTION_WIDTH && py in 0 until MOTION_HEIGHT) {
+                    pixels[py * frameWidth + px] = color
+                }
+            }
+        }
+    }
 
     private companion object {
         const val FRAME_WIDTH = 40

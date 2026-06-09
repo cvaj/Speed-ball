@@ -5,10 +5,12 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
+import kotlin.math.sign
 
 private const val MILES_PER_HOUR_PER_METER_PER_SECOND = 2.2369362920544
 private const val FEET_PER_METER = 3.280839895013123
 private const val MIN_COSINE = 1e-12
+private const val RPM_TO_RADIANS_PER_SECOND = 2.0 * PI / 60.0
 
 /** Physical ball dimensions used by trajectory integration. */
 data class BallSpec(
@@ -36,6 +38,41 @@ data class AirSpec(
                 dragCoefficient = 0.40,
             )
     }
+}
+
+/**
+ * Transverse spin used by the optional Magnus trajectory model.
+ *
+ * Positive [transverseSpinRpm] means backspin in the 2D flight plane and
+ * produces upward lift for a forward-moving launch. Negative values model
+ * topspin/downward Magnus force. The default is no spin, which exactly
+ * preserves the drag-only trajectory model.
+ */
+data class MagnusSpinSpec(
+    val transverseSpinRpm: Double,
+    val liftCoefficientModel: MagnusLiftCoefficientModel = MagnusLiftCoefficientModel.NATHAN_BASEBALL_SPIN_PARAMETER,
+) {
+    companion object {
+        fun none(): MagnusSpinSpec = MagnusSpinSpec(transverseSpinRpm = 0.0)
+
+        fun assumedLevelSwingBackspin(
+            transverseSpinRpm: Double = 1800.0,
+        ): MagnusSpinSpec =
+            MagnusSpinSpec(transverseSpinRpm = transverseSpinRpm)
+    }
+}
+
+/** Experiment-backed lift-coefficient model for spinning ball estimates. */
+enum class MagnusLiftCoefficientModel {
+    /**
+     * Nathan baseball spin-parameter model:
+     * `C_L = 2.5S / (1 + 5.8S)`, where `S = R * omega / v`.
+     *
+     * This is an assumption-based estimate for softball until the app has
+     * measured softball-specific spin evidence. It should be reported as a
+     * model path, not as measured spin.
+     */
+    NATHAN_BASEBALL_SPIN_PARAMETER,
 }
 
 /** Launch state in SI units, with angle in degrees above horizontal. */
@@ -141,8 +178,9 @@ object TrajectoryPhysics {
         ball: BallSpec = BallSpec.softball12Inch(),
         air: AirSpec = AirSpec.standardSeaLevel(),
         options: TrajectoryOptions = TrajectoryOptions.default(),
+        spin: MagnusSpinSpec = MagnusSpinSpec.none(),
     ): TrajectoryOutcome {
-        validateInputs(launch, ball, air, options)?.let { return it }
+        validateInputs(launch, ball, air, options, spin)?.let { return it }
 
         if (isImmediateGroundResult(launch)) {
             return TrajectoryOutcome.Success(immediateGroundTrajectory(launch.launchHeightMeters))
@@ -164,6 +202,7 @@ object TrajectoryPhysics {
             ball = ball,
             air = air,
             options = options,
+            spin = spin,
         )
     }
 
@@ -172,8 +211,10 @@ object TrajectoryPhysics {
         ball: BallSpec,
         air: AirSpec,
         options: TrajectoryOptions,
+        spin: MagnusSpinSpec = MagnusSpinSpec.none(),
     ): TrajectoryOutcome {
         val drag = dragConstant(ball, air)
+        val magnus = magnusConstant(ball, air)
         val samples = mutableListOf(initialState.toSample())
         var current = initialState
 
@@ -183,7 +224,7 @@ object TrajectoryPhysics {
 
         while (current.timeSeconds < options.maxFlightSeconds) {
             val dt = minOf(options.timeStepSeconds, options.maxFlightSeconds - current.timeSeconds)
-            val next = rk4Step(current, dt, drag, options.gravityMetersPerSecondSquared)
+            val next = rk4Step(current, dt, drag, magnus, spin, ball, options.gravityMetersPerSecondSquared)
             if (!next.hasOnlyFiniteValues()) {
                 return nonFiniteStateFailure()
             }
@@ -241,6 +282,7 @@ private fun validateInputs(
     ball: BallSpec,
     air: AirSpec,
     options: TrajectoryOptions,
+    spin: MagnusSpinSpec,
 ): TrajectoryOutcome.Failure? {
     if (!launch.speedMetersPerSecond.isFinite() || launch.speedMetersPerSecond < 0.0) {
         return TrajectoryOutcome.Failure(TrajectoryFailure.INVALID_LAUNCH, "Launch speed must be finite and non-negative.")
@@ -268,6 +310,9 @@ private fun validateInputs(
     }
     if (!options.gravityMetersPerSecondSquared.isFinite() || options.gravityMetersPerSecondSquared <= 0.0) {
         return TrajectoryOutcome.Failure(TrajectoryFailure.INVALID_OPTIONS, "Gravity must be finite and positive.")
+    }
+    if (!spin.transverseSpinRpm.isFinite()) {
+        return TrajectoryOutcome.Failure(TrajectoryFailure.INVALID_AIR, "Magnus spin rate must be finite.")
     }
     return null
 }
@@ -297,16 +342,25 @@ private fun dragConstant(ball: BallSpec, air: AirSpec): Double {
     return 0.5 * air.densityKgPerCubicMeter * air.dragCoefficient * area / ball.massKilograms
 }
 
+private fun magnusConstant(ball: BallSpec, air: AirSpec): Double {
+    val radius = ball.diameterMeters / 2.0
+    val area = PI * radius * radius
+    return 0.5 * air.densityKgPerCubicMeter * area / ball.massKilograms
+}
+
 private fun rk4Step(
     state: IntegratorState,
     dt: Double,
     drag: Double,
+    magnus: Double,
+    spin: MagnusSpinSpec,
+    ball: BallSpec,
     gravity: Double,
 ): IntegratorState {
-    val k1 = derivative(state, drag, gravity)
-    val k2 = derivative(state.offset(k1, dt / 2.0), drag, gravity)
-    val k3 = derivative(state.offset(k2, dt / 2.0), drag, gravity)
-    val k4 = derivative(state.offset(k3, dt), drag, gravity)
+    val k1 = derivative(state, drag, magnus, spin, ball, gravity)
+    val k2 = derivative(state.offset(k1, dt / 2.0), drag, magnus, spin, ball, gravity)
+    val k3 = derivative(state.offset(k2, dt / 2.0), drag, magnus, spin, ball, gravity)
+    val k4 = derivative(state.offset(k3, dt), drag, magnus, spin, ball, gravity)
     return IntegratorState(
         timeSeconds = state.timeSeconds + dt,
         xMeters = state.xMeters + dt / 6.0 * (k1.dx + 2.0 * k2.dx + 2.0 * k3.dx + k4.dx),
@@ -328,15 +382,45 @@ private fun IntegratorState.offset(derivative: Derivative, dt: Double): Integrat
 private fun derivative(
     state: IntegratorState,
     drag: Double,
+    magnus: Double,
+    spin: MagnusSpinSpec,
+    ball: BallSpec,
     gravity: Double,
 ): Derivative {
     val speed = hypot(state.vxMetersPerSecond, state.vyMetersPerSecond)
+    val liftCoefficient = liftCoefficient(speed, ball, spin)
+    val spinDirection = spin.transverseSpinRpm.sign
+    val liftX = if (speed <= 0.0 || spinDirection == 0.0) {
+        0.0
+    } else {
+        -spinDirection * magnus * liftCoefficient * speed * state.vyMetersPerSecond
+    }
+    val liftY = if (speed <= 0.0 || spinDirection == 0.0) {
+        0.0
+    } else {
+        spinDirection * magnus * liftCoefficient * speed * state.vxMetersPerSecond
+    }
     return Derivative(
         dx = state.vxMetersPerSecond,
         dy = state.vyMetersPerSecond,
-        dvx = -drag * speed * state.vxMetersPerSecond,
-        dvy = -gravity - drag * speed * state.vyMetersPerSecond,
+        dvx = -drag * speed * state.vxMetersPerSecond + liftX,
+        dvy = -gravity - drag * speed * state.vyMetersPerSecond + liftY,
     )
+}
+
+private fun liftCoefficient(
+    speedMetersPerSecond: Double,
+    ball: BallSpec,
+    spin: MagnusSpinSpec,
+): Double {
+    if (spin.transverseSpinRpm == 0.0 || speedMetersPerSecond <= 0.0) return 0.0
+    val radius = ball.diameterMeters / 2.0
+    val omega = abs(spin.transverseSpinRpm) * RPM_TO_RADIANS_PER_SECOND
+    val spinParameter = radius * omega / speedMetersPerSecond
+    return when (spin.liftCoefficientModel) {
+        MagnusLiftCoefficientModel.NATHAN_BASEBALL_SPIN_PARAMETER ->
+            2.5 * spinParameter / (1.0 + 5.8 * spinParameter)
+    }
 }
 
 private fun interpolateGroundCrossing(

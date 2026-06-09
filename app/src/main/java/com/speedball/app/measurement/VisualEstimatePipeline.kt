@@ -25,12 +25,14 @@ data class VisualEstimateTrackSample(
 /**
  * Unit-bearing gates for S10+ visual estimate mode.
  *
- * [allowApparentScaleChangeEstimate] is restricted to estimate-only
- * ball-diameter self-calibration. When enabled, strong apparent diameter change
- * remains a LOW-confidence warning instead of becoming a strict no-read.
+ * [allowApparentScaleChangeEstimate] prevents noisy apparent-diameter
+ * variation from becoming a standalone veto. Timing, path fit, direction,
+ * residual, and calibration gates still fail loudly when the whole track cannot
+ * support an honest estimate.
  */
 data class VisualEstimatePipelineConfig(
     val maxEstimateRmsResidualPx: Double = 2.0,
+    val maxEstimateRmsResidualDiameterFraction: Double? = null,
     val minTimeSpreadSecondsSquared: Double = 1.0e-6,
     val maxOutlierPasses: Int = 1,
     val minOutlierRmsImprovementPx: Double = 0.5,
@@ -46,6 +48,7 @@ data class VisualEstimatePipelineConfig(
     val minimumSpeedGatePolicy: MinimumSpeedGatePolicy = MinimumSpeedGatePolicy.ALL_TRUSTED_SCALE,
     val scaleMode: VisualEstimateScaleMode = VisualEstimateScaleMode.SamePlane,
     val levelReference: LevelReferenceSnapshot? = null,
+    val launchHeightFeet: Double = 4.0,
 )
 
 /** Scale-plane model used before converting visual pixels per second to mph. */
@@ -58,7 +61,7 @@ sealed interface VisualEstimateScaleMode {
      *
      * Depths are measured from camera to the ball travel plane and calibration
      * plane. Monocular video cannot verify these entries or recover toward/away
-     * speed, so this mode is always LOW confidence.
+     * speed, so this mode caps otherwise strong track confidence at MEDIUM.
      */
     data class DepthCorrected(
         val ballPlaneDepthFeet: Double,
@@ -163,12 +166,13 @@ object VisualEstimatePipeline {
                 yPx = it.yPx,
             )
         }
+        val maxRmsResidualPx = effectiveMaxRmsResidualPx(samples, config)
         val measurement = when (
             val outcome = VelocityMeasurementCalculator.measure(
                 detections = detections,
                 pixelsPerFoot = scale.pixelsPerFoot,
                 options = MeasurementOptions(
-                    maxRmsResidualPx = config.maxEstimateRmsResidualPx,
+                    maxRmsResidualPx = maxRmsResidualPx,
                     minTimeSpreadSecondsSquared = config.minTimeSpreadSecondsSquared,
                     maxOutlierPasses = config.maxOutlierPasses,
                     minOutlierRmsImprovementPx = config.minOutlierRmsImprovementPx,
@@ -223,7 +227,7 @@ object VisualEstimatePipeline {
             timingBasis = timingBasis,
             timestampGapSummary = gapSummary,
             fitResidualPx = measurement.fit.rmsResidualPx,
-            confidence = confidenceFor(samples.size, gapSummary, measurement.fit.rmsResidualPx, config, intervalCoherence, scale.basis),
+            confidence = confidenceFor(samples.size, gapSummary, measurement.fit.rmsResidualPx, maxRmsResidualPx, intervalCoherence, scale.basis),
             scaleBasis = scale.basis,
             levelReference = config.levelReference,
             assumptions = assumptionsFor(timingBasis, scale.basis, config.levelReference),
@@ -247,6 +251,7 @@ object VisualEstimatePipeline {
                 levelReference = config.levelReference,
             ),
             diagnostics = diagnostics,
+            launchHeightFeet = config.launchHeightFeet,
         )
     }
 }
@@ -372,10 +377,10 @@ private fun applyScaleMode(
                 pixelsPerFoot = correctedPixelsPerFoot,
                 basis = EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION,
                 warnings = buildList {
-                    add("LOW confidence: depth-corrected scale uses user-entered camera-to-plane depths.")
+                    add("Depth-corrected scale uses user-entered camera-to-plane depths.")
                     add("Depth correction factor=${correctionFactor.formatScaleWarning()}.")
                     if (correctionFactor < LOW_CONFIDENCE_DEPTH_SCALE_FACTOR_FLOOR || correctionFactor > LOW_CONFIDENCE_DEPTH_SCALE_FACTOR_CEILING) {
-                        add("LOW confidence: depth correction factor is far from same-plane calibration.")
+                        add("Depth correction factor is far from same-plane calibration.")
                     }
                 },
             )
@@ -524,6 +529,11 @@ private fun validateConfig(config: VisualEstimatePipelineConfig): VisualEstimate
     if (!config.maxEstimateRmsResidualPx.isFinite() || config.maxEstimateRmsResidualPx <= 0.0) {
         return configNoRead("Estimate residual threshold must be finite and positive.")
     }
+    config.maxEstimateRmsResidualDiameterFraction?.let {
+        if (!it.isFinite() || it <= 0.0) {
+            return configNoRead("Estimate diameter-scaled residual threshold must be finite and positive.")
+        }
+    }
     if (!config.minTimeSpreadSecondsSquared.isFinite() || config.minTimeSpreadSecondsSquared <= 0.0) {
         return configNoRead("Estimate minimum time spread must be finite and positive.")
     }
@@ -616,9 +626,9 @@ private fun scaleChangeCheck(
     val ratio = (diameters.maxOrNull() ?: return ScaleChangeCheck.None) /
         (diameters.minOrNull() ?: return ScaleChangeCheck.None)
     if (ratio > config.maxApparentScaleChangeRatio) {
-        if (config.allowApparentScaleChangeEstimate && scaleBasis == EstimateScaleBasis.BALL_DIAMETER_SELF_CALIBRATION) {
+        if (config.allowApparentScaleChangeEstimate) {
             return ScaleChangeCheck.Warning(
-                "LOW confidence: apparent ball size changed across the track; entered ball diameter scale is an estimate.",
+                "Apparent blob size varied across the track; accepted because the full trajectory/timing fit remained coherent.",
             )
         }
         return ScaleChangeCheck.Failure(
@@ -709,22 +719,38 @@ private fun confidenceFor(
     frameCount: Int,
     gapSummary: TimestampGapSummary,
     residualPx: Double,
-    config: VisualEstimatePipelineConfig,
+    maxRmsResidualPx: Double,
     intervalCoherence: IntervalCoherenceOutcome,
     scaleBasis: EstimateScaleBasis,
 ): VisualEstimateConfidence =
-    if (scaleBasis == EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION) {
-        VisualEstimateConfidence.LOW
-    } else when {
+    when {
         intervalCoherence is IntervalCoherenceOutcome.Coalesced -> VisualEstimateConfidence.LOW
         frameCount >= 6 &&
             gapSummary.maxToMedianRatio <= 1.25 &&
-            residualPx <= config.maxEstimateRmsResidualPx * 0.5 -> VisualEstimateConfidence.HIGH
+            residualPx <= maxRmsResidualPx * 0.5 -> {
+                if (scaleBasis == EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION) {
+                    VisualEstimateConfidence.MEDIUM
+                } else {
+                    VisualEstimateConfidence.HIGH
+                }
+            }
         frameCount >= 5 &&
             gapSummary.maxToMedianRatio <= 1.75 &&
-            residualPx <= config.maxEstimateRmsResidualPx * 0.75 -> VisualEstimateConfidence.MEDIUM
+            residualPx <= maxRmsResidualPx * 0.75 -> VisualEstimateConfidence.MEDIUM
         else -> VisualEstimateConfidence.LOW
     }
+
+private fun effectiveMaxRmsResidualPx(
+    samples: List<VisualEstimateTrackSample>,
+    config: VisualEstimatePipelineConfig,
+): Double {
+    val fraction = config.maxEstimateRmsResidualDiameterFraction ?: return config.maxEstimateRmsResidualPx
+    val medianDiameter = samples.mapNotNull { it.apparentDiameterPx }
+        .filter { it.isFinite() && it > 0.0 }
+        .median()
+    val diameterScaled = medianDiameter * fraction
+    return max(config.maxEstimateRmsResidualPx, diameterScaled)
+}
 
 private fun shouldApplyMinimumSpeedGate(
     policy: MinimumSpeedGatePolicy,

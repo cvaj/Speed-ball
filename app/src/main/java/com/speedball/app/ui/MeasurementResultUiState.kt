@@ -7,6 +7,7 @@ import com.speedball.app.measurement.VisualEstimateCaptureProof
 import com.speedball.app.measurement.VisualEstimateNoReadReason
 import com.speedball.app.measurement.VisualEstimateOutcome
 import com.speedball.core.physics.LaunchState
+import com.speedball.core.physics.MagnusSpinSpec
 import com.speedball.core.physics.TrajectoryOutcome
 import com.speedball.core.physics.TrajectoryPhysics
 
@@ -153,7 +154,7 @@ private fun VisualEstimateCaptureProof?.reportLinesFor(kind: VisualEstimateRepor
         if (proof.capturedFrameCount == 0) {
             add("EVIDENCE 0 frames captured")
         } else if (summary.candidateFrameCount == 0 && kind != VisualEstimateReportKind.Success) {
-            add("EVIDENCE selected color/ROI matched no blobs")
+            add("EVIDENCE it appears there are no moving ball blobs in the camera frame view")
         }
     }
     return if (kind == VisualEstimateReportKind.Success) {
@@ -167,7 +168,7 @@ private fun successUiLines(outcome: MeasurementRunOutcome.Success): List<String>
     listOf(
         "result=success evidence=${outcome.timingProof.evidenceLabel.compactForResult()} detections=${outcome.detectionCount}",
         "speed mph=${outcome.measurement.milesPerHour.formatResult(1)} angleDeg=${outcome.measurement.launchAngleDegrees.formatResult(1)}",
-        "trajectory carryFt=${(outcome.trajectory.carryMeters * FEET_PER_METER).formatResult(1)} apexFt=${(outcome.trajectory.apexMeters * FEET_PER_METER).formatResult(1)} hangSec=${outcome.trajectory.hangTimeSeconds.formatResult(2)}",
+        "trajectory carryFt=${(outcome.trajectory.carryMeters * FEET_PER_METER).formatResult(1)} backspinCarryFt=${measurementBackspinCarryFeet(outcome)?.formatResult(1) ?: "na"} spinRpm=${ASSUMED_LEVEL_SWING_BACKSPIN_RPM.formatResult(0)} apexFt=${(outcome.trajectory.apexMeters * FEET_PER_METER).formatResult(1)} hangSec=${outcome.trajectory.hangTimeSeconds.formatResult(2)}",
     )
 
 private fun estimateSuccessUiLines(outcome: VisualEstimateOutcome.Success): List<String> {
@@ -176,11 +177,13 @@ private fun estimateSuccessUiLines(outcome: VisualEstimateOutcome.Success): List
     val residual = diagnostics.fitResidualPx?.formatResult(2) ?: "na"
     val assumption = diagnostics.assumptions.joinToString(separator = " ").compactForResult()
     val angle = outcome.launchAngleDegrees?.formatResult(1) ?: "na"
-    val carryFeet = estimateCarryFeet(outcome)?.formatResult(1) ?: "na"
+    val carryRange = estimateCarryFeet(outcome)
+    val carryFeet = carryRange?.dragOnlyFeet?.formatResult(1) ?: "na"
+    val backspinCarryFeet = carryRange?.backspinFeet?.formatResult(1) ?: "na"
     return buildList {
         add("result=estimate confidence=${diagnostics.confidence} frames=${diagnostics.frameCount} detections=${diagnostics.detectionCount} timing=${diagnostics.timingBasis} scale=${diagnostics.scaleBasis}")
         add("speed-estimate mph=${outcome.milesPerHour.formatResult(1)} angleDeg=$angle angleScope=in-image-plane-estimate")
-        add("distance-estimate carryFt=$carryFeet")
+        add("distance-estimate carryFt=$carryFeet backspinCarryFt=$backspinCarryFeet spinRpm=${ASSUMED_LEVEL_SWING_BACKSPIN_RPM.formatResult(0)} spinModel=assumed-level-swing-backspin")
         add("estimate-diagnostics timestampGapMaxToMedian=$gapRatio residualPx=$residual assumption=$assumption")
         diagnostics.assumptions.forEach { assumptionLine ->
             add("estimate-assumption ${assumptionLine.compactForResult()}")
@@ -195,21 +198,48 @@ private fun estimateSuccessReportLines(outcome: VisualEstimateOutcome.Success): 
             add("ANGLE ${it.formatResult(1)} DEG")
         }
         estimateCarryFeet(outcome)?.let {
-            add("DISTANCE ${it.formatResult(1)} FT")
+            add("DISTANCE ${it.dragOnlyFeet.formatResult(1)} FT")
+            add("BACKSPIN DISTANCE ${it.backspinFeet.formatResult(1)} FT")
         }
     }
 
-private fun estimateCarryFeet(outcome: VisualEstimateOutcome.Success): Double? {
+private data class CarryRangeFeet(
+    val dragOnlyFeet: Double,
+    val backspinFeet: Double,
+)
+
+private fun estimateCarryFeet(outcome: VisualEstimateOutcome.Success): CarryRangeFeet? {
     val angle = outcome.launchAngleDegrees?.takeIf { it.isFinite() } ?: return null
-    val trajectory = TrajectoryPhysics.simulate(
+    return carryRangeFeet(
         LaunchState.fromMilesPerHour(
             milesPerHour = outcome.milesPerHour,
             angleDegrees = angle,
+            launchHeightMeters = outcome.launchHeightFeet / FEET_PER_METER,
         ),
     )
-    return when (trajectory) {
-        is TrajectoryOutcome.Success -> trajectory.trajectory.carryMeters * FEET_PER_METER
-        is TrajectoryOutcome.Failure -> null
+}
+
+private fun measurementBackspinCarryFeet(outcome: MeasurementRunOutcome.Success): Double? =
+    carryRangeFeet(
+        LaunchState.fromMilesPerHour(
+            milesPerHour = outcome.measurement.milesPerHour,
+            angleDegrees = outcome.measurement.launchAngleDegrees,
+        ),
+    )?.backspinFeet
+
+private fun carryRangeFeet(launch: LaunchState): CarryRangeFeet? {
+    val dragOnly = TrajectoryPhysics.simulate(launch)
+    val backspin = TrajectoryPhysics.simulate(
+        launch = launch,
+        spin = MagnusSpinSpec.assumedLevelSwingBackspin(ASSUMED_LEVEL_SWING_BACKSPIN_RPM),
+    )
+    return if (dragOnly is TrajectoryOutcome.Success && backspin is TrajectoryOutcome.Success) {
+        CarryRangeFeet(
+            dragOnlyFeet = dragOnly.trajectory.carryMeters * FEET_PER_METER,
+            backspinFeet = backspin.trajectory.carryMeters * FEET_PER_METER,
+        )
+    } else {
+        null
     }
 }
 
@@ -256,3 +286,4 @@ private fun Double.formatResult(decimals: Int): String =
 
 private const val MAX_RESULT_MESSAGE_CHARS = 120
 private const val FEET_PER_METER = 3.280839895013123
+private const val ASSUMED_LEVEL_SWING_BACKSPIN_RPM = 1800.0

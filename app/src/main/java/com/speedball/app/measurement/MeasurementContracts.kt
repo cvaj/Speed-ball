@@ -187,23 +187,26 @@ sealed interface VisualEstimateOutcome {
         val milesPerHour: Double,
         val launchAngleDegrees: Double?,
         val diagnostics: VisualEstimateDiagnostics,
+        val launchHeightFeet: Double,
     ) : VisualEstimateOutcome {
         override fun equals(other: Any?): Boolean =
             this === other ||
                 other is Success &&
                 milesPerHour == other.milesPerHour &&
                 launchAngleDegrees == other.launchAngleDegrees &&
-                diagnostics == other.diagnostics
+                diagnostics == other.diagnostics &&
+                launchHeightFeet == other.launchHeightFeet
 
         override fun hashCode(): Int {
             var result = milesPerHour.hashCode()
             result = 31 * result + (launchAngleDegrees?.hashCode() ?: 0)
             result = 31 * result + diagnostics.hashCode()
+            result = 31 * result + launchHeightFeet.hashCode()
             return result
         }
 
         override fun toString(): String =
-            "Success(milesPerHour=$milesPerHour, launchAngleDegrees=$launchAngleDegrees, diagnostics=$diagnostics)"
+            "Success(milesPerHour=$milesPerHour, launchAngleDegrees=$launchAngleDegrees, diagnostics=$diagnostics, launchHeightFeet=$launchHeightFeet)"
     }
 
     data class NoRead(
@@ -219,12 +222,14 @@ object VisualEstimateResultFactory {
         milesPerHour: Double,
         launchAngleDegrees: Double?,
         diagnostics: VisualEstimateDiagnostics,
+        launchHeightFeet: Double = 4.0,
     ): VisualEstimateOutcome {
-        validateSuccessFields(milesPerHour, launchAngleDegrees, diagnostics)?.let { return it }
+        validateSuccessFields(milesPerHour, launchAngleDegrees, diagnostics, launchHeightFeet)?.let { return it }
         return VisualEstimateOutcome.Success(
             milesPerHour = milesPerHour,
             launchAngleDegrees = launchAngleDegrees,
             diagnostics = diagnostics,
+            launchHeightFeet = launchHeightFeet,
         )
     }
 }
@@ -233,11 +238,12 @@ private fun validateSuccessFields(
     milesPerHour: Double,
     launchAngleDegrees: Double?,
     diagnostics: VisualEstimateDiagnostics,
+    launchHeightFeet: Double,
 ): VisualEstimateOutcome.NoRead? {
-    if (!milesPerHour.isFinite() || milesPerHour < 0.0 || launchAngleDegrees?.isFinite() == false) {
+    if (!milesPerHour.isFinite() || milesPerHour < 0.0 || launchAngleDegrees?.isFinite() == false || !launchHeightFeet.isFinite() || launchHeightFeet < 0.0) {
         return VisualEstimateOutcome.NoRead(
             reason = VisualEstimateNoReadReason.NON_FINITE_RESULT,
-            message = "Estimate produced a non-finite speed or angle.",
+            message = "Estimate produced a non-finite speed, angle, or launch height.",
             diagnostics = diagnostics,
         )
     }

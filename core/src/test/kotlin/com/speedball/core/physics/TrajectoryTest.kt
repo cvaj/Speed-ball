@@ -15,6 +15,8 @@ class TrajectoryTest {
         assertEquals(0.1899, BallSpec.softball12Inch().massKilograms, 0.0)
         assertEquals(1.225, AirSpec.standardSeaLevel().densityKgPerCubicMeter, 0.0)
         assertEquals(0.40, AirSpec.standardSeaLevel().dragCoefficient, 0.0)
+        assertEquals(0.0, MagnusSpinSpec.none().transverseSpinRpm, 0.0)
+        assertEquals(1800.0, MagnusSpinSpec.assumedLevelSwingBackspin().transverseSpinRpm, 0.0)
         assertEquals(0.001, TrajectoryOptions.default().timeStepSeconds, 0.0)
         assertEquals(15.0, TrajectoryOptions.default().maxFlightSeconds, 0.0)
         assertEquals(9.81, TrajectoryOptions.default().gravityMetersPerSecondSquared, 0.0)
@@ -35,6 +37,7 @@ class TrajectoryTest {
         assertEquals(TrajectoryFailure.INVALID_BALL, assertFailure(TrajectoryPhysics.simulate(validLaunch(), ball = BallSpec(0.0, 0.1899))).reason)
         assertEquals(TrajectoryFailure.INVALID_AIR, assertFailure(TrajectoryPhysics.simulate(validLaunch(), air = AirSpec(Double.NaN, 0.40))).reason)
         assertEquals(TrajectoryFailure.INVALID_OPTIONS, assertFailure(TrajectoryPhysics.simulate(validLaunch(), options = options.copy(timeStepSeconds = 0.0))).reason)
+        assertEquals(TrajectoryFailure.INVALID_AIR, assertFailure(TrajectoryPhysics.simulate(validLaunch(), spin = MagnusSpinSpec(Double.NaN))).reason)
     }
 
     @Test
@@ -149,6 +152,57 @@ class TrajectoryTest {
         assertTrue(highDrag.carryMeters < standardDrag.carryMeters)
         assertTrue(standardDrag.samples.isNotEmpty())
         assertTrue(standardDrag.samples.all { it.timeSeconds.isFinite() && it.xMeters.isFinite() && it.yMeters.isFinite() })
+    }
+
+    @Test
+    fun zeroSpinExactlyPreservesDragOnlyTrajectory() {
+        val implicitNoSpin = assertSuccess(TrajectoryPhysics.simulate(validLaunch(), options = options))
+        val explicitNoSpin = assertSuccess(TrajectoryPhysics.simulate(validLaunch(), spin = MagnusSpinSpec.none(), options = options))
+
+        assertEquals(implicitNoSpin.carryMeters, explicitNoSpin.carryMeters, 0.0)
+        assertEquals(implicitNoSpin.apexMeters, explicitNoSpin.apexMeters, 0.0)
+        assertEquals(implicitNoSpin.hangTimeSeconds, explicitNoSpin.hangTimeSeconds, 0.0)
+    }
+
+    @Test
+    fun backspinMagnusTrajectoryExtendsCarryAndTopspinShortensIt() {
+        val dragOnly = assertSuccess(TrajectoryPhysics.simulate(validLaunch(), options = options))
+        val backspin = assertSuccess(
+            TrajectoryPhysics.simulate(
+                launch = validLaunch(),
+                spin = MagnusSpinSpec.assumedLevelSwingBackspin(transverseSpinRpm = 1800.0),
+                options = options,
+            ),
+        )
+        val topspin = assertSuccess(
+            TrajectoryPhysics.simulate(
+                launch = validLaunch(),
+                spin = MagnusSpinSpec(transverseSpinRpm = -1800.0),
+                options = options,
+            ),
+        )
+
+        assertTrue(backspin.carryMeters > dragOnly.carryMeters, "backspin=${backspin.carryMeters} dragOnly=${dragOnly.carryMeters}")
+        assertTrue(backspin.apexMeters > dragOnly.apexMeters, "backspin=${backspin.apexMeters} dragOnly=${dragOnly.apexMeters}")
+        assertTrue(backspin.hangTimeSeconds > dragOnly.hangTimeSeconds, "backspin=${backspin.hangTimeSeconds} dragOnly=${dragOnly.hangTimeSeconds}")
+        assertTrue(topspin.carryMeters < dragOnly.carryMeters, "topspin=${topspin.carryMeters} dragOnly=${dragOnly.carryMeters}")
+    }
+
+    @Test
+    fun magnusLiftDisappearsWhenAirDensityIsZero() {
+        val noAirNoSpin = assertSuccess(TrajectoryPhysics.simulate(validLaunch(), air = AirSpec(0.0, 0.40), options = options))
+        val noAirBackspin = assertSuccess(
+            TrajectoryPhysics.simulate(
+                launch = validLaunch(),
+                air = AirSpec(0.0, 0.40),
+                spin = MagnusSpinSpec.assumedLevelSwingBackspin(),
+                options = options,
+            ),
+        )
+
+        assertEquals(noAirNoSpin.carryMeters, noAirBackspin.carryMeters, 0.0)
+        assertEquals(noAirNoSpin.apexMeters, noAirBackspin.apexMeters, 0.0)
+        assertEquals(noAirNoSpin.hangTimeSeconds, noAirBackspin.hangTimeSeconds, 0.0)
     }
 
     @Test

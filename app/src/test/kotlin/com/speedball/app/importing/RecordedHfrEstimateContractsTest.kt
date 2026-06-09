@@ -107,7 +107,7 @@ class RecordedHfrEstimateContractsTest {
             decodedWindowFrameCount = 24,
             requestedWindowFrameCount = 24,
             minUsableFrameCount = 4,
-            diagnostics = diagnosticsWithUniqueCount(count = 400, gapMillis = 8.33),
+            diagnostics = diagnosticsWithUniqueCount(count = 40, gapMillis = 8.33),
             metadata = metadata(sampleCount = 325),
             windowStartUs = 1_000_000,
             windowEndUs = 1_200_000,
@@ -125,7 +125,8 @@ class RecordedHfrEstimateContractsTest {
         ).value)
         assertEquals(325, proof.metadataSampleCount)
         assertEquals(24, proof.decodedWindowFrameCount)
-        assertEquals(400, proof.uniqueSensorTimestampCount)
+        assertEquals(40, proof.uniqueSensorTimestampCount)
+        assertFalse(proof.captureProofPasses)
         assertEquals("PASS", proof.windowVerdict)
         assertEquals("PASS", proof.cadenceVerdict)
     }

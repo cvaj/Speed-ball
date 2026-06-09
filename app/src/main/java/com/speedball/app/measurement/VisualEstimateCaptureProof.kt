@@ -282,7 +282,13 @@ object VisualEstimateCaptureProofBuilder {
             )
         }
         val traceByFrameIndex = trace.frames.associateBy { it.frameIndex }
-        val selectedIndices = selectProofFrameIndices(frames.size, maxProofFrames)
+        val selectedTrackIndices = trace.frames
+            .filter { it.selectedBlob != null }
+            .map { it.frameIndex }
+            .filter { it in frames.indices }
+        val selectedIndices = (selectedTrackIndices + selectProofFrameIndices(frames.size, maxProofFrames))
+            .distinct()
+            .take(maxProofFrames)
             .filter { traceByFrameIndex.containsKey(it) }
         return VisualEstimateCaptureProof(
             attemptId = attemptId,

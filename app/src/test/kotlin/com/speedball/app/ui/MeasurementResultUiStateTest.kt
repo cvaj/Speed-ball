@@ -7,7 +7,9 @@ import com.speedball.app.measurement.EstimateScaleBasis
 import com.speedball.app.measurement.EstimateTimingBasis
 import com.speedball.app.measurement.TimestampGapSummary
 import com.speedball.app.measurement.VisualEstimateConfidence
+import com.speedball.app.measurement.VisualEstimateCaptureProof
 import com.speedball.app.measurement.VisualEstimateDiagnostics
+import com.speedball.app.measurement.VisualEstimateDetectorSummary
 import com.speedball.app.measurement.VisualEstimateNoReadReason
 import com.speedball.app.measurement.VisualEstimateOutcome
 import com.speedball.app.measurement.VisualEstimateResultFactory
@@ -51,6 +53,8 @@ class MeasurementResultUiStateTest {
         assertTrue(joined.contains("angleDeg=12.0"))
         assertTrue(joined.contains("trajectory"))
         assertTrue(joined.contains("carryFt=328.1"))
+        assertTrue(joined.contains("backspinCarryFt="))
+        assertTrue(joined.contains("spinRpm=1800"))
         assertTrue(joined.contains("apexFt=39.4"))
         assertTrue(joined.contains("hangSec=3.00"))
     }
@@ -84,7 +88,10 @@ class MeasurementResultUiStateTest {
         assertTrue(joined.contains("scale=DISTANCE_CALIBRATION"))
         assertTrue(joined.contains("speed-estimate mph=68.2"))
         assertTrue(joined.contains("angleScope=in-image-plane-estimate"))
-        assertTrue(joined.contains("distance-estimate carryFt=0.0"))
+        assertTrue(joined.contains("distance-estimate carryFt="))
+        assertTrue(joined.contains("backspinCarryFt="))
+        assertTrue(joined.contains("spinModel=assumed-level-swing-backspin"))
+        assertFalse(joined.contains("distance-estimate carryFt=0.0"))
         assertTrue(joined.contains("timestampGapMaxToMedian=2.00"))
         assertTrue(joined.contains("residualPx=1.25"))
         assertTrue(joined.contains("calibrated image plane"))
@@ -210,6 +217,51 @@ class MeasurementResultUiStateTest {
     }
 
     @Test
+    fun zeroCandidateProofExplainsBallLikelyWasOutsideCameraView() {
+        val proof = VisualEstimateCaptureProof(
+            attemptId = 12L,
+            capturedFrameCount = 24,
+            frameAvailableCallbackCount = 24,
+            captureResultCallbackCount = 24,
+            uniqueSensorTimestampCount = 24,
+            readbackWidth = 640,
+            readbackHeight = 360,
+            detectorSummary = VisualEstimateDetectorSummary(
+                processedFrameCount = 24,
+                candidateFrameCount = 0,
+                candidateBlobCount = 0,
+                selectedSampleCount = 0,
+                noReadReason = VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
+                noReadMessage = "It appears there are no moving ball blobs in the camera frame view.",
+            ),
+            frames = emptyList(),
+            sourceKind = "RECORDED_HFR",
+            sourceWidth = 1280,
+            sourceHeight = 720,
+            workingWidth = 640,
+            workingHeight = 360,
+            decodedFrameCount = 24,
+            requestedFps = 120,
+            dropGateVerdict = "PASS",
+            cadenceGateVerdict = "PASS",
+        )
+        val report = visualEstimateReportFor(
+            attemptId = 12L,
+            outcome = VisualEstimateOutcome.NoRead(
+                reason = VisualEstimateNoReadReason.INSUFFICIENT_DETECTIONS,
+                message = "It appears there are no moving ball blobs in the camera frame view.",
+            ),
+            captureProof = proof,
+        )
+        val joined = requireNotNull(report).lines.joinToString("\n")
+
+        assertTrue(joined.contains("MESSAGE It appears there are no moving ball blobs in the camera frame view."))
+        assertTrue(joined.contains("EVIDENCE it appears there are no moving ball blobs in the camera frame view"))
+        assertFalse(joined.contains("selected color/ROI matched no blobs"))
+        assertNoResultValues(joined)
+    }
+
+    @Test
     fun visualEstimateSuccessReportContainsOnlyTypedSuccessValues() {
         val outcome = VisualEstimateResultFactory.successOrNoRead(
             milesPerHour = 68.18182,
@@ -236,6 +288,7 @@ class MeasurementResultUiStateTest {
         assertTrue(report.attemptId == 9L)
         assertTrue(joined.contains("VELOCITY 68.2 MPH"))
         assertTrue(joined.contains("ANGLE 12.0 DEG"))
+        assertTrue(joined.contains("BACKSPIN DISTANCE"))
         assertTrue(report.dismissToken.startsWith("visual-estimate-report-attempt-"))
     }
 

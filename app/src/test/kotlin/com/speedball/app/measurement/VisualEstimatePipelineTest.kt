@@ -86,6 +86,43 @@ class VisualEstimatePipelineTest {
     }
 
     @Test
+    fun blurredBlobResidualUsesDiameterScaledCentroidTolerance() {
+        val blurredTrack = listOf(
+            sample(0.00, 0.0, yPx = 0.0, diameter = 20.0),
+            sample(0.01, 20.0, yPx = 4.0, diameter = 20.0),
+            sample(0.02, 40.0, yPx = -4.0, diameter = 20.0),
+            sample(0.03, 60.0, yPx = 4.0, diameter = 20.0),
+            sample(0.04, 80.0, yPx = 0.0, diameter = 20.0),
+        )
+
+        assertNoRead(
+            VisualEstimatePipeline.estimate(
+                samples = blurredTrack,
+                calibration = validCalibration(),
+                config = VisualEstimatePipelineConfig(
+                    maxEstimateRmsResidualPx = 2.0,
+                    maxOutlierPasses = 0,
+                ),
+            ),
+            VisualEstimateNoReadReason.EXCESSIVE_RESIDUAL,
+        )
+
+        val scaled = VisualEstimatePipeline.estimate(
+            samples = blurredTrack,
+            calibration = validCalibration(),
+            config = VisualEstimatePipelineConfig(
+                maxEstimateRmsResidualPx = 2.0,
+                maxEstimateRmsResidualDiameterFraction = 0.35,
+                maxOutlierPasses = 0,
+            ),
+        )
+
+        val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, scaled)
+        assertTrue(success.diagnostics.fitResidualPx ?: 0.0 > 2.0)
+        assertTrue(success.diagnostics.confidence != null)
+    }
+
+    @Test
     fun stationaryLaunchReferenceIsTrimmedBeforeVelocityFit() {
         val outcome = VisualEstimatePipeline.estimate(
             samples = listOf(
@@ -252,7 +289,7 @@ class VisualEstimatePipelineTest {
     }
 
     @Test
-    fun ballDiameterEstimateCanWarnInsteadOfNoReadOnApparentScaleChange() {
+    fun apparentScaleChangeDoesNotStandaloneFailWhenTrackIsOtherwiseCoherent() {
         val outcome = VisualEstimatePipeline.estimate(
             samples = listOf(
                 sample(0.0, 0.0, diameter = 8.0),
@@ -260,27 +297,28 @@ class VisualEstimatePipelineTest {
                 sample(0.2, 20.0, diameter = 14.0),
                 sample(0.3, 30.0, diameter = 16.0),
             ),
-            calibration = MeasurementCalibrationState(pointA = null, pointB = null, knownDistanceFeet = null),
+            calibration = validCalibration(),
             config = VisualEstimatePipelineConfig(
-                knownBallDiameterFeet = 3.8 / 12.0,
                 allowApparentScaleChangeEstimate = true,
             ),
         )
 
         val success = assertInstanceOf(VisualEstimateOutcome.Success::class.java, outcome)
-        assertEquals(VisualEstimateConfidence.LOW, success.diagnostics.confidence)
-        assertTrue(success.diagnostics.warnings.any { it.contains("apparent ball size") })
-        assertTrue(success.diagnostics.assumptions.any { it.contains("entered ball diameter") })
+        assertTrue(success.diagnostics.warnings.any { it.contains("Apparent blob size varied") })
+        assertTrue(success.milesPerHour > 0.0)
     }
 
     @Test
-    fun depthCorrectedScaleAppliesPerspectiveRatioAndReportsLowConfidence() {
+    fun depthCorrectedScaleAppliesPerspectiveRatioAndCapsStrongTrackConfidence() {
+        val strongTrack = List(6) { index ->
+            sample(timestampSeconds = index * 0.1, xPx = index * 10.0)
+        }
         val samePlane = VisualEstimatePipeline.estimate(
-            samples = cleanSamples(),
+            samples = strongTrack,
             calibration = calibration(pixels = 10.0, feet = 10.0),
         )
         val depthCorrected = VisualEstimatePipeline.estimate(
-            samples = cleanSamples(),
+            samples = strongTrack,
             calibration = calibration(pixels = 10.0, feet = 10.0),
             config = VisualEstimatePipelineConfig(
                 scaleMode = VisualEstimateScaleMode.DepthCorrected(
@@ -294,7 +332,7 @@ class VisualEstimatePipelineTest {
         val correctedSuccess = assertInstanceOf(VisualEstimateOutcome.Success::class.java, depthCorrected)
         assertEquals(samePlaneSuccess.milesPerHour / 7.0, correctedSuccess.milesPerHour, 0.0001)
         assertEquals(EstimateScaleBasis.DEPTH_CORRECTED_DISTANCE_CALIBRATION, correctedSuccess.diagnostics.scaleBasis)
-        assertEquals(VisualEstimateConfidence.LOW, correctedSuccess.diagnostics.confidence)
+        assertEquals(VisualEstimateConfidence.MEDIUM, correctedSuccess.diagnostics.confidence)
         assertTrue(correctedSuccess.diagnostics.assumptions.any { it.contains("Depth-corrected scale") })
         assertTrue(correctedSuccess.diagnostics.assumptions.any { it.contains("toward-or-away") })
         assertTrue(correctedSuccess.diagnostics.warnings.any { it.contains("factor=7.000") })

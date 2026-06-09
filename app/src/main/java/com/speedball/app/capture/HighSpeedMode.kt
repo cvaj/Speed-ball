@@ -23,11 +23,17 @@ data class RawHighSpeedRange(
     val upperFps: Int,
 )
 
-/** User/request options for a bounded high-speed burst. */
+/**
+ * User/request options for a bounded high-speed burst.
+ *
+ * `preferredExposureTimeNanos` requests manual exposure immediately. `maxAutoExposureTimeNanos`
+ * starts with AE, then caps the repeating request only if reported AE exposure is slower.
+ */
 data class BurstOptions(
     val mode: HighSpeedMode,
     val durationMillis: Long = DEFAULT_BURST_DURATION_MILLIS,
     val preferredExposureTimeNanos: Long? = null,
+    val maxAutoExposureTimeNanos: Long? = null,
     val companionSurfaceMode: BurstCompanionSurfaceMode = BurstCompanionSurfaceMode.VISIBLE_PREVIEW,
     val stopMode: BurstStopMode = BurstStopMode.FixedDuration,
     val onFirstFrameAnchor: ((BurstFrameAnchor) -> Unit)? = null,

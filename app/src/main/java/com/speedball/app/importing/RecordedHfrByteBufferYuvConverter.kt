@@ -81,6 +81,56 @@ object RecordedHfrByteBufferYuvConverter {
         )
     }
 
+    fun convertLuma(
+        buffer: ByteBuffer,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        colorFormat: Int,
+        stride: Int,
+        sliceHeight: Int,
+    ): ImportValidationResult<IntArray> {
+        if (
+            sourceWidth <= 0 ||
+            sourceHeight <= 0 ||
+            targetWidth <= 0 ||
+            targetHeight <= 0 ||
+            stride < sourceWidth ||
+            sliceHeight < sourceHeight
+        ) {
+            return noRead("Recorded-HFR byte-buffer YUV layout metadata is invalid.")
+        }
+        val layout = when (colorFormat) {
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar -> YuvLayout.I420
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar,
+            QCOM_YUV420_SEMIPLANAR,
+            -> YuvLayout.NV12
+            else -> return noRead("Recorded-HFR decoder output color format is unsupported: $colorFormat.")
+        }
+        val requiredCapacity = layout.requiredCapacity(stride, sliceHeight)
+        if (requiredCapacity <= 0 || buffer.capacity() < requiredCapacity) {
+            return noRead(
+                "Recorded-HFR decoder output buffer is too small for reported layout: " +
+                    "capacity=${buffer.capacity()} required=$requiredCapacity stride=$stride sliceHeight=$sliceHeight.",
+            )
+        }
+        val luma = IntArray(targetWidth * targetHeight)
+        for (targetY in 0 until targetHeight) {
+            val sourceY = min(sourceHeight - 1, (targetY.toLong() * sourceHeight / targetHeight).toInt())
+            for (targetX in 0 until targetWidth) {
+                val sourceX = min(sourceWidth - 1, (targetX.toLong() * sourceWidth / targetWidth).toInt())
+                luma[targetY * targetWidth + targetX] = layout.readLuma(
+                    buffer = buffer,
+                    x = sourceX,
+                    y = sourceY,
+                    stride = stride,
+                )
+            }
+        }
+        return ImportValidationResult.Success(luma)
+    }
+
     private fun yuvToArgb(yValue: Int, uValue: Int, vValue: Int): Int {
         val c = yValue - 16
         val d = uValue - 128
@@ -142,6 +192,8 @@ object RecordedHfrByteBufferYuvConverter {
 
         abstract fun requiredCapacity(stride: Int, sliceHeight: Int): Int
         abstract fun readYuv(buffer: ByteBuffer, x: Int, y: Int, stride: Int, sliceHeight: Int): YuvSample
+        fun readLuma(buffer: ByteBuffer, x: Int, y: Int, stride: Int): Int =
+            buffer.unsigned(y * stride + x)
     }
 
     private data class YuvSample(val y: Int, val u: Int, val v: Int)

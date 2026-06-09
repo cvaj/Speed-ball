@@ -59,6 +59,7 @@ LaunchState + BallSpec + AirSpec + TrajectoryOptions
   -> launch/ball/air/options validation
   -> RK4 projectile integration
   -> quadratic drag acceleration
+  -> optional Magnus lift from assumed transverse spin
   -> interpolated y=0 ground crossing
   -> apex/carry/hang summary
   -> TrajectoryOutcome.Success or TrajectoryOutcome.Failure
@@ -66,6 +67,10 @@ LaunchState + BallSpec + AirSpec + TrajectoryOptions
 
 `TrajectoryOutcome.Failure` carries only a reason and message, never partial
 trajectory samples or plausible carry/hang/apex values.
+The default path is unchanged drag-only carry. Result formatting may run a
+second, explicit assumed-backspin simulation with Nathan's spin-parameter lift
+coefficient to show an upper/model-based `backspinCarryFt` next to the
+drag-only `carryFt`; capture, decode, and detector data flow are not involved.
 
 ## Recorded-HFR 120 fps Path
 
@@ -86,15 +91,17 @@ MainActivity
 Camera2 constrained high-speed session
   -> AudioRecord starts first and obtains TIMEBASE_BOOTTIME mic anchor
   -> offscreen companion preview surface + MediaRecorder surface for Run Mode
-  -> auto-exposure by default; explicit manual fast shutter is opt-in
+  -> auto-exposure first; recorded-HFR leaves normal 120 fps AE alone and caps
+     only pathologically slow exposure above 12 ms before Ready
   -> actual CaptureResult SENSOR_EXPOSURE_TIME samples feed diagnostics
   -> first positive capture-result SENSOR_TIMESTAMP anchors the video clock
   -> Ready cue is emitted after both audio and video anchors exist
   -> actual cue completion maps to an audio sample index and enables acceptance
   -> chunk-fed ImpactAudioStreamingDetector scans each finalized audio window once
   -> loud ambient-relative pop/spike is used only as a timestamp marker
-  -> impact marker maps to a bounded container-PTS decode window
-  -> recorder stops after the 200 ms post-impact capture window
+  -> impact marker maps to a bounded container-PTS decode window from 1 second
+     before the marker through 1 second after it
+  -> recorder stops after the 1-second post-impact capture window
   -> recorder duration failsafe still caps ExternalStop if no marker arrives
   -> capture callback SENSOR_TIMESTAMP list
   -> BurstDiagnostics unique-count floor + median-gap band
@@ -102,23 +109,33 @@ Camera2 constrained high-speed session
   -> app-owned MP4 is passed directly to recorded estimate processing
   -> redacted metadata and decoded sample count probe
   -> detector working resolution selection, capped at 640x360 for 720p recorded-HFR
-  -> MediaExtractor.seekTo(windowStartUs, CLOSEST_SYNC)
+  -> MediaExtractor.seekTo(windowStartUs, PREVIOUS_SYNC)
   -> MediaCodec.configure(format, null, null, 0) byte-buffer decode
   -> read codec output with getOutputBuffer(), KEY_COLOR_FORMAT, KEY_STRIDE, and KEY_SLICE_HEIGHT
-  -> convert only supported raw YUV layouts; unsupported/opaque output fails loud
-  -> emit only frames inside windowStartUs/windowEndUs
-  -> increment scanned decoded-frame count for every emitted in-window frame
+  -> first source pass converts only low-resolution luma and builds a bounded median-background scout
+  -> source scout selects a high-centroid-travel foreground run with enough
+     mean component area, then pads that detector interval
+  -> if source scout is unsure, fall back to the full bounded window
+  -> reopen MediaCodec from the previous sync sample for the actual detector pass
+  -> drain/count sync-prefix frames and cheap in-window frames before the dense interval without ARGB conversion
+  -> convert only supported raw YUV layouts inside the selected dense interval; unsupported/opaque output fails loud
+  -> increment detector scanned-frame count only for converted dense/full-window frames
   -> compute ROI/full-frame luma/non-dark-pixel source-validity summary and bounded
      source proof thumbnails before detector/reducer no-reads
-  -> retain only bounded impact-window ARGB frames needed for median-background
-     motion detection
+  -> retain only selected dense/full-window ARGB frames needed for median-background motion detection
   -> foreground(frame) = abs(luma(frame) - medianBackground) over the bounded
      working frame or optional ROI
   -> bounded morphology plus connected components emit isolated motion-ball
-     candidates only
-  -> reject no foreground, global lighting/camera motion, merged foreground
-     masses (`BALL_NOT_ISOLATED`), too many isolated moving fragments, oversized
-     components, and over-budget work with fail-loud no-read reasons
+     candidates
+  -> if a moving foreground component is merged with a hand/body/bat, selected
+     ball color can split smaller child candidates inside that moving parent
+  -> rank bounded candidates by optional selected color, preferred configurable
+     long-side/short-side shape ratio, compactness, size, and edge evidence;
+     shape ratio reduces confidence but is not a standalone veto for motion blur
+  -> reducer selects a high-velocity smooth flight path and rejects no
+     foreground, global lighting/camera motion, merged foreground masses
+     (`BALL_NOT_ISOLATED`), oversized components, and over-budget work with
+     fail-loud no-read reasons
   -> discard full-frame ARGB after motion detection
   -> retain only bounded motion candidate blob/index/timestamp records plus
      bounded thumbnails
@@ -126,10 +143,14 @@ Camera2 constrained high-speed session
   -> ImportTimingReconciliation with CONTAINER_PTS_DELTAS from retained window PTS
   -> skip non-hit leading frames, filter tiny speckles, and use RANSAC-style
      consensus to select a short high-velocity one-directional straight
-     motion-ball window
+     motion-ball window with coherent 120 fps timestamp spacing
+  -> recorded-HFR uses the selected RANSAC window directly for the final fit;
+     it does not run a second outlier-pruning pass that can drop a four-sample
+     window below the reporting minimum
   -> VisualEstimateCaptureProofBuilder bounded thumbnails from retained recorded-HFR proof frames
-  -> RecordedHfrWindowCaptureGate proves the full burst plus bounded window integrity
-  -> actual median exposure above 2 ms returns motion-blur-risk no-read, not mph
+  -> RecordedHfrWindowCaptureGate proves bounded window integrity and in-band
+     sensor cadence without requiring full planned-duration sensor count
+  -> actual median exposure above 12 ms returns motion-blur-risk no-read, not mph
   -> VisualEstimateOutcome estimate success or no-read with proof
   -> MeasurementResultUiState.EstimateOutcome UI formatting
   -> SavedResultSummaryStore app-private redacted RECORDED_ESTIMATE summary
@@ -185,13 +206,22 @@ AudioRecord timestamp anchor from getTimestamp(TIMEBASE_BOOTTIME)
      with sensor impact frame index retained as diagnostic only
   -> AndroidRecordedHfrWindowFrameSource seeks by container PTS and decodes a
      bounded MediaCodec window, not the whole clip
+  -> its low-resolution source scout selects a moving dense interval before
+     full ARGB conversion only when the run has enough travel and mean area;
+     weak speck-only runs fall back instead of cropping away the ball, and
+     non-selected frames are drained cheaply and not retained
   -> RecordedHfrWindowCaptureGate accepts a bounded decoded subset while
-     proving capture cadence/source validity and leaving the full-burst gate
-     unchanged for non-windowed paths
+     proving median high-speed cadence/source validity and leaving the
+     full-burst count-equality gate unchanged for non-windowed paths
   -> optional ROI or full-frame 640x360 working region feeds bounded
-     median-background motion candidate generation
-  -> recorded-HFR candidate budget enforces 32 blobs/frame, 90 total blobs,
-     90 RANSAC candidates, and 4096 pair hypotheses
+     median-background motion candidate generation after the low-resolution
+     motion scout has narrowed the heavy detector to the padded moving interval
+  -> selected color may split a ball child out of a larger moving foreground
+     parent before path selection
+  -> recorded-HFR candidate budget enforces 32 blobs/frame, 150 total blobs,
+     90 exhaustive-RANSAC candidates, and 4096 pair hypotheses; candidate-heavy
+     windows skip exhaustive RANSAC and still run the cheap directional
+     centroid-path selector before failing as ambiguous or over-budget
   -> RecordedHfrStreamingEstimate uses CONTAINER_PTS_DELTAS timing mode for
      retained sound-window candidates
   -> VisualEstimateCaptureProof carries window/anchor/decode/source validity
@@ -209,8 +239,9 @@ AudioRecord timestamp anchor from getTimestamp framePosition/nanoTime
      with sensor impact frame index retained as diagnostic only
   -> RecordedHfrWindowFrameSource emits only frames with container PTS inside
      the requested window and enforces maxFrames/strictly increasing PTS
-  -> RecordedHfrWindowCaptureGate accepts a bounded decoded subset while
-     keeping the full-burst scanned==metadata==sensor gate unchanged
+  -> RecordedHfrWindowCaptureGate accepts a bounded decoded subset while using
+     median cadence only for the external-stop window and keeping the
+     full-burst scanned==metadata==sensor gate unchanged
   -> RecordedHfrStreamingEstimate may use CONTAINER_PTS_DELTAS timing mode for
      retained sound-window candidates
   -> VisualEstimateCaptureProof can carry optional window/anchor/decode/source
@@ -279,6 +310,7 @@ TimedFrameSequence
   -> measurement-time DistanceCalibration revalidation
   -> VelocityMeasurementCalculator.measure
   -> TrajectoryPhysics.simulate
+  -> optional display-only backspin TrajectoryPhysics.simulate
   -> MeasurementRunOutcome.Success only when caller supplies MeasurementTimingProof
 ```
 
@@ -301,8 +333,9 @@ optional and falls back to the bounded full-frame working region when it is
 missing or invalid, and treats color as optional post-motion evidence.
 
 The setup drawer button labeled `Est 120` starts the direct visual-estimate
-diagnostic path. Run Mode `Shoot` and the readiness-gated voice command `shoot`
-start the recorded-HFR path above. The direct diagnostic path uses the selected
+diagnostic path. Run Mode `Shoot` and the readiness-gated voice start commands
+`shoot`, `record`, `cheese`, and `smile` start the recorded-HFR path above. The
+direct diagnostic path uses the selected
 fixed 120 fps Camera2 high-speed mode, but it does not create a MediaRecorder
 MP4 or decode a file; it reads app-owned frames through the direct GL/readback
 surface and runs the live estimate pipeline. The setup preview surface is
@@ -334,8 +367,12 @@ recorded frames, or a strict timing-proof token. No-read and failure
 reports use the proof to explain whether zero frames, zero candidates, too few
 candidate frames, too few selected samples, or recorded-source count/cadence
 gates caused the attempt to fail loud.
+For the fixed-camera recorded-HFR detector, zero retained motion candidates are
+reported as no moving ball blobs in the camera frame view, which usually means
+the ball never crossed the visible setup frame.
 On success, estimate result formatting includes speed, launch angle, and a
-carry-distance estimate computed through the existing trajectory simulator.
+carry-distance estimate computed through the existing trajectory simulator using
+the configured setup launch height above ground.
 The camera UI presents those values in a black full-screen result overlay only
 while the current capture status is a successful estimate-complete state. Ready
 states and active capture do not show that result overlay. No-read and direct
@@ -358,14 +395,16 @@ Setup Mode state
      VoiceUnavailable / VoiceError / Capturing / Reporting / SetupInvalid
 ```
 
-Green listening is set only from `onReadyForSpeech` after setup is still valid.
-Speech recognizer `ERROR_NO_MATCH` and `ERROR_SPEECH_TIMEOUT` are idle-listening
-events, so they clear the consecutive-error count and schedule another listen
-window without degrading voice. Other recognizer errors use one delayed restart
-runnable, bounded backoff, and a consecutive-error cap before degrading to
-manual-ready/voice-error state. Manual Run Mode `Shoot` remains available
-whenever setup is valid, including voice unavailable/error/retrying states, but
-voice remains the primary hands-free command path.
+Green listening is set from `onReadyForSpeech` after setup is still valid and
+is retained across idle recognizer cycles. Speech recognizer `ERROR_NO_MATCH`
+and `ERROR_SPEECH_TIMEOUT` are idle-listening events, so they clear the
+consecutive-error count, schedule another listen window, and keep the Run
+command state green `Listening` instead of showing a yellow retry count. Other
+recognizer errors use one delayed restart runnable, bounded backoff, and a
+consecutive-error cap before degrading to manual-ready/voice-error state. Manual
+Run Mode `Shoot` remains available whenever setup is valid, including voice
+unavailable/error/retrying states, but voice remains the primary hands-free
+command path.
 
 ```text
 MainActivity / DirectVisualEstimateCapture
@@ -388,7 +427,7 @@ MainActivity / DirectVisualEstimateCapture
   -> VisualEstimateOutcome.Success or VisualEstimateOutcome.NoRead
   -> typed VisualEstimateReport(attemptId, kind, lines, dismiss key)
   -> success-only ResultOverlay OR non-destructive no-read/failure bottom panel
-  -> CLEAR dismisses only that attempt id
+  -> CLEAR button, voice "clear", or 10-second auto-clear dismisses only that attempt id
 ```
 
 `updateShellState()` does not derive report visibility from volatile status
@@ -396,7 +435,8 @@ strings. It receives the currently owned attempt report, excluding an attempt id
 that has been cleared. Setup edits, status changes, distance edits, live-feed
 restarts, and voice-listener updates therefore cannot resurrect the same old
 report after `CLEAR`; the next shot gets a new attempt id and can show a new
-report.
+report. Entering Setup Mode also clears any visible report state so returning
+to Run never asks for `clear` on an old attempt.
 
 This path is for the S10+ personal estimate mode, not certified measurement.
 Real per-frame timestamps anchor absolute time when available. If a frame
@@ -410,13 +450,16 @@ skipped/coalesced intervals: if a later centroid jump is about five times the
 normal displacement and the real timestamp gap is also about five times the
 normal gap, the estimate may proceed with lower confidence and a
 skipped/coalesced diagnostic. If timestamp gaps and displacement disagree, the
-track no-reads as ambiguous. Strong apparent ball size change normally no-reads
-because it indicates depth motion and violates the calibrated-plane assumption.
+track no-reads as ambiguous. Recorded/import estimates with selected blob sizes
+scale the residual gate from apparent short-side blob diameter so centroid error
+is judged against the actual blurred object size rather than only a fixed pixel
+number. Recorded-HFR apparent blob-size variation is noisy supporting evidence,
+not a standalone veto: the final read/no-read decision is based on the whole
+track, including source validity, centroid trajectory, direction, timing,
+residual, calibration, and candidate consistency.
 If distance calibration is absent, the estimate path can infer `pixelsPerFoot`
 from a reviewed known ball diameter plus the median detected apparent short-axis
-diameter, avoiding the motion-blurred long axis for fast balls. In that
-ball-diameter self-calibration path only, apparent scale change can proceed as
-a LOW-confidence warning rather than a strict no-read.
+diameter, avoiding the motion-blurred long axis for fast balls.
 That result is labeled with `BALL_DIAMETER_SELF_CALIBRATION` and carries a
 first-class assumption that the entered ball type must match the real ball and
 that motion blur can bias scale. Raw pixels are consumed only in memory by the
@@ -645,13 +688,20 @@ produce plausible mph values.
 Color calibration produces HSV bounds. Distance calibration produces
 `pixelsPerFoot` for strict measurement. Estimate mode also supports an explicit
 known-ball-diameter self-calibration fallback when distance calibration is
-absent and apparent short-axis ball diameter is detected in enough frames. Any
-scale input is revalidated at measurement time rather than trusted from stale
-state.
+absent and apparent short-axis ball diameter is detected in enough frames. When
+the A/B calibration plane is not the ball travel plane, the setup UI can accept
+camera-to-calibration-plane feet and camera-to-ball-plane feet and uses
+`VisualEstimateScaleMode.DepthCorrected`; partial or invalid depth text fails
+loud instead of silently applying stale same-plane scale. Depth-corrected scale
+is disclosed as estimate-only and caps otherwise strong track confidence at
+medium rather than hiding clear blob/track evidence as low confidence. Any scale
+input is revalidated at measurement time rather than trusted from stale state.
 
 Phase 14 estimate setup stores vertical caliper line positions, the entered
-distance in feet, color sample point, sampled HSV value, and ROI as normalized
-frame coordinates after preview scale and sensor-rotation transform handling.
+distance in feet, optional calibration/ball plane depth text, configurable
+launch-height text, configurable motion-blob side ratio, color sample point,
+sampled HSV value, and ROI as
+normalized frame coordinates after preview scale and sensor-rotation transform handling.
 It also stores a setup-time
 `LevelReferenceSnapshot` from the phone IMU: `TYPE_GRAVITY` is preferred,
 accelerometer is the fallback, and gyroscope movement during an explicit still
@@ -705,10 +755,11 @@ arm. The P14-G2-A golden covers the full composed chain: preview-space
 calibration plus readback-space ball motion plus known delta time must produce
 the expected mph through real estimate logic, including a non-square/aspect
 ratio case.
-The `shoot` voice command is a readiness-gated recorded-HFR command: it checks
-the same Phase 14 setup state for distance/color/level/mode readiness, stops
-speech recognition, arms impact audio, starts HFR after the mic is actually
-listening, waits for the first video timestamp, and only then emits the
+The voice start commands `shoot`, `record`, `cheese`, and `smile` are
+readiness-gated recorded-HFR commands: they check the same Phase 14 setup state
+for distance/color/level/mode readiness, stop speech recognition, arm impact
+audio, start HFR after the mic is actually listening, wait for the first video
+timestamp, and only then emit the
 Ready/beep cue. Marker acceptance is enabled after the actual cue completion
 maps to an audio sample index. It must not route through
 `startDirectVisualEstimate()` on S10+. If readiness fails, the status row reports

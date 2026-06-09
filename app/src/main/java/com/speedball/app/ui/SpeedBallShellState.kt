@@ -70,6 +70,10 @@ data class SpeedBallShellState(
     val phase14State: Phase14WorkflowState = Phase14WorkflowState(),
     val setupAdjustmentTargetLabel: String = "A",
     val knownDistanceFeetText: String = "",
+    val calibrationPlaneDepthFeetText: String = "",
+    val ballPlaneDepthFeetText: String = "",
+    val motionBlobSideRatioText: String = "2.00",
+    val launchHeightFeetText: String = "4.0",
     val previewRotationDegrees: Int = 0,
 ) {
     /** User-visible strings exposed by the placeholder shell. */
@@ -91,6 +95,10 @@ data class SpeedBallShellState(
             failureLine?.let(::add)
             add("setupTarget=$setupAdjustmentTargetLabel")
             add("knownDistanceFeetInput=$knownDistanceFeetText")
+            add("calibrationPlaneDepthFeetInput=$calibrationPlaneDepthFeetText")
+            add("ballPlaneDepthFeetInput=$ballPlaneDepthFeetText")
+            add("motionBlobSideRatioInput=$motionBlobSideRatioText")
+            add("launchHeightFeetInput=$launchHeightFeetText")
             add("previewRotationDegrees=$previewRotationDegrees")
             sections.forEach { section ->
                 add(section.title)
@@ -133,6 +141,10 @@ fun speedBallCaptureState(
     exportEvidenceText: String? = null,
     setupAdjustmentTargetLabel: String = "A",
     knownDistanceFeetText: String = "",
+    calibrationPlaneDepthFeetText: String = "",
+    ballPlaneDepthFeetText: String = "",
+    motionBlobSideRatioText: String = "2.00",
+    launchHeightFeetText: String = "4.0",
     previewRotationDegrees: Int = 0,
     visualEstimateReport: VisualEstimateReport? = null,
     workflowFrameWidth: Int = 0,
@@ -162,6 +174,10 @@ fun speedBallCaptureState(
         phase14State = phase14State,
         setupAdjustmentTargetLabel = setupAdjustmentTargetLabel,
         knownDistanceFeetText = knownDistanceFeetText,
+        calibrationPlaneDepthFeetText = calibrationPlaneDepthFeetText,
+        ballPlaneDepthFeetText = ballPlaneDepthFeetText,
+        motionBlobSideRatioText = motionBlobSideRatioText,
+        launchHeightFeetText = launchHeightFeetText,
         previewRotationDegrees = previewRotationDegrees,
         sections = listOf(
             WorkflowSection("Mode", PlaceholderStatus.Pending, "Modes are loaded from the device HAL."),

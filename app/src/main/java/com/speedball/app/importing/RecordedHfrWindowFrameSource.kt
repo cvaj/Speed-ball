@@ -22,13 +22,14 @@ data class RecordedHfrDecodedWindowProof(
  * Window source wrapper for recorded-HFR decoder foundations.
  *
  * Android codec code supplies an [ImportFrameSource] already seeking from the
- * nearest sync sample. This wrapper emits only frames whose container PTS falls
- * inside [window] and closes the upstream source on every terminal path.
+ * previous sync sample so the start of [window] cannot be skipped. This wrapper
+ * emits only frames whose container PTS falls inside [window] and closes the
+ * upstream source on every terminal path.
  */
 class RecordedHfrWindowFrameSource private constructor(
     private val upstream: ImportFrameSource,
     private val window: ContainerTimeWindow,
-) : ImportFrameSource {
+) : ImportFrameSource, ImportFrameSourceScanLimitTerminal {
     private var emitted = 0
     private var previousPtsNanos: Long? = null
     private var closed = false
@@ -56,6 +57,9 @@ class RecordedHfrWindowFrameSource private constructor(
         closed = true
         upstream.close()
     }
+
+    override fun isTerminalAtScannedFrameCount(scannedFrameCount: Int): Boolean =
+        scannedFrameCount >= window.maxFrames
 
     companion object {
         fun create(

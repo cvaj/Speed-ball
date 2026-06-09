@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test
 
 class AudioVideoClockAnchorTest {
     @Test
-    fun mapsTwoHundredMillisecondsAtOneTwentyFpsToTwentyFourPostImpactFrames() {
+    fun mapsPreAndPostImpactWindowAtOneTwentyFps() {
         val result = assertSuccess(
             ImpactWindowMapper.map(
                 anchor = anchor(errorNanos = 8_000_000L),
@@ -22,11 +22,11 @@ class AudioVideoClockAnchorTest {
 
         assertEquals(250_000L, result.impactOffsetUs)
         assertEquals(30, result.sensorDiagnosticFrameIndex)
-        assertEquals(24, result.window.postImpactFrameCount)
+        assertEquals(120, result.window.postImpactFrameCount)
         assertEquals(1, result.window.preImpactMarginFrames)
-        assertEquals(241_667L, result.window.windowStartUs)
-        assertEquals(450_000L, result.window.windowEndUs)
-        assertEquals(25, result.window.maxFrames)
+        assertEquals(0L, result.window.windowStartUs)
+        assertEquals(1_250_000L, result.window.windowEndUs)
+        assertEquals(241, result.window.maxFrames)
     }
 
     @Test
@@ -42,7 +42,7 @@ class AudioVideoClockAnchorTest {
         )
 
         assertEquals(0L, result.window.windowStartUs)
-        assertEquals(220_000L, result.window.windowEndUs)
+        assertEquals(1_020_000L, result.window.windowEndUs)
         assertEquals(6, result.window.preImpactMarginFrames)
     }
 
@@ -99,8 +99,8 @@ class AudioVideoClockAnchorTest {
         )
 
         assertEquals(120, result.sensorDiagnosticFrameIndex)
-        assertEquals(1_000_000L, result.window.windowStartUs)
-        assertEquals(1_200_000L, result.window.windowEndUs)
+        assertEquals(0L, result.window.windowStartUs)
+        assertEquals(2_000_000L, result.window.windowEndUs)
     }
 
     private fun assertSuccess(

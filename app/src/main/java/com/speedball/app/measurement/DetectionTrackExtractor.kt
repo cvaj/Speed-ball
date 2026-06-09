@@ -20,6 +20,7 @@ data class TrackExtractionConfig(
     val seedSearchRadiusPx: Double? = null,
     val allowStationaryPrefix: Boolean = false,
     val candidateReductionBudget: CandidateReductionBudget? = null,
+    val maxCandidateTimestampGapSpreadRatio: Double = Double.POSITIVE_INFINITY,
 )
 
 /**
@@ -81,7 +82,13 @@ object DetectionTrackExtractor {
         validateSequence(sequence, config.detectorConfig.bounds)?.let {
             return TrackExtractionOutcome.Failure(it.reason, it.message)
         }
-        if (!config.maxFrameToFrameJumpPx.isFinite() || config.maxFrameToFrameJumpPx <= 0.0 || config.maxInteriorMisses < 0) {
+        if (
+            !config.maxFrameToFrameJumpPx.isFinite() ||
+            config.maxFrameToFrameJumpPx <= 0.0 ||
+            config.maxInteriorMisses < 0 ||
+            config.maxCandidateTimestampGapSpreadRatio.isNaN() ||
+            config.maxCandidateTimestampGapSpreadRatio <= 0.0
+        ) {
             return TrackExtractionOutcome.Failure(
                 MeasurementRunFailure.DETECTION_FAILED,
                 "Track gates must be finite and positive.",

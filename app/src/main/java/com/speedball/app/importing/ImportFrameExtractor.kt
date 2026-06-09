@@ -10,6 +10,16 @@ interface ImportFrameSource : AutoCloseable {
     fun nextFrame(): ImportVideoFrame?
 }
 
+/**
+ * Optional source contract for streams that own a strict upstream emission cap.
+ *
+ * The streaming estimator uses this to distinguish "the source ended exactly at
+ * its reviewed window cap" from "an unbounded source hit the scan budget."
+ */
+interface ImportFrameSourceScanLimitTerminal {
+    fun isTerminalAtScannedFrameCount(scannedFrameCount: Int): Boolean
+}
+
 /** Bounded import frame extraction limits. */
 data class ImportFrameExtractionConfig(
     val maxFrames: Int,
